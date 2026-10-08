@@ -1,0 +1,7 @@
+include: project.yml
+build-dir: build/client-aot
+sources:
+  - native/main.php
+  - src
+# Exercises native compilation of the prototype; CCXT/React remain dependencies.
+# Inspect compiler fallback diagnostics before claiming full native compilation.

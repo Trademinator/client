@@ -1,0 +1,13 @@
+{
+    "mode": "fixture",
+    "data_dir": "var",
+    "exchange": "kraken",
+    "symbol": "XRP/CAD",
+    "server_url": "",
+    "ipc_port": 17840,
+    "interval_ms": 2000,
+    "request_timeout_seconds": 10,
+    "ws_retry_seconds": 30,
+    "server_poll_seconds": 60,
+    "retention": 1000
+}

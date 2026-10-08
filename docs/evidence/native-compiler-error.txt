@@ -1,0 +1,3 @@
+TypePHP v0.9.4 Linux x64 PHP 8.4.26 ZTS release, SHA-256 verified.
+Compiler startup: libphpx.so: cannot open shared object file: No such file or directory.
+No native compilation was performed.

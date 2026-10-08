@@ -1,0 +1,16 @@
+name: trademinator-m0
+mode: bin
+cxx-std: c++17
+build-dir: build/runtime
+sources:
+  - native/main.php
+embedded-files:
+  - vendor
+  - src
+ext-deps:
+  - bcmath
+  - curl
+  - gmp
+  - mbstring
+  - openssl
+  - pdo_sqlite

@@ -1,0 +1,27 @@
+{
+  "milestone": "M0",
+  "mode": "live",
+  "run_id": "941aa8761c6a8ba9c49ceaf1",
+  "state": "stopped",
+  "uptime_seconds": 12.011,
+  "exchange": "kraken",
+  "symbol": "XRP/CAD",
+  "samples": 0,
+  "errors": 6,
+  "last_error": "market_data_unavailable",
+  "transport": "rest",
+  "websocket_failures": 1,
+  "latest_quote": null,
+  "websocket_samples": 0,
+  "rest_samples": 0,
+  "server": {
+    "status": "not_configured",
+    "risk_factor": null
+  },
+  "memory_bytes": 10485760,
+  "peak_memory_bytes": 10485760,
+  "warm_memory_bytes": 10485760,
+  "growth_after_warmup_bytes": 0,
+  "validation_status": "blocked",
+  "validation_reason": "Outbound DNS was unreachable; real exchange data was not validated."
+}

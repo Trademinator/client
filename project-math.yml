@@ -1,0 +1,13 @@
+name: trademinator-m0-math
+mode: bin
+cxx-std: c++17
+build-dir: build/math
+sources:
+  - native/math.php
+  - src/MathProbe.php
+  - vendor/trademinator/bcmath/src
+  - vendor/trademinator/indicators/src
+embedded-files:
+  - vendor
+ext-deps:
+  - bcmath

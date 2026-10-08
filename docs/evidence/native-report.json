@@ -1,0 +1,14 @@
+{
+    "schema": 1,
+    "platform": "Linux",
+    "php": "8.3.6",
+    "checked_at": "2026-10-04T21:11:28+00:00",
+    "status": "blocked",
+    "checks": {
+        "compiler": {
+            "exit_code": 127
+        }
+    },
+    "note": "Runtime embedding, shared-math AOT, and client AOT are separate gates. Inspect compiler logs for fallback.",
+    "reason": "TypePHP could not start. See compiler.log; provide TPC_BIN and matching PHP\/PHPX native dependencies."
+}

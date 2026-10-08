@@ -1,0 +1,34 @@
+{
+    "status": "passed",
+    "mode": "fixture",
+    "requested_seconds": 60,
+    "exit_code": 0,
+    "report": {
+        "milestone": "M0",
+        "mode": "fixture",
+        "run_id": "3279f8f0886822231d40636e",
+        "state": "stopped",
+        "uptime_seconds": 60.003,
+        "exchange": "kraken",
+        "symbol": "XRP\/CAD",
+        "samples": 5827,
+        "errors": 0,
+        "last_error": "",
+        "transport": "websocket",
+        "websocket_failures": 1,
+        "websocket_samples": 5729,
+        "rest_samples": 98,
+        "server": {
+            "status": "fixture",
+            "risk_factor": "0.2500000000000000",
+            "algorithm_version": "questionnaire-risk-v1",
+            "source": "default",
+            "market_count": 1
+        },
+        "memory_bytes": 8388608,
+        "peak_memory_bytes": 8388608,
+        "warm_memory_bytes": 8388608,
+        "growth_after_warmup_bytes": 0
+    },
+    "scope": "PHP allocator memory only; live CCXT, process RSS and native builds need separate long-run checks."
+}

@@ -1,0 +1,9 @@
+/vendor/
+/var/
+/build/
+/trademinator-m0
+/trademinator-m0.exe
+/trademinator-m0-math
+/trademinator-m0-math.exe
+/config.local.json
+/.env

@@ -1,0 +1,15 @@
+PASS shared packages retain tiny decimal EMA/SMA and the agreed sizing fixture
+PASS WebSocket is preferred and decimals remain strings
+PASS disconnect falls back, cooldown avoids reconnect storms, then WebSocket recovers
+PASS a stalled WebSocket is bounded, cancelled, and replaced by REST
+PASS REST-only exchanges are supported without false WebSocket failures
+PASS malformed, crossed and mismatched prices cannot be persisted as healthy data
+PASS risk factors come from the Server and invalid responses never become defaults
+PASS configuration rejects public HTTP, URL credentials, unknown fields and invalid polling
+PASS SQLite retains exact decimals across reopen and prunes old samples
+PASS TCP control requires token, handles fragmented input, and only accepts status/stop
+PASS Server HTTP contract uses bearer GETs and rejects redirects/auth failures/malformed JSON
+PASS daemon CLI stops at sample limit and restart preserves database rows
+PASS the installed CCXT package provides the real Kraken REST and Pro adapters
+PASS daemon status/stop work across processes and a second daemon cannot share its state
+14 tests, 0 failures.
