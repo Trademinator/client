@@ -8,15 +8,31 @@ chdir($root);
 $out = $root.'/build/validation';
 if (!is_dir($out)) { mkdir($out, 0700, true); }
 $compiler = getenv('TPC_BIN') ?: 'tpc';
+// Composer's PHP launcher must use the same PHP CLI as this validator.
+$compilerCommand = str_ends_with(strtolower($compiler), '.php') ? [PHP_BINARY, $compiler] : [$compiler];
 $report = ['schema' => 1, 'platform' => PHP_OS_FAMILY, 'php' => PHP_VERSION,
     'checked_at' => gmdate('c'), 'status' => 'blocked', 'checks' => [],
     'note' => 'Runtime embedding, shared-math AOT, and client AOT are separate gates. Inspect compiler logs for fallback.'];
 
 function execute(array $command, string $log, ?string $workingDirectory = null): int
 {
-    $process = @proc_open($command, [0 => ['pipe', 'r'], 1 => ['file', $log, 'w'], 2 => ['file', $log, 'a']], $pipes,
-        $workingDirectory, null, ['bypass_shell' => true]);
-    if (!is_resource($process)) { file_put_contents($log, "Process could not be started.\n"); return 127; }
+    $launchWarning = null;
+    set_error_handler(static function (int $severity, string $message) use (&$launchWarning): bool {
+        $launchWarning = $message;
+        return true;
+    });
+    try {
+        $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['file', $log, 'w'], 2 => ['file', $log, 'a']], $pipes,
+            $workingDirectory, null, ['bypass_shell' => true]);
+    } finally {
+        restore_error_handler();
+    }
+    if (!is_resource($process)) {
+        $details = $launchWarning ?? 'No PHP warning was reported.';
+        file_put_contents($log, "Process could not be started: ".$details.PHP_EOL
+            .'Command: '.json_encode($command, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE).PHP_EOL, FILE_APPEND);
+        return 127;
+    }
     fclose($pipes[0]);
     $deadline = microtime(true) + 600;
     do {
@@ -32,7 +48,7 @@ function execute(array $command, string $log, ?string $workingDirectory = null):
     } while (true);
 }
 
-$compilerReady = execute([$compiler, '--version'], $out.'/compiler.log');
+$compilerReady = execute([...$compilerCommand, '--version'], $out.'/compiler.log');
 $report['checks']['compiler'] = ['exit_code' => $compilerReady];
 if ($compilerReady === 0) {
     $report['compiler_version'] = trim((string) file_get_contents($out.'/compiler.log'));
@@ -45,7 +61,7 @@ if ($compilerReady === 0) {
     foreach (['runtime' => 'project.yml', 'math' => 'project-math.yml', 'client-aot' => 'project-client-aot.yml'] as $name => $project) {
         echo 'Building '.$name.PHP_EOL;
         $binary = $out.'/probe-'.$name.$extension;
-        $buildCode = execute([$compiler, $project, '-o', $binary, '-O2', '--no-progress', '--no-color'], $out.'/'.$name.'-build.log');
+        $buildCode = execute([...$compilerCommand, $project, '-o', $binary, '-O2', '--no-progress', '--no-color'], $out.'/'.$name.'-build.log');
         $runCode = null;
         if ($buildCode === 0 && is_file($binary)) {
             $runCommand = $name === 'math' ? [$binary] : [$binary, 'run', '--config='.$fixtureConfig, '--seconds=6'];
@@ -63,7 +79,7 @@ if ($compilerReady === 0) {
         if ($report['checks'][$name]['status'] !== 'passed') { $report['status'] = 'failed'; }
     }
 } else {
-    $report['reason'] = 'TypePHP could not start. See compiler.log; provide TPC_BIN and matching PHP/PHPX native dependencies.';
+    $report['reason'] = 'TypePHP could not start. See compiler.log for the launch error; TPC_BIN must be one native executable or PHP script path.';
 }
 file_put_contents($out.'/native-report.json', json_encode($report, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR).PHP_EOL);
 echo json_encode($report, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR).PHP_EOL;

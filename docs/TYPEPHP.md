@@ -30,6 +30,21 @@ prompt to install PHP. `--dry` generation alone, a successful `php bin/client.ph
 run, and a successful embedded runtime probe each answer different questions.
 None independently proves complete AOT compatibility.
 
+`TPC_BIN` accepts a native `tpc` executable or a PHP `.php` launcher. For a
+Composer installation in a separate directory:
+
+```bash
+export TPC_BIN="$HOME/.local/share/typephp/vendor/bin/tpc.php"
+php tools/validate-native.php
+```
+
+PHP launchers run through `PHP_BINARY`, the same CLI interpreter that runs the
+validator, without depending on their shebang or executable bit. Set `TPC_BIN`
+to the script path alone, not a shell command such as `php /path/to/tpc.php`.
+Native compiler executables and generated probes still execute directly.
+Process launch failures include the underlying PHP warning and command in the
+corresponding log file.
+
 ## Build-host requirements
 
 1. A 64-bit TypePHP-compatible PHP build (8.4 or 8.5 for the evaluated compiler),

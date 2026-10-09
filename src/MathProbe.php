@@ -10,7 +10,6 @@ use Trademinator\BcMath\PrecisionPolicy;
 use Trademinator\Indicators\Indicators;
 use function Trademinator\BcMath\bcconv;
 use function Trademinator\BcMath\bcmin;
-use function Trademinator\Indicators\normalize_ticker;
 
 final class MathProbe
 {
@@ -21,8 +20,9 @@ final class MathProbe
             $price = bcdiv((string) $i, '100000000', 24);
             $rows[] = [1700000000000 + $i * 60000, $price, $price, $price, $price, '10'];
         }
-        normalize_ticker($rows, true, 'milliseconds');
+        // A named receiver lets TypePHP resolve the by-reference method signature.
         $indicators = new Indicators(new PrecisionContext(24, new PrecisionPolicy()));
+        $indicators->normalize_ticker($rows, true, 'milliseconds');
         $ema = $indicators->ema($rows, 3);
         $sma = $indicators->sma($rows, 3);
         $last = end($rows);
