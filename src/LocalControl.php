@@ -6,8 +6,10 @@ namespace Trademinator\Client\M0;
 
 use Closure;
 use React\EventLoop\Loop;
+use React\EventLoop\TimerInterface;
 use React\Socket\ConnectionInterface;
 use React\Socket\SocketServer;
+use Throwable;
 
 final class LocalControl
 {
@@ -24,8 +26,9 @@ final class LocalControl
             $this->connections[$id] = $connection;
             $buffer = '';
             $handled = false;
-            $deadline = Loop::addTimer(2.0, static fn() => $connection->close());
-            $connection->on('error', static function (): void {});
+            // Match React's supplied arguments even when they are unused (TypePHP AOT).
+            $deadline = Loop::addTimer(2.0, static fn(TimerInterface $timer) => $connection->close());
+            $connection->on('error', static function (Throwable $error): void {});
             $connection->on('close', function () use ($id, $deadline): void {
                 Loop::cancelTimer($deadline);
                 unset($this->connections[$id]);

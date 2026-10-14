@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Trademinator\Client\M0;
 
 use React\EventLoop\Loop;
+use React\EventLoop\TimerInterface;
 use React\Promise\PromiseInterface;
 use RuntimeException;
 use Throwable;
@@ -70,14 +71,17 @@ final class Daemon
             if ($written === false) { throw new RuntimeException('Cannot write local control credentials.'); }
             chmod($controlFile, 0600);
             $this->store->set('status', $this->status());
-            $this->timers[] = Loop::addPeriodicTimer($this->config->intervalMs / 1000, fn() => $this->pollFeed());
-            $this->timers[] = Loop::addPeriodicTimer(1.0, fn() => $this->heartbeat());
+            // React supplies the timer instance, even when the callback ignores it.
+            // Keep its argument explicit for TypePHP's strict compiled signatures.
+            $this->timers[] = Loop::addPeriodicTimer($this->config->intervalMs / 1000, fn(TimerInterface $timer) => $this->pollFeed());
+            $this->timers[] = Loop::addPeriodicTimer(1.0, fn(TimerInterface $timer) => $this->heartbeat());
             if ($api !== null) {
-                $this->timers[] = Loop::addPeriodicTimer($this->config->serverPollSeconds, fn() => $this->pollServer($api));
+                $this->timers[] = Loop::addPeriodicTimer($this->config->serverPollSeconds, fn(TimerInterface $timer) => $this->pollServer($api));
                 Loop::futureTick(fn() => $this->pollServer($api));
             }
-            if ($seconds > 0) { $this->timers[] = Loop::addTimer($seconds, fn() => $this->stop()); }
-            $signalHandler = fn() => $this->stop();
+            if ($seconds > 0) { $this->timers[] = Loop::addTimer($seconds, fn(TimerInterface $timer) => $this->stop()); }
+            // Signal listeners receive the signal number; future ticks receive no arguments.
+            $signalHandler = fn(int $signal) => $this->stop();
             if (extension_loaded('pcntl')) {
                 Loop::addSignal(SIGTERM, $signalHandler);
                 Loop::addSignal(SIGINT, $signalHandler);

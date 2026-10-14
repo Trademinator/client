@@ -12,7 +12,13 @@ final class Application
 {
     public function run(array $argv): int
     {
+        $stage = 'arguments';
         try {
+            // A visible marker distinguishes a rebuilt binary from an older one.
+            // Diagnostic output is stderr-only; stdout remains the command payload.
+            if (getenv('TRADEMINATOR_M0_DIAGNOSTIC') === '1') {
+                fwrite(STDERR, 'M0 diagnostic v5: enabled'.PHP_EOL);
+            }
             $command = $argv[1] ?? 'help';
             $options = [];
             foreach (array_slice($argv, 2) as $argument) {
@@ -22,35 +28,71 @@ final class Application
                 $options[$match[1]] = $match[2];
             }
             if ($command === 'help') { $this->help(); return 0; }
-            if ($command === 'doctor') { return $this->doctor(); }
-            if ($command === 'math') { self::print(MathProbe::run()); return 0; }
+            if ($command === 'doctor') { $stage = 'doctor'; return $this->doctor(); }
+            if ($command === 'math') { $stage = 'math'; self::print(MathProbe::run()); return 0; }
+            $stage = 'config.load';
             $config = Config::load($options['config'] ?? null);
             if ($command === 'run') {
+                $stage = 'run.limits';
                 $seconds = self::integer($options['seconds'] ?? '0', 0, 604800);
                 $samples = self::integer($options['samples'] ?? '0', 0, 10000000);
+                $stage = 'run.math';
                 MathProbe::run();
+                $stage = 'run.daemon';
                 return (new Daemon($config))->run($seconds, $samples);
             }
             if (in_array($command, ['status', 'stop'], true)) {
+                $stage = 'control';
                 self::print($this->control($config, $command));
                 return 0;
             }
+            $stage = 'command';
             throw new RuntimeException('Unknown command. Run help.');
         } catch (Throwable $error) {
-            // Debug-only diagnostics: disabled by default so dependency exceptions
-            // cannot expose credentials in routine logs. Never print arguments.
-            if (getenv('TRADEMINATOR_M0_DIAGNOSTIC') === '1') {
-                fwrite(STDERR, 'M0 diagnostic: '.get_class($error).' at '.$error->getFile().':'.$error->getLine().PHP_EOL);
-                if ($error instanceof \ArgumentCountError) {
-                    fwrite(STDERR, 'M0 diagnostic: '.$error->getMessage().PHP_EOL);
+            // Keep the ordinary error and exit status even if formatting fails.
+            try {
+                self::writeDiagnostic($error, $stage);
+            } catch (Throwable) {
+                if (getenv('TRADEMINATOR_M0_DIAGNOSTIC') === '1') {
+                    fwrite(STDERR, 'M0 diagnostic v5: formatting failed'.PHP_EOL);
                 }
-                fwrite(STDERR, $error->getTraceAsString().PHP_EOL);
             }
             // Dependency exceptions can contain credentials; keep their output generic.
             $safe = str_starts_with($error->getFile(), __DIR__.DIRECTORY_SEPARATOR);
             fwrite(STDERR, ($safe ? $error->getMessage() : 'M0 failed: '.get_class($error).'. Check configuration and installed dependencies.').PHP_EOL);
             return 1;
         }
+    }
+
+    private static function writeDiagnostic(Throwable $error, string $stage): void
+    {
+        if (getenv('TRADEMINATOR_M0_DIAGNOSTIC') !== '1') { return; }
+
+        // Build a fresh allowlist, never serialize getTrace() or getTraceAsString().
+        // PHP may capture argument values even when no API key is configured.
+        $trace = [];
+        foreach ($error->getTrace() as $frame) {
+            $trace[] = [
+                'file' => (string) ($frame['file'] ?? '[internal]'),
+                'line' => (int) ($frame['line'] ?? 0),
+                'call' => (string) ($frame['class'] ?? '').(string) ($frame['type'] ?? '')
+                    .(string) ($frame['function'] ?? '[unknown]'),
+            ];
+            if (count($trace) >= 32) { break; }
+        }
+        $report = [
+            'diagnostic_version' => 5,
+            'stage' => $stage,
+            'exception' => get_class($error),
+            'file' => $error->getFile(),
+            'line' => $error->getLine(),
+            // Needed to identify the expected/actual arity of the native call.
+            // Use credential-free fixture runs: exception messages are not scrubbed.
+            'message' => $error instanceof \ArgumentCountError ? $error->getMessage() : '[omitted]',
+            'trace' => $trace,
+        ];
+        $json = json_encode($report, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+        fwrite(STDERR, 'M0 diagnostic v5: '.($json === false ? 'encoding failed' : $json).PHP_EOL);
     }
 
     private static function integer(string $value, int $minimum, int $maximum): int
