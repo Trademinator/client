@@ -37,6 +37,15 @@ final class Application
             }
             throw new RuntimeException('Unknown command. Run help.');
         } catch (Throwable $error) {
+            // Debug-only diagnostics: disabled by default so dependency exceptions
+            // cannot expose credentials in routine logs. Never print arguments.
+            if (getenv('TRADEMINATOR_M0_DIAGNOSTIC') === '1') {
+                fwrite(STDERR, 'M0 diagnostic: '.get_class($error).' at '.$error->getFile().':'.$error->getLine().PHP_EOL);
+                if ($error instanceof \ArgumentCountError) {
+                    fwrite(STDERR, 'M0 diagnostic: '.$error->getMessage().PHP_EOL);
+                }
+                fwrite(STDERR, $error->getTraceAsString().PHP_EOL);
+            }
             // Dependency exceptions can contain credentials; keep their output generic.
             $safe = str_starts_with($error->getFile(), __DIR__.DIRECTORY_SEPARATOR);
             fwrite(STDERR, ($safe ? $error->getMessage() : 'M0 failed: '.get_class($error).'. Check configuration and installed dependencies.').PHP_EOL);

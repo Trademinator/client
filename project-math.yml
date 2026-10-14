@@ -9,5 +9,6 @@ sources:
   - vendor/trademinator/indicators/src
 embedded-files:
   - vendor
+  - compat
 ext-deps:
   - bcmath

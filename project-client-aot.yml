@@ -3,5 +3,10 @@ build-dir: build/client-aot
 sources:
   - native/main.php
   - src
+  # Keep shared math sources on the same native AOT side as MathProbe.
+  # When these are only embedded as opcodes, TypePHP can lose by-reference
+  # arguments to Indicators::normalize_ticker() and Indicators::ema().
+  - vendor/trademinator/bcmath/src
+  - vendor/trademinator/indicators/src
 # Exercises native compilation of the prototype; CCXT/React remain dependencies.
 # Inspect compiler fallback diagnostics before claiming full native compilation.

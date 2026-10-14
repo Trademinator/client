@@ -22,7 +22,8 @@
         "trademinator/indicators": "^0.1.0"
     },
     "autoload": {
-        "psr-4": {"Trademinator\\Client\\M0\\": "src/"}
+        "psr-4": {"Trademinator\\Client\\M0\\": "src/"},
+        "files": ["compat/typephp-polyfills.php"]
     },
     "scripts": {
         "test": "@php tests/run.php",

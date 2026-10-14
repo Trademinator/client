@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Trademinator\Client\M0;
 
 use RuntimeException;
+use std;
 use Trademinator\BcMath\PrecisionContext;
 use Trademinator\BcMath\PrecisionPolicy;
 use Trademinator\Indicators\Indicators;
@@ -20,11 +21,13 @@ final class MathProbe
             $price = bcdiv((string) $i, '100000000', 24);
             $rows[] = [1700000000000 + $i * 60000, $price, $price, $price, $price, '10'];
         }
-        // A named receiver lets TypePHP resolve the by-reference method signature.
+        // Explicit std::ref() preserves array mutation when TypePHP uses dynamic
+        // cross-trait dispatch. Standard PHP receives the same reference via
+        // the Composer-loaded compatibility shim.
         $indicators = new Indicators(new PrecisionContext(24, new PrecisionPolicy()));
-        $indicators->normalize_ticker($rows, true, 'milliseconds');
-        $ema = $indicators->ema($rows, 3);
-        $sma = $indicators->sma($rows, 3);
+        $indicators->normalize_ticker(std::ref($rows), true, 'milliseconds');
+        $ema = $indicators->ema(std::ref($rows), 3);
+        $sma = $indicators->sma(std::ref($rows), 3);
         $last = end($rows);
         // Hand-computable sequences protect against float collapse/truncation.
         if (bccomp($last[$ema], '0.00000004', 24) !== 0 || bccomp($last[$sma], '0.00000004', 24) !== 0

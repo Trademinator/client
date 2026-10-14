@@ -7,6 +7,7 @@ sources:
 embedded-files:
   - vendor
   - src
+  - compat
 ext-deps:
   - bcmath
   - curl
