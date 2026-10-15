@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 require dirname(__DIR__).'/vendor/autoload.php';
 
+use React\Dns\Model\Message;
 use React\EventLoop\Loop;
 use React\Http\HttpServer;
 use React\Http\Message\Response;
@@ -19,6 +20,7 @@ use Trademinator\Client\M0\MathProbe;
 use Trademinator\Client\M0\ResilientFeed;
 use Trademinator\Client\M0\ServerApi;
 use Trademinator\Client\M0\StateStore;
+use Trademinator\Client\M0\SystemResolver;
 use function React\Async\async;
 use function React\Async\await;
 use function React\Promise\reject;
@@ -145,6 +147,14 @@ test('configuration rejects public HTTP, URL credentials, unknown fields and inv
     }
     new Config(['server_url' => 'http://127.0.0.1:8000']);
     new Config(['server_url' => 'https://example.com/trademinator']);
+});
+
+test('system resolver follows the PHP native IPv4 resolver without public DNS fallback', function (): void {
+    $resolver = new SystemResolver();
+    $address = await($resolver->resolve('localhost'));
+    yes(@inet_pton($address) !== false && !str_contains($address, ':'), 'Native resolver did not return IPv4.');
+    same([$address], await($resolver->resolveAll('localhost', Message::TYPE_A)));
+    raises(fn() => await($resolver->resolveAll('localhost', Message::TYPE_AAAA)));
 });
 
 $testDir = sys_get_temp_dir().'/trademinator-m0-'.bin2hex(random_bytes(8));

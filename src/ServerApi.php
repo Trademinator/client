@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Trademinator\Client\M0;
 
 use React\Http\Browser;
+use React\Socket\Connector;
 use RuntimeException;
 use function React\Async\await;
 
@@ -18,7 +19,10 @@ final class ServerApi
         if ($token === '' || preg_match('/[\r\n]/', $token)) {
             throw new RuntimeException('Set TRADEMINATOR_API_KEY to a Client API key.');
         }
-        $this->browser = (new Browser())->withTimeout($timeoutSeconds)->withFollowRedirects(false)
+        $connector = PHP_OS_FAMILY === 'Windows'
+            ? new Connector(['dns' => new SystemResolver(), 'happy_eyeballs' => false])
+            : null;
+        $this->browser = (new Browser($connector))->withTimeout($timeoutSeconds)->withFollowRedirects(false)
             ->withRejectErrorResponse(false)->withResponseBuffer(1048576);
     }
 
