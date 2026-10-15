@@ -1,0 +1,11 @@
+name: trademinator-m1
+mode: bin
+cxx-std: c++17
+build-dir: build/m1-runtime
+sources:
+  - native/m1.php
+embedded-files:
+  - m1
+ext-deps:
+  - bcmath
+  - pdo_sqlite

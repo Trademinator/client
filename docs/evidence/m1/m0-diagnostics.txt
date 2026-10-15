@@ -1,0 +1,11 @@
+PASS diagnostics stay disabled without an explicit 1
+PASS arity failure includes stage, message and an argument-free trace
+PASS diagnostics also work when PHP omits captured arguments
+PASS non-arity dependency messages remain omitted
+PASS successful math keeps stdout as valid JSON
+PASS argument parsing errors do not print command arguments
+PASS configuration errors are distinguished from math
+PASS invalid limits are distinguished from daemon startup
+PASS run math errors are distinguished from daemon errors
+PASS long traces are bounded to 32 frames
+10 diagnostic tests, 0 failures.

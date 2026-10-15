@@ -1,0 +1,5 @@
+{
+    "suite": "m1-hardpoints",
+    "status": "passed",
+    "assertions": 44
+}

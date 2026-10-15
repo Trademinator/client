@@ -1,0 +1,27 @@
+{
+    "suite": "m1-simulation",
+    "status": "passed",
+    "checks": 13,
+    "fixture_checks": 46
+}
+{
+    "milestone": "M1",
+    "status": "passed",
+    "suites": {
+        "ledger": {
+            "status": "passed",
+            "exit_code": 0,
+            "seconds": 0.033
+        },
+        "hardpoints": {
+            "status": "passed",
+            "exit_code": 0,
+            "seconds": 0.463
+        },
+        "simulation": {
+            "status": "passed",
+            "exit_code": 0,
+            "seconds": 1.282
+        }
+    }
+}

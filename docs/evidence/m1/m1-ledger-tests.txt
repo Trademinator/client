@@ -1,0 +1,4 @@
+{
+    "status": "passed",
+    "assertions": 31
+}

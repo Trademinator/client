@@ -1,0 +1,4 @@
+Independent filesystem enumeration after the final simulator process exited:
+daily/*/manifest.json: 7
+trades/*/manifest.json: 7
+Data root: /tmp/trademinator-m1-final-20261015-1758/load

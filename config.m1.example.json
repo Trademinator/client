@@ -1,0 +1,6 @@
+{
+    "tick_ms": 250,
+    "log_level": "info",
+    "log_max_bytes": 5242880,
+    "log_keep": 5
+}

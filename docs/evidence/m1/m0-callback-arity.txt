@@ -1,0 +1,9 @@
+PASS guard rejects the original zero-parameter timer signature
+PASS fixture timers receive one argument and future ticks receive none
+PASS Server polling timer accepts its timer argument
+PASS SIGTERM and SIGINT callbacks accept the signal number
+PASS local-control timeout accepts the timer and closes the connection
+PASS local-control error listener accepts the exception argument
+PASS close notifications continue to use zero arguments
+PASS status and stop keep their zero-argument callback contract
+8 callback-arity tests, 0 failures.

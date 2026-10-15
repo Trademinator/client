@@ -1,0 +1,12 @@
+{
+  "name": "Trademinator Client",
+  "milestone": "M1",
+  "version": "1.0.0-rc1",
+  "source_base": "b30777977dd548229f67188d414a28e04bd2e89a",
+  "source_repository": "https://github.com/Trademinator/client",
+  "release_date": "2026-10-15",
+  "scope": "Local daemon, persistence, backup, hard points and deterministic simulation",
+  "live_order_execution": false,
+  "m0_entry": "bin/m0.php",
+  "m1_entry": "bin/client.php"
+}

@@ -232,7 +232,7 @@ test('daemon CLI stops at sample limit and restart preserves database rows', fun
     $config = $testDir.'/with spaces.json';
     file_put_contents($config, json_encode(['data_dir' => 'daemon data', 'ipc_port' => 0, 'interval_ms' => 10]));
     for ($i = 1; $i <= 2; $i++) {
-        $process = proc_open([PHP_BINARY, dirname(__DIR__).'/bin/client.php', 'run', '--config='.$config, '--samples=3', '--seconds=5'],
+        $process = proc_open([PHP_BINARY, dirname(__DIR__).'/bin/m0.php', 'run', '--config='.$config, '--samples=3', '--seconds=5'],
             [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
         $output = stream_get_contents($pipes[1]); $error = stream_get_contents($pipes[2]);
         fclose($pipes[1]); fclose($pipes[2]);
@@ -254,7 +254,7 @@ test('daemon status/stop work across processes and a second daemon cannot share 
     $config = $testDir.'/control-config.json';
     $data = $testDir.'/control-data';
     file_put_contents($config, json_encode(['data_dir' => $data, 'ipc_port' => 0, 'interval_ms' => 20]));
-    $process = proc_open([PHP_BINARY, dirname(__DIR__).'/bin/client.php', 'run', '--config='.$config, '--seconds=10'],
+    $process = proc_open([PHP_BINARY, dirname(__DIR__).'/bin/m0.php', 'run', '--config='.$config, '--seconds=10'],
         [1 => ['file', $testDir.'/control-out.json', 'w'], 2 => ['file', $testDir.'/control-err.log', 'w']], $pipes);
     try {
         $deadline = microtime(true) + 5;
@@ -262,7 +262,7 @@ test('daemon status/stop work across processes and a second daemon cannot share 
         yes(is_file($data.'/control.json'), 'Daemon did not start.');
         if (PHP_OS_FAMILY !== 'Windows') { same(0600, fileperms($data.'/control.json') & 0777); }
         foreach (['status', 'run', 'stop'] as $command) {
-            $args = [PHP_BINARY, dirname(__DIR__).'/bin/client.php', $command, '--config='.$config];
+            $args = [PHP_BINARY, dirname(__DIR__).'/bin/m0.php', $command, '--config='.$config];
             if ($command === 'run') { $args[] = '--seconds=1'; }
             $child = proc_open($args, [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $streams);
             $out = stream_get_contents($streams[1]); $err = stream_get_contents($streams[2]);

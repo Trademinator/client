@@ -1,0 +1,5 @@
+Synthetic fixture account only.
+Proposal: eligible.
+Promotion without token: exit 1.
+Promotion with current reviewed token: exit 0.
+Reuse of same token: exit 1.

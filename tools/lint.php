@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 $root = dirname(__DIR__);
 $failed = false;
-foreach (['src', 'bin', 'native', 'tests', 'tools', 'compat'] as $directory) {
+foreach (['src', 'm1', 'bin', 'native', 'tests', 'tools', 'compat'] as $directory) {
     foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root.'/'.$directory)) as $file) {
         if ($file->isFile() && $file->getExtension() === 'php') {
             $process = proc_open([PHP_BINARY, '-l', $file->getPathname()], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
@@ -13,5 +13,5 @@ foreach (['src', 'bin', 'native', 'tests', 'tools', 'compat'] as $directory) {
         }
     }
 }
-echo $failed ? "Lint failed.\n" : "All M0 PHP files passed syntax checks.\n";
+echo $failed ? "Lint failed.\n" : "All Client PHP files passed syntax checks.\n";
 exit($failed ? 1 : 0);

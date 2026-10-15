@@ -1,0 +1,119 @@
+{
+    "milestone": "M1",
+    "mode": "synthetic",
+    "status": "passed",
+    "scenario": "all",
+    "network_requests": 0,
+    "exchange_orders_submitted": 0,
+    "checks": {
+        "Hard T1 rejects an open order": "passed",
+        "An open order prevents a checkpoint": "passed",
+        "Idle synchronization does not duplicate a checkpoint": "passed",
+        "Shared quote wallet equals independent round-trip calculation": "passed",
+        "Ledger replay equals independent fixture balances": "passed",
+        "All completed orders reconcile with no open order": "passed",
+        "Every market finishes with a current checkpoint": "passed",
+        "Partial observations do not inflate completed-trade count": "passed",
+        "SQLite and financial foreign keys remain valid": "passed",
+        "ATOM/USD has no dust or unmatched SELL quantity": "passed",
+        "BTC/USD has no dust or unmatched SELL quantity": "passed",
+        "XRP/USD has no dust or unmatched SELL quantity": "passed",
+        "Daily backups retain the latest seven independently": "passed",
+        "Every 1000 completed trades retain seven independent backups": "passed",
+        "Idle backup tick creates no duplicate daily or trade backup": "passed",
+        "Residual quantity below minimum is dust": "passed",
+        "Dust prevents a market checkpoint": "passed",
+        "Dust prevents a Hard T1 candidate": "passed",
+        "Fully allocated dedusting permits a new checkpoint": "passed",
+        "Dust clears after both acquisition lots are consumed": "passed",
+        "Hard T0 requires explicit approval": "passed",
+        "Hard T0 rejects an account with an open order": "passed",
+        "Every market needs a checkpoint before Hard T1": "passed",
+        "Eligible Hard T1 remains a candidate until explicitly approved": "passed",
+        "Financial activity invalidates a previous approval token": "passed",
+        "Reconciled activity can produce a fresh Hard T1 candidate": "passed",
+        "Interrupted archival reports failure before commit": "passed",
+        "Interrupted archival preserves the previous active baseline": "passed",
+        "Precommit archival intent rolls back on recovery": "passed",
+        "Interrupted archival reports failure after commit": "passed",
+        "Committed archival intent completes on recovery": "passed",
+        "Approved Hard T1 becomes the new active baseline": "passed",
+        "Previous Hard T0 remains permanently reconstructable": "passed",
+        "Archive preserves original orders partial matching and operations": "passed",
+        "Promoted source orders leave the active database only after archival": "passed",
+        "Remaining BUY quantity and acquisition cost survive promotion": "passed",
+        "Promotion preserves the shared wallet exactly": "passed",
+        "Empty-database rebuild restores wallet inventory and acquisition costs": "passed",
+        "Interrupted backup publication reports failure": "passed",
+        "Interrupted backup leaves the previous verified snapshot and primary intact": "passed",
+        "Corrupted backup fails hash and integrity verification": "passed",
+        "Recovery skips the corrupt newest backup and uses a verified predecessor": "passed",
+        "Backup fallback reconstructs the selected snapshot balances": "passed",
+        "Backup restore requires fresh authoritative reconciliation": "passed",
+        "Separate user data directories isolate identical account identifiers": "passed",
+        "Exchange accounts isolate wallets within one user directory": "passed"
+    },
+    "workload": {
+        "completed_orders": 10000,
+        "order_observations": 20000,
+        "partial_allocations": 10000,
+        "round_trips": 5000,
+        "account_id": "11111111-1111-4111-8111-111111111111",
+        "markets": 3,
+        "shared_quote_currency": "USD",
+        "expected_final_usd": "1098900.000000000000000000000000",
+        "checkpoint_events": 10000,
+        "virtual_days": 10,
+        "backups_created": {
+            "daily": 10,
+            "trades": 10
+        },
+        "backups_retained": {
+            "daily": 7,
+            "trades": 7
+        },
+        "fixture_approved_hard_t1_promotions": 19,
+        "current_hardpoint": {
+            "account_id": "11111111-1111-4111-8111-111111111111",
+            "id": "1792087103160",
+            "kind": "HardT1",
+            "revision": 28523
+        },
+        "database_path": "/tmp/trademinator-m1-final-20261015-1758/load/client.sqlite"
+    },
+    "dust": {
+        "initial_dust_quantity": "0.1",
+        "dedusted_quantity": "1"
+    },
+    "hard_points": {
+        "account_id": "11111111-1111-4111-8111-111111111111",
+        "original_hard_t0": "1792087111270",
+        "promoted_hard_t1": "1792087111298",
+        "carried_quantity": "6",
+        "carried_unit_cost": "10.01",
+        "rebuilt_database": "/tmp/trademinator-m1-final-20261015-1758/hard-points-scenario/rebuilt/client.sqlite"
+    },
+    "backup_recovery": {
+        "valid_predecessor": "/tmp/trademinator-m1-final-20261015-1758/backup-recovery/backups/manual/1767225600000-06841a68/database.sqlite",
+        "corrupt_snapshot": "/tmp/trademinator-m1-final-20261015-1758/backup-recovery/backups/manual/1767225602000-3d5d07a7/database.sqlite",
+        "restored": {
+            "status": "restored",
+            "source": "/tmp/trademinator-m1-final-20261015-1758/backup-recovery/backups/manual/1767225600000-06841a68/database.sqlite",
+            "quarantine": "/tmp/trademinator-m1-final-20261015-1758/backup-recovery/quarantine/1792087111355-c927e7b3",
+            "reconciliation_required": true,
+            "skipped": [
+                {
+                    "path": "/tmp/trademinator-m1-final-20261015-1758/backup-recovery/backups/manual/1767225602000-3d5d07a7/database.sqlite",
+                    "reason": "SQLite snapshot SHA-256 mismatch."
+                }
+            ]
+        }
+    },
+    "isolation": {
+        "data_directories": 2,
+        "accounts_within_one_directory": 2
+    },
+    "seconds": 146.278,
+    "peak_memory_bytes": 27271168,
+    "report_path": "/tmp/trademinator-m1-final-20261015-1758/simulation-report.json"
+}

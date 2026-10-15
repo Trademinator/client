@@ -13,7 +13,7 @@ mkdir($dir, 0700, true);
 $config = $dir.'/config.json';
 file_put_contents($config, json_encode(['mode' => 'fixture', 'data_dir' => $dir.'/state', 'ipc_port' => 0,
     'interval_ms' => 10, 'retention' => 1000, 'ws_retry_seconds' => 1], JSON_THROW_ON_ERROR));
-$process = proc_open([PHP_BINARY, $root.'/bin/client.php', 'run', '--config='.$config, '--seconds='.$seconds],
+$process = proc_open([PHP_BINARY, $root.'/bin/m0.php', 'run', '--config='.$config, '--seconds='.$seconds],
     [0 => ['pipe', 'r'], 1 => ['file', $dir.'/run.json', 'w'], 2 => ['file', $dir.'/stderr.log', 'w']], $pipes);
 fclose($pipes[0]);
 $exit = proc_close($process);

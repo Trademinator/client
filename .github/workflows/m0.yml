@@ -1,4 +1,4 @@
-name: M0 runtime validation
+name: Client M0 and M1 runtime validation
 
 on:
   push:
@@ -30,9 +30,10 @@ jobs:
       - run: composer lint
       - run: composer test
       - run: composer doctor
+      - run: composer doctor:m0
       - run: php tools/soak.php 30
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: m0-${{ matrix.os }}-php${{ matrix.php }}
+          name: client-${{ matrix.os }}-php${{ matrix.php }}
           path: build/soak-*/report.json

@@ -26,7 +26,7 @@ directory fully AOT-compiled.
 
 The script runs with a non-interactive compiler input and a ten-minute limit per
 subprocess. Prepare the toolchain first; do not rely on an interactive compiler
-prompt to install PHP. `--dry` generation alone, a successful `php bin/client.php`
+prompt to install PHP. `--dry` generation alone, a successful `php bin/m0.php`
 run, and a successful embedded runtime probe each answer different questions.
 None independently proves complete AOT compatibility.
 
