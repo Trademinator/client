@@ -61,6 +61,11 @@ corresponding log file.
 Compile separately on Linux, macOS and Windows. A PHP runtime matrix does not
 validate the native toolchain. On Windows, set `TPC_BIN` to the executable path
 and supply the matching DLLs through the toolchain's documented environment.
+When `tools/validate-native.php` launches generated Windows probes, it points
+`PHPRC` at `PHP_HOME\php.ini` (falling back to the directory containing
+`PHP_BINARY`) and clears `PHP_INI_SCAN_DIR`. This keeps the relocated probes on
+the same packaged extension configuration as the validator without depending on
+machine-wide PHP ini files.
 
 ## Acceptance checks after successful builds
 

@@ -14,7 +14,7 @@ $report = ['schema' => 1, 'platform' => PHP_OS_FAMILY, 'php' => PHP_VERSION,
     'checked_at' => gmdate('c'), 'status' => 'blocked', 'checks' => [],
     'note' => 'Runtime embedding, shared-math AOT, and client AOT are separate gates. Inspect compiler logs for fallback.'];
 
-function execute(array $command, string $log, ?string $workingDirectory = null): int
+function execute(array $command, string $log, ?string $workingDirectory = null, ?array $environment = null): int
 {
     $launchWarning = null;
     set_error_handler(static function (int $severity, string $message) use (&$launchWarning): bool {
@@ -23,7 +23,7 @@ function execute(array $command, string $log, ?string $workingDirectory = null):
     });
     try {
         $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['file', $log, 'w'], 2 => ['file', $log, 'a']], $pipes,
-            $workingDirectory, null, ['bypass_shell' => true]);
+            $workingDirectory, $environment, ['bypass_shell' => true]);
     } finally {
         restore_error_handler();
     }
@@ -50,6 +50,18 @@ function execute(array $command, string $log, ?string $workingDirectory = null):
 
 $compilerReady = execute([...$compilerCommand, '--version'], $out.'/compiler.log');
 $report['checks']['compiler'] = ['exit_code' => $compilerReady];
+$runtimeEnvironment = null;
+if (PHP_OS_FAMILY === 'Windows') {
+    $phpHome = getenv('PHP_HOME');
+    if (!is_string($phpHome) || $phpHome === '') { $phpHome = dirname(PHP_BINARY); }
+    $runtimeEnvironment = getenv();
+    if (!is_array($runtimeEnvironment)) { $runtimeEnvironment = []; }
+    // Generated Windows binaries do not discover the packaged php.ini after being
+    // moved into build/validation. Point Zend at the matching runtime explicitly
+    // and ignore unrelated machine-wide scan directories.
+    $runtimeEnvironment['PHPRC'] = $phpHome.DIRECTORY_SEPARATOR.'php.ini';
+    $runtimeEnvironment['PHP_INI_SCAN_DIR'] = '';
+}
 if ($compilerReady === 0) {
     $report['compiler_version'] = trim((string) file_get_contents($out.'/compiler.log'));
     $report['status'] = 'passed';
@@ -65,7 +77,7 @@ if ($compilerReady === 0) {
         $runCode = null;
         if ($buildCode === 0 && is_file($binary)) {
             $runCommand = $name === 'math' ? [$binary] : [$binary, 'run', '--config='.$fixtureConfig, '--seconds=6'];
-            $runCode = execute($runCommand, $out.'/'.$name.'-run.log', $out);
+            $runCode = execute($runCommand, $out.'/'.$name.'-run.log', $out, $runtimeEnvironment);
             if ($runCode === 0) {
                 $payload = json_decode(trim((string) file_get_contents($out.'/'.$name.'-run.log')), true);
                 $valid = is_array($payload) && ($name === 'math' ? (($payload['status'] ?? null) === 'passed')
