@@ -4,9 +4,7 @@ declare(strict_types=1);
 
 namespace Trademinator\Client\M0;
 
-use React\Dns\Model\Message;
 use React\Dns\Resolver\ResolverInterface;
-use React\Promise\PromiseInterface;
 use RuntimeException;
 use Throwable;
 use function React\Promise\reject;
@@ -22,7 +20,11 @@ use function React\Promise\resolve;
  */
 final class SystemResolver implements ResolverInterface
 {
-    public function resolve($domain): PromiseInterface
+    // React\Dns\Model\Message::TYPE_A. Keep the native class independent from
+    // React's model classes; TypePHP only needs the ResolverInterface contract.
+    private const DNS_TYPE_A = 1;
+
+    public function resolve($domain)
     {
         try {
             return resolve($this->ipv4($domain));
@@ -31,9 +33,9 @@ final class SystemResolver implements ResolverInterface
         }
     }
 
-    public function resolveAll($domain, $type): PromiseInterface
+    public function resolveAll($domain, $type)
     {
-        if ($type !== Message::TYPE_A) {
+        if ($type !== self::DNS_TYPE_A) {
             return reject(new RuntimeException('System resolver only supports IPv4 A records.'));
         }
         try {

@@ -3,6 +3,10 @@ build-dir: build/client-aot
 sources:
   - native/main.php
   - src
+  # TypePHP must see declarations for interfaces implemented by native classes.
+  # Only the React DNS interface is native input; the React implementation stays
+  # embedded PHP as before.
+  - vendor/react/dns/src/Resolver/ResolverInterface.php
   # Keep shared math sources on the same native AOT side as MathProbe.
   # When these are only embedded as opcodes, TypePHP can lose by-reference
   # arguments to Indicators::normalize_ticker() and Indicators::ema().
