@@ -136,7 +136,7 @@ final class Ledger
         return $this->database->transaction(function () use ($accountId, $symbol, $base, $quote, $id, $options): string {
             $account = $this->account($accountId);
             if ($existing = $this->one('SELECT * FROM markets WHERE account_id=? AND symbol=?', [$accountId, $symbol])) { return $existing['id']; }
-            if ($this->one('SELECT id FROM markets WHERE account_id=? AND (base_currency=? OR quote_currency=?)', [$accountId, $quote, $base])) {
+            if (($options['allow_currency_roles'] ?? false) !== true && $this->one('SELECT id FROM markets WHERE account_id=? AND (base_currency=? OR quote_currency=?)', [$accountId, $quote, $base])) {
                 throw new RuntimeException('M1 does not yet support spending one market inventory as another market quote currency.');
             }
             $marketId = $id ?? self::uuid();
@@ -144,8 +144,27 @@ final class Ledger
             if (!is_array($lots)) { throw new InvalidArgumentException('opening_lots must be an array.'); }
             // An initial wallet holding has unknown cost unless the operator supplied its basis.
             $opening = self::decode($account['opening_balances_json']);
-            if ($lots === [] && isset($opening[$base]) && !$this->one('SELECT id FROM markets WHERE account_id=? AND base_currency=?', [$accountId, $base])) {
-                $lots[] = ['id' => self::uuid(), 'quantity' => $opening[$base], 'unit_cost' => null, 'origin' => ['kind' => 'initial_wallet'], 'acquired_at' => $account['created_at']];
+            $firstInventoryMarket = !$this->one('SELECT id FROM markets WHERE account_id=? AND base_currency=?', [$accountId, $base]);
+            if ($lots === [] && $firstInventoryMarket) {
+                $seed = null;
+                $hardPoint = self::decode($account['hard_t0_json']);
+                if (($hardPoint['kind'] ?? null) === 'HardH0') {
+                    // This is cash carried by H0, not an additional original deposit.
+                    // Full archive replay replaces it with the original wallet seed.
+                    $availableAt = \Trademinator\Client\M3\Numbers::iso((int) $hardPoint['cutoff_ms']);
+                    $seed = ['id' => self::uuid(),'quantity' => $opening[$base] ?? '0','unit_cost' => null,
+                        'origin' => ['kind' => 'hard_point_cash','account_id' => $accountId,
+                            'hardpoint_id' => $hardPoint['hardpoint_id'],'cutoff_ms' => (int) $hardPoint['cutoff_ms']],
+                        'acquired_at' => $availableAt,'available_at' => $availableAt];
+                    // Retain the descriptor even when H0 cash was zero: full
+                    // history may still have spent an original opening balance.
+                    $hardPoint['cash_inventory_seeds'][$marketId] = $seed;
+                    $this->execute('UPDATE exchange_accounts SET hard_t0_json=? WHERE id=?', [self::json($hardPoint),$accountId]);
+                }
+                if (isset($opening[$base])) {
+                    $lots[] = $seed ?? ['id' => self::uuid(),'quantity' => $opening[$base],'unit_cost' => null,
+                        'origin' => ['kind' => 'initial_wallet'],'acquired_at' => $account['created_at']];
+                }
             }
             foreach ($lots as &$lot) {
                 $lot['id'] ??= self::uuid();
@@ -308,9 +327,11 @@ final class Ledger
         return $this->database->transaction(function () use ($input): string {
             $accountId = (string) ($input['account_id'] ?? '');
             $market = $this->market((string) ($input['market_id'] ?? ''), $accountId);
+            $inventory = $this->market((string) ($input['inventory_market_id'] ?? $market['id']), $accountId);
+            if ($inventory['base_currency'] !== $market['base_currency']) { throw new RuntimeException('Allocation inventory currency differs from the SELL base currency.'); }
             $key = (string) ($input['allocation_key'] ?? '');
             if ($key === '' || strlen($key) > 255) { throw new InvalidArgumentException('An idempotency key is required for each allocation.'); }
-            $row = ['account_id' => $accountId, 'market_id' => $market['id'], 'allocation_key' => $key,
+            $row = ['account_id' => $accountId, 'market_id' => $market['id'], 'inventory_market_id' => $inventory['id'], 'allocation_key' => $key,
                 'buy_order_id' => $input['buy_order_id'] ?? null, 'buy_operation_id' => $input['buy_operation_id'] ?? null,
                 'baseline_lot_id' => $input['baseline_lot_id'] ?? null, 'sell_order_id' => (string) ($input['sell_order_id'] ?? ''),
                 'quantity' => self::decimal($input['quantity'] ?? '', true), 'buy_lot_key' => $input['buy_lot_key'] ?? null];
@@ -324,7 +345,7 @@ final class Ledger
             if ($row['buy_lot_key'] !== null && $row['buy_lot_key'] !== $sourceKey && !str_starts_with($row['buy_lot_key'], $sourceKey.':')) { throw new RuntimeException('Lot fragment does not belong to the selected acquisition.'); }
             $sourceKey = $row['buy_lot_key'] ?? $sourceKey;
             $source = null;
-            foreach ($this->marketLots($market['id']) as $lot) { if ($lot['source_key'] === $sourceKey) { $source = $lot; break; } }
+            foreach ($this->marketLots($inventory['id']) as $lot) { if ($lot['source_key'] === $sourceKey) { $source = $lot; break; } }
             if ($source === null || bccomp($row['quantity'], $source['quantity'], self::SCALE) > 0) { throw new RuntimeException('Allocation exceeds remaining BUY-equivalent inventory.'); }
             if (($source['available_at'] ?? $source['acquired_at']) > $sell['occurred_at']) { throw new RuntimeException('A SELL cannot consume a later acquisition.'); }
             $allocated = '0';
@@ -334,6 +355,7 @@ final class Ledger
             $id = self::uuid();
             $this->insert('buys_vs_sells', ['id' => $id] + $row + ['created_at' => self::timestamp($input['created_at'] ?? null)]);
             $this->touch($accountId, $market['id']);
+            if ($inventory['id'] !== $market['id']) { $this->touch($accountId, $inventory['id']); }
             return $id;
         });
     }
@@ -386,7 +408,7 @@ final class Ledger
     }
 
     /** Remaining inventory with its acquisition basis and exact source references. */
-    public function marketLots(string $marketId): array
+    public function marketLots(string $marketId, bool $includeConsumptions = true): array
     {
         $market = $this->market($marketId);
         $lots = [];
@@ -420,24 +442,34 @@ final class Ledger
                 'acquisition_cost' => $operation['price_basis'] === null ? null : self::trimDecimal(bcmul($quantity, $operation['price_basis'], self::SCALE)),
                 'origin' => ['kind' => 'deposit', 'exchange_operation_id' => $operation['exchange_operation_id'], 'operation_id' => $operation['id']], 'acquired_at' => $operation['occurred_at']];
         }
-        $consume = static function (string $key, string $quantity) use (&$lots): void {
-            if (!isset($lots[$key])) { throw new RuntimeException('An allocation references missing acquisition inventory.'); }
-            $left = bcsub($lots[$key]['quantity'], $quantity, self::SCALE);
-            if (bccomp($left, '0', self::SCALE) < 0) { throw new RuntimeException('Acquisition inventory is overallocated.'); }
-            $lots[$key]['quantity'] = self::trimDecimal($left);
-            $lots[$key]['cost_amount'] = $lots[$key]['acquisition_cost'] === null ? null : self::trimDecimal(bcdiv(bcmul($lots[$key]['acquisition_cost'], $left, self::SCALE * 2), $lots[$key]['acquisition_quantity'], self::SCALE));
-        };
-        foreach ($this->rows('SELECT * FROM buys_vs_sells WHERE market_id=?', [$marketId]) as $allocation) {
-            $key = $allocation['buy_order_id'] !== null ? 'order:' . $allocation['buy_order_id'] : ($allocation['buy_operation_id'] !== null ? 'operation:' . $allocation['buy_operation_id'] : 'baseline:' . $allocation['baseline_lot_id']);
-            $consume($allocation['buy_lot_key'] ?? $key, $allocation['quantity']);
+        foreach ($this->rows('SELECT * FROM orders WHERE account_id=? AND side=\'SELL\' ORDER BY occurred_at,id', [$market['account_id']]) as $order) {
+            $metadata = self::decode($order['metadata_json']);
+            if (($metadata['m3']['quote_inventory_market_id'] ?? null) !== $marketId) { continue; }
+            $sourceMarket = $this->market($order['market_id'], $market['account_id']);
+            foreach (\Trademinator\Client\M3\Lots::quoteAcquisitions($order, $sourceMarket, $market) as $fragment) { $lots[$fragment['source_key']] = $fragment; }
         }
-        foreach ($this->rows('SELECT lot_consumptions_json FROM operations WHERE market_id=? AND kind=\'withdrawal\'', [$marketId]) as $withdrawal) {
-            foreach (self::decode($withdrawal['lot_consumptions_json']) as $key => $quantity) { $consume($key, $quantity); }
-        }
-        // Third-currency fees are expenses and consume that currency's inventory separately.
-        foreach (['orders','operations'] as $table) {
-            foreach ($this->rows('SELECT metadata_json FROM '.$table.' WHERE account_id=?', [$market['account_id']]) as $row) {
-                foreach ((self::decode($row['metadata_json'])['m3']['inventory_debits'][$marketId] ?? []) as $key => $quantity) { $consume($key, $quantity); }
+        if ($includeConsumptions) {
+            $consume = static function (string $key, string $quantity) use (&$lots): void {
+                if (!isset($lots[$key])) { throw new RuntimeException('An allocation references missing acquisition inventory.'); }
+                $left = bcsub($lots[$key]['quantity'], $quantity, self::SCALE);
+                if (bccomp($left, '0', self::SCALE) < 0) { throw new RuntimeException('Acquisition inventory is overallocated.'); }
+                $lots[$key]['quantity'] = self::trimDecimal($left);
+                $lots[$key]['cost_amount'] = $lots[$key]['acquisition_cost'] === null ? null : self::trimDecimal(bcdiv(bcmul($lots[$key]['acquisition_cost'], $left, self::SCALE * 2), $lots[$key]['acquisition_quantity'], self::SCALE));
+            };
+            foreach ($this->rows('SELECT * FROM buys_vs_sells WHERE inventory_market_id=?', [$marketId]) as $allocation) {
+                $key = $allocation['buy_order_id'] !== null ? 'order:' . $allocation['buy_order_id'] : ($allocation['buy_operation_id'] !== null ? 'operation:' . $allocation['buy_operation_id'] : 'baseline:' . $allocation['baseline_lot_id']);
+                $consume($allocation['buy_lot_key'] ?? $key, $allocation['quantity']);
+            }
+            foreach ($this->rows('SELECT market_id,lot_consumptions_json FROM operations WHERE account_id=? AND kind=\'withdrawal\'', [$market['account_id']]) as $withdrawal) {
+                foreach (self::decode($withdrawal['lot_consumptions_json']) as $key => $quantity) {
+                    if (isset($lots[$key])) { $consume($key, $quantity); }
+                }
+            }
+            // Third-currency fees are expenses and consume that currency's inventory separately.
+            foreach (['orders','operations'] as $table) {
+                foreach ($this->rows('SELECT metadata_json FROM '.$table.' WHERE account_id=?', [$market['account_id']]) as $row) {
+                    foreach ((self::decode($row['metadata_json'])['m3']['inventory_debits'][$marketId] ?? []) as $key => $quantity) { $consume($key, $quantity); }
+                }
             }
         }
         $lots = array_values(array_filter($lots, static fn ($lot) => bccomp($lot['quantity'], '0', self::SCALE) > 0));
@@ -524,8 +556,26 @@ final class Ledger
             $id = self::uuid();
             $refs = ['order_ids' => array_column($this->rows('SELECT id FROM orders WHERE market_id=? ORDER BY id', [$marketId]), 'id'),
                 'operation_ids' => array_column($this->rows('SELECT id FROM operations WHERE market_id=? ORDER BY id', [$marketId]), 'id'),
-                'allocation_ids' => array_column($this->rows('SELECT id FROM buys_vs_sells WHERE market_id=? ORDER BY id', [$marketId]), 'id'),
+                'allocation_ids' => array_column($this->rows('SELECT id FROM buys_vs_sells WHERE market_id=? OR inventory_market_id=? ORDER BY id', [$marketId,$marketId]), 'id'),
                 'baseline_lots' => self::decode($market['baseline_lots_json']), 'hardpoint_id' => self::decode($account['hard_t0_json'])['hardpoint_id'] ?? null];
+            // A market's inventory can originate in another pair's quote proceeds or
+            // be consumed by another pair. Keep those source rows reconstructible.
+            $sourceKeys = array_fill_keys(array_column($this->marketLots($marketId, false), 'source_key'), true);
+            foreach (['orders' => 'order_ids','operations' => 'operation_ids'] as $table => $ref) {
+                foreach ($this->rows('SELECT * FROM '.$table.' WHERE account_id=? ORDER BY id', [$account['id']]) as $row) {
+                    $metadata = self::decode($row['metadata_json'])['m3'] ?? [];
+                    if (($metadata['quote_inventory_market_id'] ?? null) === $marketId || !empty($metadata['inventory_debits'][$marketId])
+                        || ($table === 'operations' && array_intersect_key(self::decode($row['lot_consumptions_json']), $sourceKeys) !== [])) {
+                        $refs[$ref][] = $row['id'];
+                    }
+                }
+            }
+            foreach ($this->rows('SELECT * FROM buys_vs_sells WHERE market_id=? OR inventory_market_id=?', [$marketId,$marketId]) as $allocation) {
+                $refs['order_ids'][] = $allocation['sell_order_id'];
+                if ($allocation['buy_order_id'] !== null) { $refs['order_ids'][] = $allocation['buy_order_id']; }
+                if ($allocation['buy_operation_id'] !== null) { $refs['operation_ids'][] = $allocation['buy_operation_id']; }
+            }
+            foreach (['order_ids','operation_ids'] as $key) { $refs[$key] = array_values(array_unique($refs[$key])); sort($refs[$key]); }
             $this->insert('checkpoints', ['id' => $id, 'account_id' => $account['id'], 'market_id' => $marketId,
                 'activity_revision' => $market['activity_revision'], 'account_revision' => $account['revision'], 'state_json' => self::json($state),
                 'wallet_balances_json' => $account['wallet_balances_json'], 'reconstruction_refs_json' => self::json($refs), 'created_at' => self::timestamp()]);
@@ -573,7 +623,10 @@ final class Ledger
             }
             $this->execute('DELETE FROM exchange_accounts WHERE id=?', [$id]);
             $this->insert('exchange_accounts', $account);
-            foreach (self::TABLES as $table) { foreach ($snapshot[$table] as $row) { $this->insert($table, $row); } }
+            foreach (self::TABLES as $table) { foreach ($snapshot[$table] as $row) {
+                if ($table === 'buys_vs_sells') { $row['inventory_market_id'] ??= $row['market_id']; }
+                $this->insert($table, $row);
+            } }
             if (!$this->database->integrityCheck()['ok']) { throw new RuntimeException('Restored snapshot failed database integrity checks.'); }
             // Validate arithmetic/lot links; unknown acquisition cost is deliberately retained.
             $this->accountState($id);

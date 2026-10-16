@@ -86,7 +86,9 @@ final class CcxtAccount
             $open = [];
             $operations = [];
             $since = $context['since_ms'];
-            foreach ($symbols as $symbol) {
+            $accountWide = $this->rest instanceof BitsoReadClient;
+            $historySymbols = $accountWide ? [null] : $symbols;
+            foreach ($historySymbols as $symbol) {
                 foreach ($this->history('fetch_my_trades', $symbol, $since) as $row) {
                     $trade = Normalize::trade($row);
                     $trades[$trade['symbol'].'|'.$trade['id']] = $trade;
@@ -133,22 +135,28 @@ final class CcxtAccount
                         foreach ($history['trades'] as $trade) {
                             $trades[$trade['symbol'].'|'.$trade['id']] = $trade;
                         }
-                        $historicalSymbols[$symbol][] = (string)$id;
+                        $historicalSymbols[$accountWide ? '' : $symbol][] = (string)$id;
                         ++$historyOnlyCount;
                     }
                 }
                 $o = $orders[$id];
+                if ($o['id'] !== (string)$id || $o['symbol'] !== $symbol) {
+                    throw new RuntimeException('Trade/order identity mismatch.');
+                }
                 if ($o['status'] === 'history_only') { continue; }
                 if (bccomp($o['filled'], '0', 24) > 0 && $this->supports('fetchOrderTrades')) {
                     foreach ($this->history('fetch_order_trades', $symbol, null, (string)$id) as $row) {
                         $trade = Normalize::trade($row);
+                        if (isset($trades[$trade['symbol'].'|'.$trade['id']]) && $trades[$trade['symbol'].'|'.$trade['id']] !== $trade) {
+                            throw new RuntimeException('Conflicting exchange trade identity.');
+                        }
                         $trades[$trade['symbol'].'|'.$trade['id']] = $trade;
                     }
                 }
             }
             foreach ($historicalSymbols as $symbol => $ids) {
                 // Confirm the complete open-order list again after the history fetch.
-                foreach ($this->history('fetch_open_orders', $symbol, null) as $row) {
+                foreach ($this->history('fetch_open_orders', $symbol === '' ? null : $symbol, null) as $row) {
                     if (in_array((string)($row['id'] ?? ''), $ids, true)) {
                         throw new RuntimeException('Historical order appeared in the open-order confirmation; retry synchronization.');
                     }
@@ -247,12 +255,33 @@ final class CcxtAccount
         $mode = $config['mode'] ?? 'time';
         $params = $config['params'] ?? [];
         $limit = $this->settings['history_limit'];
+        $bitso = $this->rest instanceof BitsoReadClient;
+        if ($bitso && in_array($method, ['fetch_open_orders', 'fetch_order_trades'], true)) {
+            $this->requestContext = ['operation' => $method, 'phase' => 'history_configuration'];
+            $openOrders = $method === 'fetch_open_orders';
+            // Accept the old example's open-order policy, but do not send its
+            // undocumented marker/sort. Neither endpoint supports pagination.
+            if (($openOrders && (array_diff(array_keys($params), ['sort']) || ($params['sort'] ?? 'desc') !== 'desc'
+                    || !in_array($config['mode'] ?? 'all', ['all', 'backward_id'], true)
+                    || ($config['cursor_param'] ?? 'marker') !== 'marker'))
+                || (!$openOrders && ($params !== [] || ($config['mode'] ?? 'all') !== 'all'))) {
+                throw new RuntimeException($openOrders ? 'Bitso open orders require an unfiltered account-wide list.'
+                    : 'Bitso order trade verification requires the complete unfiltered order history.');
+            }
+            $arguments = $openOrders ? [null, null, null, []] : [$orderId, $symbol, null, null, []];
+            $rows = $this->read($method, $arguments, ['symbol' => $symbol, 'page' => 1, 'limit' => $openOrders ? 500 : null,
+                'pagination_mode' => 'all', 'since_ms' => null, 'cursor_present' => false]);
+            if (!is_array($rows)) { throw new RuntimeException('Invalid history page.'); }
+            return $rows;
+        }
+        $bitsoTrades = $bitso && $method === 'fetch_my_trades';
         $bitsoTransfers = $this->rest instanceof BitsoReadClient && in_array($method, ['fetch_deposits', 'fetch_withdrawals'], true);
-        if ($bitsoTransfers) {
+        if ($bitsoTransfers || $bitsoTrades) {
             $this->requestContext = ['operation' => $method, 'phase' => 'history_configuration'];
             $mode = $config['mode'] ?? 'backward_id';
             if ($mode !== 'backward_id' || ($config['cursor_param'] ?? 'marker') !== 'marker' || array_key_exists('marker', $params)) {
-                throw new RuntimeException('Bitso transfer history requires unfiltered backward marker pagination.');
+                throw new RuntimeException($bitsoTrades ? 'Bitso trade history requires unfiltered backward marker pagination.'
+                    : 'Bitso transfer history requires unfiltered backward marker pagination.');
             }
             $limit = min(100, $limit);
         }
@@ -280,14 +309,18 @@ final class CcxtAccount
                 $timestamp = Normalize::timestamp($row);
                 $min = min($min, $timestamp);
                 $max = max($max, $timestamp);
-                if ($bitsoTransfers || $edge === null || ($mode === 'backward_id' ? [$timestamp,$id] < [$edge['timestamp'],$edge['id']] : [$timestamp,$id] > [$edge['timestamp'],$edge['id']])) {
+                if ($bitsoTransfers || $bitsoTrades || $edge === null || ($mode === 'backward_id' ? [$timestamp,$id] < [$edge['timestamp'],$edge['id']] : [$timestamp,$id] > [$edge['timestamp'],$edge['id']])) {
                     $edge = ['id' => $id,'timestamp' => $timestamp];
                 }
                 if ($bitsoTransfers && isset($seen[$id]) && $seen[$id] !== $row) {
                     throw new RuntimeException('Bitso transfer changed during pagination; repeat the account snapshot.');
                 }
+                $evidence = $bitsoTrades ? Normalize::trade($row) : ($bitsoTransfers ? $row : true);
+                if ($bitsoTrades && isset($seen[$id]) && $seen[$id] !== $evidence) {
+                    throw new RuntimeException('Conflicting exchange trade identity.');
+                }
                 if (!isset($seen[$id])) {
-                    $seen[$id] = $bitsoTransfers ? $row : true;
+                    $seen[$id] = $evidence;
                     $new++;
                     if ($since === null || $timestamp >= $since) {
                         $result[] = $row;

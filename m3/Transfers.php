@@ -160,52 +160,24 @@ final class Transfers
             if (bccomp($w['amount'], $d['amount'], 24) !== 0) {
                 throw new RuntimeException('Unexplained transfer amount difference; confirmed fee evidence is required.');
             }
-            if ($w['market_id'] === null || $d['market_id'] === null) {
+            if ($d['market_id'] === null) {
                 throw new RuntimeException('Transfer cost attribution requires registered inventory markets.');
             }
-            $sourceMarket = $this->accounting->rows('SELECT * FROM markets WHERE id=?', [$w['market_id']])[0];
             $targetMarket = $this->accounting->rows('SELECT * FROM markets WHERE id=?', [$d['market_id']])[0];
-            $rate = null;
-            if ($sourceMarket['quote_currency'] !== $targetMarket['quote_currency']) {
-                $rate = $dm['m3']['fx_rates'][$sourceMarket['quote_currency']] ?? null;
-                if ($rate === null || ($rate['quote'] ?? null) !== $targetMarket['quote_currency']) {
-                    throw new RuntimeException('Transfer quote currencies differ; an audited historical conversion is required.');
-                }
-                $rate['price'] = Ledger::decimal($rate['price'], true);
-            }
             $this->accounting->rebuild($w['account_id']);
             $w = $this->accounting->rows('SELECT * FROM operations WHERE id=?', [$withdrawal])[0];
+            $wm = Numbers::decode($w['metadata_json']);
             $sources = [];
-            foreach (Numbers::decode($sourceMarket['baseline_lots_json']) as $lot) {
-                $sources['baseline:'.$lot['id']] = $lot;
-            }
-            foreach (['orders','operations'] as $table) {
-                foreach ($this->accounting->rows('SELECT * FROM '.$table.' WHERE market_id=?', [$w['market_id']]) as $row) {
-                    if (($row['side'] ?? 'BUY') !== 'BUY' || ($row['kind'] ?? 'deposit') !== 'deposit') {
-                        continue;
+            $ledger = new Ledger($this->db);
+            // One wallet currency can be held in several markets, including receipts
+            // from another market's SELL. Reconstruct every consumed acquisition,
+            // even when the withdrawal depleted it completely.
+            foreach ($this->accounting->rows('SELECT * FROM markets WHERE account_id=? AND base_currency=? ORDER BY id', [$w['account_id'],$w['currency']]) as $sourceMarket) {
+                foreach ($ledger->marketLots($sourceMarket['id'], false) as $lot) {
+                    if (isset($sources[$lot['source_key']])) {
+                        throw new RuntimeException('Transfer source lot has ambiguous inventory attribution.');
                     }
-                    $lots = Lots::acquisition($row, $sourceMarket);
-                    if ($lots === null) {
-                        // Existing M1 acquisitions retain their exact original ledger representation.
-                        $this->db->pdo()->exec('SAVEPOINT legacy_transfer_lots');
-                        try {
-                            $snapshot = (function () use ($w, $row, $table): array {
-                                $this->accounting->execute('DELETE FROM buys_vs_sells WHERE market_id=?', [$w['market_id']]);
-                                $this->accounting->execute("UPDATE operations SET lot_consumptions_json='{}' WHERE market_id=?", [$w['market_id']]);
-                                return (new Ledger($this->db))->marketLots($w['market_id']);
-                            })();
-                        } finally {
-                            $this->db->pdo()->exec('ROLLBACK TO SAVEPOINT legacy_transfer_lots');
-                            $this->db->pdo()->exec('RELEASE SAVEPOINT legacy_transfer_lots');
-                        }
-                        foreach ($snapshot as $lot) {
-                            $sources[$lot['source_key']] = $lot;
-                        }
-                    } else {
-                        foreach ($lots as $lot) {
-                            $sources[$lot['source_key']] = $lot;
-                        }
-                    }
+                    $sources[$lot['source_key']] = array_replace($lot, ['inventory_market_id' => $sourceMarket['id'],'quote_currency' => $sourceMarket['quote_currency']]);
                 }
             }
             $left = Numbers::sub($d['amount'], Lots::fee($d, $d['currency']));
@@ -216,9 +188,17 @@ final class Transfers
                 if (bccomp($take, '0', 24) === 0) {
                     continue;
                 }
+                $rate = null;
+                if ($lot['unit_cost'] !== null && $lot['quote_currency'] !== $targetMarket['quote_currency']) {
+                    $rate = $dm['m3']['fx_rates'][$lot['quote_currency']] ?? null;
+                    if ($rate === null || ($rate['quote'] ?? null) !== $targetMarket['quote_currency']) {
+                        throw new RuntimeException('Transfer quote currencies differ; an audited historical conversion is required.');
+                    }
+                    $rate['price'] = Ledger::decimal($rate['price'], true);
+                }
                 $lots[] = ['id' => hash('sha256', $withdrawal.'|'.$key),'quantity' => $take,'unit_cost' => $lot['unit_cost'] === null ? null : ($rate === null ? $lot['unit_cost'] : Numbers::decimal(bcmul($lot['unit_cost'], $rate['price'], 24))),
                     'acquired_at' => $lot['acquired_at'],'origin' => ['kind' => 'transfer','source_account' => $w['account_id'],'source_key' => $key,
-                        'withdrawal_id' => $withdrawal,'quote_currency' => $sourceMarket['quote_currency'],'original_unit_cost' => $lot['unit_cost'],'conversion' => $rate,'acquisition' => $lot['origin'] ?? []]];
+                        'withdrawal_id' => $withdrawal,'inventory_market_id' => $lot['inventory_market_id'],'quote_currency' => $lot['quote_currency'],'original_unit_cost' => $lot['unit_cost'],'conversion' => $rate,'acquisition' => $lot['origin'] ?? []]];
                 $left = Numbers::sub($left, $take);
                 if (bccomp($left, '0', 24) === 0) {
                     break;

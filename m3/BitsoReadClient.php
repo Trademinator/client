@@ -26,6 +26,136 @@ class BitsoReadClient extends \ccxt\async\bitso
         return is_string($input) && $input !== '' && parent::is_json_encoded_object($input);
     }
 
+    public function fetch_my_trades(?string $symbol = null, ?int $since = null, ?int $limit = 25, $params = []): PromiseInterface
+    {
+        return async(function () use ($symbol, $since, $limit, $params): array {
+            // Bitso's book filter is optional. Scanning today's available_books
+            // loses executions in removed markets, including their quote receipts.
+            // https://docs.bitso.com/bitso-api/docs/user-trades
+            if ($symbol !== null || $since !== null || array_diff(array_keys($params), ['marker', 'sort'])
+                || (isset($params['sort']) && $params['sort'] !== 'desc') || ($limit !== null && $limit < 1)) {
+                throw new RuntimeException('Bitso trade history requires unfiltered backward marker pagination.');
+            }
+            $request = ['limit' => min(100, $limit ?? 100), 'sort' => 'desc'];
+            if (array_key_exists('marker', $params)) {
+                // Trade IDs are strings; intval can corrupt IDs above PHP_INT_MAX.
+                $request['marker'] = Normalize::id($params['marker']);
+            }
+            await($this->load_markets());
+            $rows = $this->privateTrades($this->historyPayload(await($this->privateGetUserTrades($request)), $request['limit']));
+            $previous = PHP_INT_MAX;
+            foreach ($rows as $row) {
+                if ($row['timestamp'] > $previous) {
+                    throw new RuntimeException('Bitso trade history is not in backward chronological order.');
+                }
+                $previous = $row['timestamp'];
+            }
+            // Preserve server order for the marker, including equal timestamps.
+            // CCXT parse_trades sorts locally and is unsuitable for this boundary.
+            return $rows;
+        })();
+    }
+
+    public function fetch_order_trades(string $id, ?string $symbol = null, ?int $since = null, ?int $limit = null, $params = []): PromiseInterface
+    {
+        return async(function () use ($id, $symbol, $since, $limit, $params): array {
+            if ($since !== null || $limit !== null || $params !== []) {
+                throw new RuntimeException('Bitso order trade verification requires the complete unfiltered order history.');
+            }
+            await($this->load_markets());
+            // This endpoint accepts an order ID, not a current market. Parse the
+            // book recorded on each fill so delisted pairs remain verifiable.
+            $rows = $this->historyPayload(await($this->privateGetOrderTradesOid(['oid' => Normalize::id($id)])));
+            return $this->privateTrades($rows, $id, $symbol);
+        })();
+    }
+
+    public function fetch_open_orders(?string $symbol = null, ?int $since = null, ?int $limit = null, $params = []): PromiseInterface
+    {
+        return async(function () use ($symbol, $since, $limit, $params): array {
+            if ($symbol !== null || $since !== null || $params !== [] || ($limit !== null && $limit < 1)) {
+                throw new RuntimeException('Bitso open orders require an unfiltered account-wide list.');
+            }
+            await($this->load_markets());
+            // The documented endpoint has a limit (default 500), no marker.
+            // Never call a capped list complete or trim it using CCXT's parser.
+            // https://docs.bitso.com/bitso-api/docs/list-open-orders
+            $limit = min(500, $limit ?? 500);
+            $rows = $this->historyPayload(await($this->privateGetOpenOrders(['limit' => $limit])), $limit);
+            if (count($rows) === $limit) {
+                throw new RuntimeException('Bitso open-order list reached its limit; completeness cannot be confirmed.');
+            }
+            $out = [];
+            $seen = [];
+            foreach ($rows as $raw) {
+                if (!is_array($raw)) { throw new RuntimeException('Bitso private history response is invalid.'); }
+                $expected = $this->spotSymbol($raw);
+                $row = parent::parse_order($raw);
+                $order = Normalize::order($row);
+                if ($order['symbol'] !== $expected || !in_array($order['status'], ['open', 'partially_filled'], true)
+                    || isset($seen[$order['id']])) {
+                    throw new RuntimeException('Bitso open-order identity, market or status is invalid.');
+                }
+                $seen[$order['id']] = true;
+                $out[] = $row;
+            }
+            return $out;
+        })();
+    }
+
+    private function historyPayload(mixed $response, ?int $limit = null): array
+    {
+        if (!is_array($response) || ($response['success'] ?? null) !== true
+            || !is_array($response['payload'] ?? null) || !array_is_list($response['payload'])
+            || ($limit !== null && count($response['payload']) > $limit)) {
+            throw new RuntimeException('Bitso private history response is invalid.');
+        }
+        return $response['payload'];
+    }
+
+    private function privateTrades(array $rows, ?string $orderId = null, ?string $symbol = null): array
+    {
+        $out = [];
+        $seen = [];
+        foreach ($rows as $raw) {
+            if (!is_array($raw) || !isset($raw['major'], $raw['minor'], $raw['fees_amount'], $raw['fees_currency'])
+                || !in_array($raw['side'] ?? null, ['buy', 'sell'], true)) {
+                throw new RuntimeException('Bitso private trade evidence is incomplete.');
+            }
+            $expected = $this->spotSymbol($raw);
+            $row = parent::parse_trade($raw);
+            $trade = Normalize::trade($row);
+            if ($trade['symbol'] !== $expected || ($symbol !== null && $trade['symbol'] !== $symbol)
+                || ($orderId !== null && $trade['order'] !== $orderId)) {
+                throw new RuntimeException('Historical order trade identity, market or side differs.');
+            }
+            if (isset($seen[$trade['id']]) && $seen[$trade['id']] !== $trade) {
+                throw new RuntimeException('Conflicting exchange trade identity.');
+            }
+            $seen[$trade['id']] = $trade;
+            $out[] = $row;
+        }
+        return $out;
+    }
+
+    private function spotSymbol(array $raw): string
+    {
+        if (isset($raw['margin_order_type']) && $raw['margin_order_type'] !== '') {
+            throw new RuntimeException('Bitso margin activity is unsupported by spot accounting.');
+        }
+        $book = $raw['book'] ?? null;
+        if (!is_string($book) || count($parts = explode('_', $book)) !== 2 || in_array('', $parts, true)) {
+            throw new RuntimeException('Bitso private history market is invalid.');
+        }
+        $base = $this->safe_currency_code($parts[0]);
+        $quote = $this->safe_currency_code($parts[1]);
+        if ((isset($raw['major_currency']) && (!is_string($raw['major_currency']) || $this->safe_currency_code($raw['major_currency']) !== $base))
+            || (isset($raw['minor_currency']) && (!is_string($raw['minor_currency']) || $this->safe_currency_code($raw['minor_currency']) !== $quote))) {
+            throw new RuntimeException('Bitso private history currencies conflict with its order book.');
+        }
+        return Normalize::symbol($base.'/'.$quote);
+    }
+
     public function fetch_deposits(?string $code = null, ?int $since = null, ?int $limit = null, $params = []): PromiseInterface
     {
         return $this->transferPage('deposit', $code, $since, $limit, $params);

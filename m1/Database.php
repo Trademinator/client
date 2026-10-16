@@ -11,7 +11,7 @@ use Throwable;
 /** SQLite is the durable authority; all financial writers serialize with BEGIN IMMEDIATE. */
 final class Database
 {
-    public const SCHEMA_VERSION = 4;
+    public const SCHEMA_VERSION = 5;
 
     private PDO $connection;
     private int $depth = 0;
@@ -77,6 +77,12 @@ final class Database
             $columns = array_column($connection->query('PRAGMA table_info(orders)')->fetchAll(PDO::FETCH_ASSOC), null, 'name');
             if (($columns['quantity']['notnull'] ?? 1) !== 0 || ($columns['remaining_quantity']['notnull'] ?? 1) !== 0) {
                 throw new RuntimeException('Incomplete M3 historical-order schema.');
+            }
+        }
+        if ($version >= 5) {
+            $columns = array_column($connection->query('PRAGMA table_info(buys_vs_sells)')->fetchAll(PDO::FETCH_ASSOC), null, 'name');
+            if (($columns['inventory_market_id']['notnull'] ?? 0) !== 1) {
+                throw new RuntimeException('Incomplete M3 currency-inventory schema.');
             }
         }
         return $version;
@@ -239,6 +245,34 @@ ALTER TABLE orders_v4 RENAME TO orders;
 CREATE INDEX orders_market_status ON orders(market_id,status);
 SQL);
                 $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(4,?)')->execute([gmdate('c')]);
+            }
+            if ($version < 5) {
+                $this->connection->exec(<<<'SQL'
+CREATE UNIQUE INDEX orders_account_identity ON orders(id,account_id);
+CREATE UNIQUE INDEX operations_account_identity ON operations(id,account_id);
+CREATE TABLE buys_vs_sells_v5 (
+ id TEXT PRIMARY KEY, account_id TEXT NOT NULL, market_id TEXT NOT NULL,
+ allocation_key TEXT NOT NULL, buy_order_id TEXT, buy_operation_id TEXT, baseline_lot_id TEXT,
+ sell_order_id TEXT NOT NULL, quantity TEXT NOT NULL, created_at TEXT NOT NULL,
+ buy_lot_key TEXT, inventory_market_id TEXT NOT NULL,
+ CHECK((buy_order_id IS NOT NULL)+(buy_operation_id IS NOT NULL)+(baseline_lot_id IS NOT NULL)=1),
+ UNIQUE(account_id,allocation_key),
+ FOREIGN KEY(market_id,account_id) REFERENCES markets(id,account_id) ON DELETE CASCADE,
+ FOREIGN KEY(inventory_market_id,account_id) REFERENCES markets(id,account_id) ON DELETE CASCADE,
+ FOREIGN KEY(buy_order_id,account_id) REFERENCES orders(id,account_id),
+ FOREIGN KEY(buy_operation_id,account_id) REFERENCES operations(id,account_id),
+ FOREIGN KEY(sell_order_id,account_id,market_id) REFERENCES orders(id,account_id,market_id)
+);
+INSERT INTO buys_vs_sells_v5 SELECT buys_vs_sells.*,market_id FROM buys_vs_sells;
+DROP TABLE buys_vs_sells;
+ALTER TABLE buys_vs_sells_v5 RENAME TO buys_vs_sells;
+CREATE INDEX allocations_buy_order ON buys_vs_sells(buy_order_id);
+CREATE INDEX allocations_buy_operation ON buys_vs_sells(buy_operation_id);
+CREATE INDEX allocations_baseline ON buys_vs_sells(baseline_lot_id);
+CREATE INDEX allocations_sell ON buys_vs_sells(sell_order_id);
+CREATE INDEX allocations_inventory_market ON buys_vs_sells(inventory_market_id);
+SQL);
+                $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(5,?)')->execute([gmdate('c')]);
             }
             if (!$this->integrityCheck()['ok']) { throw new RuntimeException('M3 migration failed database integrity checks.'); }
         });

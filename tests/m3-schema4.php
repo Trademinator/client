@@ -38,6 +38,25 @@ try {
     $pdo->exec(<<<'SQL'
 PRAGMA foreign_keys=OFF;
 BEGIN IMMEDIATE;
+CREATE TABLE buys_vs_sells_v3 (
+ id TEXT PRIMARY KEY, account_id TEXT NOT NULL, market_id TEXT NOT NULL,
+ allocation_key TEXT NOT NULL, buy_order_id TEXT, buy_operation_id TEXT, baseline_lot_id TEXT,
+ sell_order_id TEXT NOT NULL, quantity TEXT NOT NULL, created_at TEXT NOT NULL, buy_lot_key TEXT,
+ CHECK((buy_order_id IS NOT NULL)+(buy_operation_id IS NOT NULL)+(baseline_lot_id IS NOT NULL)=1),
+ UNIQUE(account_id,allocation_key),
+ FOREIGN KEY(market_id,account_id) REFERENCES markets(id,account_id) ON DELETE CASCADE,
+ FOREIGN KEY(buy_order_id,account_id,market_id) REFERENCES orders(id,account_id,market_id),
+ FOREIGN KEY(buy_operation_id,account_id,market_id) REFERENCES operations(id,account_id,market_id),
+ FOREIGN KEY(sell_order_id,account_id,market_id) REFERENCES orders(id,account_id,market_id)
+);
+INSERT INTO buys_vs_sells_v3 SELECT id,account_id,market_id,allocation_key,buy_order_id,buy_operation_id,baseline_lot_id,sell_order_id,quantity,created_at,buy_lot_key FROM buys_vs_sells;
+DROP TABLE buys_vs_sells;
+ALTER TABLE buys_vs_sells_v3 RENAME TO buys_vs_sells;
+CREATE INDEX allocations_buy_order ON buys_vs_sells(buy_order_id);
+CREATE INDEX allocations_buy_operation ON buys_vs_sells(buy_operation_id);
+CREATE INDEX allocations_baseline ON buys_vs_sells(baseline_lot_id);
+CREATE INDEX allocations_sell ON buys_vs_sells(sell_order_id);
+DROP INDEX operations_account_identity;
 CREATE TABLE orders_v3 (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL, market_id TEXT NOT NULL,
  exchange_order_id TEXT NOT NULL, side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
@@ -55,7 +74,7 @@ INSERT INTO orders_v3 SELECT * FROM orders;
 DROP TABLE orders;
 ALTER TABLE orders_v3 RENAME TO orders;
 CREATE INDEX orders_market_status ON orders(market_id,status);
-DELETE FROM schema_migrations WHERE version=4;
+DELETE FROM schema_migrations WHERE version>=4;
 COMMIT;
 PRAGMA foreign_keys=ON;
 SQL);
@@ -70,7 +89,7 @@ SQL);
 
     $db = new Database($root.'/client.sqlite');
     $ledger = new Ledger($db);
-    check(Database::schemaVersion($db->pdo()) === 4, 'existing schema 3 upgrades to schema 4');
+    check(Database::schemaVersion($db->pdo()) === 5, 'existing schema 3 upgrades through schema 4 to schema 5');
     check($ledger->accountSnapshot($id) === $before, 'migration preserves every financial row, ID and observation');
     check($db->integrityCheck()['ok'] && (int)$db->pdo()->query('PRAGMA foreign_keys')->fetchColumn() === 1, 'migration validates and re-enables foreign keys');
     $backups = (new Backup($db, $root))->list('pre-migration');
@@ -80,7 +99,7 @@ SQL);
     $backupPdo = null;
     unset($ledger, $db);
     $db = new Database($root.'/client.sqlite');
-    check(count((new Backup($db, $root))->list('pre-migration')) === 1, 'reopening schema 4 does not repeat the migration');
+    check(count((new Backup($db, $root))->list('pre-migration')) === 1, 'reopening the current schema does not repeat the migration');
 
     $rejected = false;
     try { new Database($root.'/fault/client.sqlite'); } catch (Throwable) { $rejected = true; }

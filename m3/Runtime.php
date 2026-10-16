@@ -21,6 +21,7 @@ final class Runtime
     private array $states = [];
     private array $tasks = [];
     private array $syncs = [];
+    private array $priceTasks = [];
     private const PROGRESS_INTERVAL_MS = 30000;
     private array $watchers = [];
     private array $generation = [];
@@ -158,7 +159,7 @@ final class Runtime
         $generation = $this->generation[$id];
         $eventSequence = $this->states[$id]['event_sequence'];
         $this->tasks[$id] = true;
-        $this->syncs[$id] = ['started_at_ms' => $now, 'stage' => 'rest_snapshot', 'next_log_at_ms' => $now + self::PROGRESS_INTERVAL_MS];
+        $this->syncs[$id] = ['started_at_ms' => $now, 'stage' => 'prepare_reconciliation', 'next_log_at_ms' => $now + self::PROGRESS_INTERVAL_MS];
         $this->states[$id]['due'] = $now + $this->settings['sync_interval_ms'];
         $this->emit('info', 'exchange_sync_started', ['account_id' => $id], 'Synchronizing exchange account; collecting authoritative REST history.');
         try {
@@ -168,24 +169,59 @@ final class Runtime
                 if ($this->states[$id]['cursor_ms'] !== null && !($this->hard?->verificationPending($id) ?? false)) {
                     $context['since_ms'] = max($context['since_ms'], $this->states[$id]['cursor_ms'] - $this->settings['overlap_ms']);
                 }
+                $this->syncs[$id]['stage'] = 'rest_snapshot';
                 $batch = await($this->clients[$id]->snapshot($context));
-                $this->syncs[$id]['stage'] = 'deposit_pricing';
                 if ($this->clients[$id] instanceof CcxtAccount) {
+                    $this->syncs[$id]['stage'] = 'inventory_validation';
+                    $this->reconciler->validateInventory($id, $batch, $account);
+                    $this->syncs[$id]['stage'] = 'deposit_pricing';
+                    $this->accounting->prepareMarkets($id, $batch);
                     $prices = new Prices($this->clients[$id]->publicClient(), $account, $this->settings['timeout_ms']);
-                    foreach ($batch['operations'] as $op) {
-                        if ($op['kind'] !== 'deposit' || $op['currency'] === $account['valuation_quote']) {
-                            continue;
+                    $this->priceTasks[$id] = $prices;
+                    try {
+                        $storedDeposits = array_column($this->accounting->rows("SELECT * FROM operations WHERE account_id=? AND kind='deposit'", [$id]), null, 'exchange_operation_id');
+                        $deposits = [];
+                        foreach ($batch['operations'] as $op) {
+                            if ($op['kind'] === 'deposit') { $deposits[$op['id']] = $op; }
                         }
-                        if ($this->accounting->rows('SELECT id FROM operations WHERE account_id=? AND exchange_operation_id=?', [$id,$op['id']]) !== []) {
-                            continue;
+                        // The sender may reveal a different cost denomination after
+                        // this deposit left the current REST overlap. Retry missing FX
+                        // evidence for live, unlinked deposits without changing basis.
+                        foreach ($storedDeposits as $operationId => $row) {
+                            $deposits[$operationId] ??= ['id' => $operationId, 'currency' => $row['currency'],
+                                'timestamp' => Numbers::ms($row['occurred_at'])];
                         }
-                        $market = $this->accounting->currencyMarket($id, $op['currency'], $account);
-                        $batch['prices'][$op['id']] = await($prices->estimate($op['currency'], $market['quote_currency'], $op['timestamp']));
-                        foreach (array_unique(array_column($this->settings['accounts'], 'valuation_quote')) as $sourceQuote) {
-                            if ($sourceQuote !== $market['quote_currency']) {
-                                $batch['transfer_rates'][$op['id']][$sourceQuote] = await($prices->estimate($sourceQuote, $market['quote_currency'], $op['timestamp']));
+                        $this->syncs[$id]['pricing'] = ['deposits_total' => count($deposits), 'deposits_finished' => 0];
+                        foreach ($deposits as $op) {
+                            $this->syncs[$id]['pricing']['deposit'] = ['ref' => substr(hash('sha256', (string)$op['id']), 0, 16),
+                                'currency' => $op['currency'], 'at_ms' => $op['timestamp']];
+                            try {
+                                $existing = $storedDeposits[$op['id']] ?? null;
+                                $meta = $existing === null ? [] : Numbers::decode($existing['metadata_json'])['m3'] ?? [];
+                                if (isset($meta['transfer'])) { continue; }
+                                $market = ($existing['market_id'] ?? null) !== null
+                                    ? $this->accounting->rows('SELECT * FROM markets WHERE id=? AND account_id=?', [$existing['market_id'],$id])[0]
+                                    : $this->accounting->currencyMarket($id, $op['currency'], $account);
+                                if ($market === null) { continue; }
+                                if ($existing === null) {
+                                    $batch['prices'][$op['id']] = await($prices->estimate($op['currency'], $market['quote_currency'], $op['timestamp']));
+                                }
+                                $otherAccounts = array_filter($this->settings['accounts'], static fn ($a) => $a['account_id'] !== $id);
+                                $sourceQuotes = array_merge(array_column($otherAccounts, 'valuation_quote'),
+                                    array_column($this->accounting->rows('SELECT DISTINCT quote_currency FROM markets WHERE base_currency=? AND account_id<>?', [$op['currency'],$id]), 'quote_currency'));
+                                foreach (array_unique($sourceQuotes) as $sourceQuote) {
+                                    if ($sourceQuote === $market['quote_currency'] || isset($meta['fx_rates'][$sourceQuote])
+                                        || isset($batch['transfer_rates'][$op['id']][$sourceQuote])) { continue; }
+                                    $rate = await($prices->estimate($sourceQuote, $market['quote_currency'], $op['timestamp']));
+                                    if ($rate !== null) { $batch['transfer_rates'][$op['id']][$sourceQuote] = $rate; }
+                                }
+                            } finally {
+                                if (isset($this->syncs[$id]['pricing'])) { ++$this->syncs[$id]['pricing']['deposits_finished']; }
                             }
                         }
+                    } finally {
+                        $prices->close();
+                        unset($this->priceTasks[$id]);
                     }
                 }
                 return $batch;
@@ -206,6 +242,7 @@ final class Runtime
                     if ($result['reconciled']) {
                         $this->states[$id]['cursor_ms'] = $batch['started_at_ms'] ?? $batch['at_ms'];
                     }
+                    $this->syncs[$id]['stage'] = 'transfer_matching';
                     $links = (new Transfers($this->db, $this->settings, $this->dataDir))->autoLink();
                     $this->transferCandidates = (new Transfers($this->db, $this->settings, $this->dataDir))->candidates();
                     $this->transferBlocks = [];
@@ -222,7 +259,9 @@ final class Runtime
                         $this->emit(($link['linked'] ?? false) ? 'info' : 'warning', 'exchange_transfer_match', $link, 'Transfer matching reviewed.');
                     }
                     if ($this->hard !== null && $result['reconciled']) {
+                        $this->syncs[$id]['stage'] = 'hardpoint_verification';
                         $this->hard->verifyPending($id, $batch);
+                        $this->syncs[$id]['stage'] = 'hardpoint_capture';
                         $this->hard->capture($id);
                     }
                     if (($batch['history_only_orders'] ?? 0) > 0) {
@@ -240,24 +279,28 @@ final class Runtime
             }, function (Throwable $error) use ($id, $generation): void {
                 if ($this->closed || $generation !== $this->generation[$id]) {
                     return;
-                }unset($this->tasks[$id], $this->syncs[$id]);
-                $this->failed($id, $error);
+                }
+                $stage = $this->syncs[$id]['stage'];
+                unset($this->tasks[$id], $this->syncs[$id]);
+                $this->failed($id, $error, $stage);
             });
         } catch (Throwable $error) {
+            $stage = $this->syncs[$id]['stage'] ?? 'prepare_reconciliation';
             unset($this->tasks[$id], $this->syncs[$id]);
-            $this->failed($id, $error);
+            $this->failed($id, $error, $stage);
         }
     }
     private static function auth(Throwable $e): bool
     {
         return is_a($e, 'ccxt\\AuthenticationError') || is_a($e, 'ccxt\\PermissionDenied') || is_a($e, 'ccxt\\AccountSuspended');
     }
-    private function failed(string $id, Throwable $error): void
+    private function failed(string $id, Throwable $error, ?string $stage = null): void
     {
+        $stage ??= $this->syncs[$id]['stage'] ?? 'reconcile_account';
         $this->reconciler->invalidate($id);
         $this->states[$id]['rest_ok'] = false;
         if (self::auth($error)) {
-            $this->blockAuth($id, $error, 'rest_snapshot');
+            $this->blockAuth($id, $error, $stage);
             return;
         }
         $failures = ++$this->states[$id]['failures'];
@@ -269,7 +312,7 @@ final class Runtime
         $exchange = $this->accounting->rows('SELECT exchange FROM exchange_accounts WHERE id=?', [$id])[0]['exchange'];
         $call = $this->clients[$id] instanceof CcxtAccount ? $this->clients[$id]->failureContext($error) : [];
         $diagnostic = array_merge(['account_id' => $id, 'exchange' => $exchange,
-            'operation' => 'reconcile_account', 'error_type' => get_class($error)],
+            'stage' => $stage, 'operation' => $stage, 'error_type' => get_class($error)],
             $call, SyncDiagnostics::describe($error, $exchange));
         $this->states[$id]['last_error'] = $diagnostic;
         $summary = $exchange.' '.$diagnostic['operation'].(empty($diagnostic['symbol']) ? '' : ' '.$diagnostic['symbol']);
@@ -278,6 +321,9 @@ final class Runtime
         }
         if (isset($diagnostic['http_status'])) {
             $summary .= ' (HTTP '.$diagnostic['http_status'].')';
+        }
+        if (isset($diagnostic['source_file'], $diagnostic['source_line'])) {
+            $summary .= ' ('.$diagnostic['source_file'].':'.$diagnostic['source_line'].')';
         }
         $this->emit('warning', 'exchange_sync_failed', $diagnostic + ['retry_in_ms' => $delay],
             $summary.': '.$diagnostic['detail'].' New orders are blocked.');
@@ -338,6 +384,10 @@ final class Runtime
             'elapsed_ms' => max(0, $now - $sync['started_at_ms']), 'stage' => $sync['stage']];
         if ($sync['stage'] === 'rest_snapshot' && $this->clients[$id] instanceof CcxtAccount) {
             $progress += $this->clients[$id]->snapshotProgress($now);
+        }
+        if ($sync['stage'] === 'deposit_pricing') {
+            $progress['pricing'] = $sync['pricing'] ?? [];
+            if (isset($this->priceTasks[$id])) { $progress += $this->priceTasks[$id]->progress($now); }
         }
         return $progress;
     }
@@ -412,6 +462,8 @@ final class Runtime
         if ($this->closed) {
             return;
         }$this->closed = true;
+        foreach ($this->priceTasks as $prices) { $prices->close(); }
+        $this->priceTasks = [];
         foreach ($this->clients as $id => $client) {
             $this->generation[$id]++;
             $client->close();

@@ -37,6 +37,16 @@ final class Reconciler
         }
         return ['since_ms' => $since,'known_orders' => $orders,'symbols' => array_column($this->accounting->rows('SELECT symbol FROM markets WHERE account_id=?', [$account]), 'symbol')];
     }
+    /** Quantity attribution is independent of prices; reject it before expensive public lookups. */
+    public function validateInventory(string $account, array $batch, array $settings): void
+    {
+        if (($batch['complete'] ?? false) !== true) { throw new RuntimeException('Incomplete exchange snapshot.'); }
+        $copy = new Database(':memory:');
+        (new Ledger($copy))->restoreAccountSnapshot($this->ledger->accountSnapshot($account));
+        $accounting = new Accounting($copy);
+        $accounting->ingest($account, $batch, $settings);
+        $accounting->rebuild($account);
+    }
     public function apply(string $account, array $batch, array $settings): array
     {
         $this->invalidate($account);

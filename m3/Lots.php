@@ -28,6 +28,7 @@ final class Lots
             return null;
         }
         $isOrder = isset($row['exchange_order_id']);
+        if ($isOrder && !array_key_exists('fills', $m)) { return null; }
         $type = $isOrder ? 'order' : 'operation';
         $prefix = $type.':'.$row['id'];
         $lots = [];
@@ -69,6 +70,42 @@ final class Lots
             $part['acquisition_quantity'] = $part['quantity'];
             $part['acquisition_cost'] = $part['cost_amount'];
             $lots[] = $part;
+        }
+        return $lots;
+    }
+
+    /** The acquired quote leg of a real SELL; never a fabricated BUY or deposit. */
+    public static function quoteAcquisitions(array $order, array $sourceMarket, array $inventoryMarket): array
+    {
+        if ($order['side'] !== 'SELL' || $sourceMarket['quote_currency'] !== $inventoryMarket['base_currency']) { return []; }
+        $meta = Numbers::decode($order['metadata_json']);
+        $fills = $meta['m3']['fills'] ?? [['id' => 'legacy:'.$order['exchange_order_id'], 'timestamp' => Numbers::ms($order['occurred_at']),
+            'amount' => $order['filled_quantity'], 'cost' => $order['cost_amount'], 'fees' => self::fees($order)]];
+        $lots = [];
+        foreach ($fills as $fill) {
+            $quantity = $fill['cost'];
+            $spent = $fill['amount'];
+            foreach ($fill['fees'] as $fee) {
+                if ($fee['currency'] === $sourceMarket['quote_currency']) { $quantity = Numbers::sub($quantity, $fee['cost']); }
+                if ($fee['currency'] === $sourceMarket['base_currency']) { $spent = Numbers::add($spent, $fee['cost']); }
+            }
+            if (bccomp($quantity, '0', 24) === 0) { continue; }
+            // The fill directly prices the quote in the sold base only. Never
+            // reuse that price as a cost in an unrelated valuation currency.
+            $cost = $inventoryMarket['quote_currency'] === $sourceMarket['base_currency'] ? $spent : null;
+            $id = 'quote:'.$fill['id'];
+            $at = Numbers::iso($fill['timestamp']);
+            $lots[] = ['id' => $id, 'source_key' => 'order:'.$order['id'].':'.$id,
+                'source_type' => 'order', 'source_id' => $order['id'], 'quantity' => $quantity,
+                'unit_cost' => $cost === null ? null : Numbers::decimal(bcdiv($cost, $quantity, 24)),
+                'cost_amount' => $cost, 'acquisition_quantity' => $quantity, 'acquisition_cost' => $cost,
+                'acquired_at' => $at, 'available_at' => $at,
+                'origin' => ['kind' => 'quote_fill', 'order_id' => $order['id'], 'trade_id' => $fill['id'],
+                    'symbol' => $sourceMarket['symbol'], 'side' => 'SELL',
+                    'received_currency' => $sourceMarket['quote_currency'], 'spent_currency' => $sourceMarket['base_currency'],
+                    'gross_received' => $fill['cost'], 'net_received' => $quantity, 'spent_amount' => $spent,
+                    'fees' => $fill['fees'], 'quote_currency' => $inventoryMarket['quote_currency'],
+                    'basis_source' => $cost === null ? 'unknown_conversion' : 'trade_quote_leg']];
         }
         return $lots;
     }

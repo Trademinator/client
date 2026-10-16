@@ -20,11 +20,20 @@ php -d memory_limit=512M tests/m2.php
 composer test:m3
 ```
 
-Schema 4 retains the eight existing tables and the schema-3 acquisition-fragment
-key in `buys_vs_sells`. It extends `orders` to preserve verified historical
-executions whose original order details are unavailable. The existing verified pre-migration backup is created
-before changing an existing database. Quantities remain decimal strings. No
-runtime, settings, or reconciliation tables are added.
+Schema 5 retains the eight existing tables and the verified historical-order
+support from schema 4. It adds `inventory_market_id` to `buys_vs_sells`, so a real
+SELL and the market owning its acquisition lot can differ. Existing allocations
+keep their original market as inventory owner. A verified pre-migration backup
+is created before changing an existing database; a failed migration rolls back.
+Quantities remain decimal strings. Existing immutable archives are not migrated.
+Older Client releases cannot open the upgraded live database.
+
+For the currency-inventory fix on GitHub commit `1d6bb4c` with the reconciliation
+diagnostics patch already applied, stop the daemon and apply the incremental
+`trademinator-client-m3-currency-inventory.patch`, then run `composer test:m3`.
+Restart the daemon with the same configuration and data directory. Migration
+runs automatically when the live database is opened. Dependencies are unchanged;
+there is no account-specific currency override to add.
 
 ## Connect an account
 
@@ -59,11 +68,30 @@ php bin/client.php exchange-refresh --account=UUID --config=config.m3.local.json
 
 M3 synchronizes every configured account, including stopped markets, and discovers
 manual spot trading from exchange history. It does not activate Server
-subscriptions for discovered markets. Multiple quote markets sharing a base need
-an explicit `currency_markets` choice for transfers. M1's prohibition on spending
-one market's base inventory as another market's quote is retained; such activity
-fails closed and needs an account-inventory extension before it can be reconciled.
-It is not silently assigned to a different market.
+subscriptions for discovered markets. M3 supports currencies used both as base
+inventory and as payment currency in other markets. It consumes the account's
+newest available lots of that currency, preserving each lot's owning market and
+original quote-denominated basis. BUY quote spending and confirmed fees are
+inventory debits; the quote received from a real SELL is an acquisition fragment
+of that fill. No extra financial order or wallet operation is created.
+
+`currency_markets` optionally selects the owning market for new deposits and
+quote receipts. Without an override, M3 prefers an existing base market quoted
+in `valuation_quote`, then the first existing symbol in lexical order. Existing
+lot ownership never changes. Earlier cash operations gain inventory attribution
+when that currency first becomes a registered base; their financial identity and
+amounts stay unchanged.
+
+A SELL directly prices its quote receipt in the sold base currency. If the lot's
+owning market uses a different valuation currency, its acquisition cost remains
+unknown. Cash deposits newly attributed to inventory also retain unknown basis
+unless supported by acquisition evidence. Such remaining lots block market
+readiness and candidate H eligibility, even when wallet quantities reconcile.
+No missing conversion is replaced by zero. These rules apply to all accounts;
+legacy M1 callers retain their original currency-role guard. Same-timestamp
+trades release acquisitions only after their own debits are funded. Unresolved
+same-time funding dependencies remain blocked with
+`ambiguous_same_timestamp_funding`; trade IDs are not treated as proof of order.
 
 ## Transport and history
 
@@ -82,7 +110,34 @@ extension reads transfer history using CCXT's existing authenticated GET methods
 for `/fundings` and `/withdrawals/`. CCXT still owns signing, HTTP, timeouts and
 rate limits. No separate HTTP/WebSocket implementation or vendor edit is needed.
 Other exchanges retain the generic ledger fallback when required. `mode: all` is
-only for an endpoint documented to return the full set (Bitso order trades).
+only for an endpoint documented to return the full set; bounded lists still
+require a completeness check.
+
+Bitso trade history is read account-wide from
+[`/user_trades`](https://docs.bitso.com/bitso-api/docs/user-trades), without a
+`book` filter. This includes historical books absent from today's market catalog
+and trades outside subscribed pairs. Pages use descending markers, at most 100
+rows, and preserve exact string trade IDs and server ordering. The configured
+history/Hard H0 boundary is applied locally; order verification still requires
+the full independent order-trade response, including for removed markets.
+Historical pairs are not added to the available trading catalog.
+
+Bitso open orders are read account-wide with the documented 500-row limit and no
+book, currency or source filter. A list reaching the limit is rejected because
+the endpoint has no documented marker pagination. Historical-order confirmation
+rechecks that account-wide list. The former example's open-order
+`backward_id`/`marker`/`sort: desc` policy remains compatible, but those pagination
+arguments are not sent to this endpoint; new configurations use `mode: all`.
+No configuration edits are needed for an existing example-based installation.
+
+An earlier `inventory_shortfall` may therefore reflect omitted historical
+executions. After updating, restart to read from the configured/Hard H0 boundary.
+If the same outflow still fails, the log alone does not prove what funded it:
+compare earlier deposits, trades or conversions in the exchange's account
+history. A later acquisition cannot fund an earlier withdrawal. Do not create
+an opening balance merely to cancel the shortfall, or treat USD, USDC and USDT
+as interchangeable without transaction evidence. Margin records and conflicting
+currency fields are rejected by this spot-only accounting path.
 
 REST-only operation can satisfy exchange readiness. REST failure, stale state,
 unknown cost, open/uncertain orders or inconsistent accounting prevents readiness.
@@ -103,11 +158,43 @@ While an attempt is pending, `EXCHANGE_SYNC_PROGRESS` reports progress at most o
 every 30 seconds. `exchange-status` also exposes `sync.in_progress`, the current
 stage, elapsed time, and CCXT call counts and metadata (operation, symbol,
 page and whether a request is in flight). A request's elapsed time includes CCXT
-rate-limit waiting. Request counts cover the snapshot, not later deposit pricing;
-the stage changes to `deposit_pricing` while historical prices are estimated.
-Counts track unified method calls, including cached calls, rather than individual
-HTTP requests. These fields describe activity; they do not imply that
-reconciliation succeeded.
+rate-limit waiting. Request counts are specific to the current stage. During
+`deposit_pricing`, progress includes the public provider, requested symbol,
+candle period and historical timestamp, plus `pricing.deposits_total`,
+`pricing.deposits_finished` and a hashed deposit reference. Counts track method
+calls rather than individual HTTP requests. `sync.elapsed_ms` measures the whole
+attempt, not time spent exclusively in the current stage. These fields describe
+activity; they do not imply that reconciliation succeeded.
+
+Before pricing, `inventory_validation` replays quantity attribution in an isolated
+in-memory copy. It changes no live financial rows. A failed inventory check
+therefore does not wait for public price lookups before explaining its shortfall.
+The actual snapshot still passes normal reconciliation before it is accepted.
+
+An `inventory_shortfall` reports `outflow_at`, `outflow_kind`, `outflow_currency`,
+`outflow_required`, `inventory_available`, `inventory_shortfall`, and the market
+symbol when applicable. The console message includes the date and amounts.
+`later_acquisition_quantity` and `next_acquisition_at` show whether later history
+contains inventory that cannot fund this earlier event. Same-time dependencies
+retain their separate diagnostic reason. `outflow_ref` is a stable hash; raw order
+and operation IDs, addresses, memos and transaction hashes are excluded. A price
+estimate cannot supply missing inventory quantities.
+
+`last_error` is the most recent failed attempt and stays visible while a retry
+runs; a later successful reconciliation clears it. Thus `RECOVERING` with
+`sync.in_progress: true` describes both a previous failure and ongoing new work.
+
+Public pricing reuses providers and market catalogs within an attempt, caches up
+to 4,096 estimate results and historical candle results per cache, and skips a
+bridge's second leg when its first leg is absent. Cache keys preserve provider,
+symbol, candle period and historical bucket; estimates retain each deposit's
+original timestamp. Missing candles are retried on a later snapshot. Each async
+public method is bounded by `exchange.timeout_ms`, including rate-limit waiting;
+this is not a total budget for a multi-deposit pricing stage. Missing or timed-out
+price evidence remains unknown, never zero or today's price. Shutdown cancels
+pending price work and closes only its owned fallback clients. Transfer-rate
+lookups use other managed accounts' cost denominations, excluding the receiving
+account's own markets.
 
 `RECONCILING` with `at_ms: null` means no snapshot has yet been applied. An initial
 scan visits all available spot markets to find manual trades and may take time.
@@ -122,6 +209,27 @@ and `HTTP 503` identifies a server/gateway error. CCXT can classify all three as
 Unknown formats stay generic. Signed URLs, request parameters, response bodies
 and headers are excluded. Existing authentication handling and retry backoff are
 unchanged; a failed ledger read still blocks reconciliation.
+
+Local failures report their actual `stage`: `prepare_reconciliation`,
+`inventory_validation`, `deposit_pricing`, `reconcile_account`, `transfer_matching`,
+`hardpoint_verification` or `hardpoint_capture`. Exchange calls retain their
+specific `operation` (such as `fetch_my_trades`) with stage `rest_snapshot`.
+Previously, local failures defaulted to `reconcile_account`, even when they
+occurred before applying the snapshot or while preparing a hard point.
+
+Known ledger and archive checks now have explicit messages. When an exception
+originates in an allowlisted Client source file, `source_file` and `source_line`
+identify the check in both `exchange-status` and the console event. The filename
+is a fixed project-relative label, never an installation path. Unknown exception
+text remains withheld; stack traces, arguments, raw exchange replies and private
+paths are not logged. These diagnostics are visible at the normal warning level;
+setting `log_level` to debug is not required.
+
+`inventory_currency_role_conflict` identifies the legacy M1 currency-role guard.
+The schema-5 currency-inventory patch enables this combination in M3 through
+account-wide lot attribution. If M3 still reports that guard after applying the
+patch, verify that the daemon was restarted using the updated source. Other
+financial failures retain their explicit stage, reason and source location.
 
 ## Bitso transfer history
 

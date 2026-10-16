@@ -340,3 +340,196 @@ read-only checker reports accepted records in
 `documented_bitso_transfer_zero_fees`. Live full-history reconciliation remains
 to be run after applying the patch and restarting the daemon; a successful
 first-page check does not complete M3's remaining acceptance gates.
+
+## Local reconciliation failure diagnostics
+
+Base: GitHub `Trademinator/client` commit
+`1d6bb4cdd50241e5be7baf924d09be1ffe56c05d` (bitso compatibility work).
+
+The reported `RuntimeException` was hidden by the safe diagnostic allowlist.
+The former `reconcile_account` fallback also covered failures in preparation,
+deposit pricing, transfer matching and hard-point work, so the log alone did not
+identify the failing stage or accounting invariant.
+
+This patch adds fixed ledger/archive messages and an explicit explanation for
+the existing inventory/quote currency-role restriction. It retains the actual
+stage across async cleanup and reports an allowlisted project-relative source
+filename plus line. Unknown messages, absolute paths, stack arguments, signed
+URLs and exchange response bodies remain private. Financial checks, accounting,
+retry backoff, database schema and dependencies are unchanged.
+
+Offline validation on Linux/PHP 8.3.6:
+
+* All seven M3 suites pass: 424 checks, including 74 diagnostic checks.
+* The 17 added checks exercise real currency-role and cumulative-fill failures,
+  rejected-write rollback, private dynamic storage errors, source-path spoofing,
+  an async deposit-pricing failure, status/console parity, blocked readiness,
+  unchanged exponential backoff and successful-retry cleanup.
+* The financial suite processes 10,000 events in 11.063 seconds with an
+  81,788,928-byte peak. No exchange requests or orders are made.
+* All Client PHP files pass syntax checks. Whitespace validation and patch
+  application against the exact GitHub base pass.
+
+The synthetic currency-role failure reproduces the old generic diagnostic, but
+does not establish the cause on the user's account. Restart the daemon and use
+the resulting stage, reason and source location to identify that cause. Live
+reconciliation remains unverified; this patch improves diagnosis without
+bypassing an unresolved financial check.
+
+
+## Currency inventory across market roles (schema 5)
+
+Incremental base: GitHub `Trademinator/client`
+`1d6bb4cdd50241e5be7baf924d09be1ffe56c05d`, with the previously delivered
+reconciliation-diagnostics patch applied. GitHub main was rechecked at that same
+commit before delivery. The user's explicit `inventory_currency_role_conflict`
+now identifies the legacy M1 restriction as the failing check.
+
+M3 now attributes currency outflows across the account's acquisition lots. Real
+SELL allocations retain both the selling market and the inventory-owning market.
+BUY quote spending and third-currency fees consume inventory separately. A real
+SELL's net quote receipt is an acquisition fragment with its original fill
+provenance. Unknown valuation conversions remain unknown; no balancing financial
+rows or zero-cost prices are fabricated. The legacy M1 opt-in boundary remains.
+
+Earlier cash operations are attributed when their currency first becomes an
+inventory base, without changing financial identity, amounts or timestamps.
+Transfers reconstruct all consumed source lots and convert each known basis in
+its own original quote currency. A receiver can retrieve a missing historical
+conversion after another account reveals the source denomination, without
+replacing an existing deposit basis or rate.
+
+Same-timestamp executions release credit only after all their tracked debits
+are funded, including third-currency fees. Opaque trade IDs are only deterministic
+tie breakers, not chronology evidence. Unfunded cycles and unresolved same-time
+funding schedules roll back; the latter report
+`ambiguous_same_timestamp_funding`. The algorithm does not search every possible
+ordering of an ambiguous history group.
+
+Schema 5 adds the inventory owner to allocations, preserves account and SELL
+foreign keys, and migrates existing allocations with their original owner. The
+verified pre-migration backup and transactional rollback are tested. Old archive
+snapshots remain readable without rewriting their files. New inventory roles
+after H0 reconstruct the original opening cash exactly once, including zero-cash
+boundaries, subsequent promotions and late cost corrections.
+
+Offline validation on Linux/PHP 8.3.6:
+
+* All eleven M3 suites pass: 549 checks. These include 58 currency-role checks,
+  28 archive-transition checks, 27 schema-5 checks, 11 missing-rate recovery checks,
+  75 diagnostic checks and the existing transport, runtime and Bitso coverage.
+* The financial suite processes and replays 10,000 events in 12.997 seconds with
+  a 98,566,144-byte peak. No exchange requests or orders are made.
+* Tests cover global LIFO, principal and fee conservation, source ownership,
+  mixed valuation quotes, chronological rollback, same-time trade and fee
+  dependencies, restart/idempotence, checkpoint invalidation, H/H1 promotion,
+  post-capture activity, immutable archive hashes and late transfer matching.
+* All Client PHP files pass syntax checks. Whitespace validation and incremental
+  patch application against the declared base pass.
+
+No dependencies, private credentials or account-specific mappings are added.
+Unknown remaining acquisition cost still blocks market readiness and candidate
+H eligibility. Live Bitso history and native platform acceptance remain to be
+verified on the user's machines; these offline tests do not establish them.
+
+
+## Outflow evidence and deposit-pricing progress
+
+Incremental base: `trademinator-client-m3-currency-inventory.patch` already
+applied over the reconciliation-diagnostics patch and GitHub commit
+`1d6bb4cdd50241e5be7baf924d09be1ffe56c05d`. GitHub main was checked again and
+remains at that commit.
+
+The reported status has two failed attempts and an ongoing attempt whose total
+elapsed time is 2,037,218 ms (33 minutes 57 seconds), currently at deposit pricing.
+Its previous generic outflow error does not identify which currency, transaction
+or acquisition is missing. It cannot establish a fee, opening balance or
+accounting adjustment. This patch supplies that evidence without weakening the
+quantity invariant.
+
+An isolated inventory preflight now runs before public historical-price work.
+Failures report the normalized outflow date, kind, symbol, required/available
+amounts and exact shortfall. Later acquisitions are reported separately and never
+backdated. Hashed references remain stable across preview/live reconstruction;
+private exchange identifiers and response data stay out of events and status.
+
+Pricing now displays per-stage call counts, current provider/candle request and
+deposit progress. Providers and catalogs are reused; bounded caches retain both
+successful and unavailable historical results within an attempt. Duplicate
+candle fetches and unnecessary second bridge legs are eliminated. The receiving
+account's own market quotes no longer trigger transfer FX lookups. Missing FX
+from another account still recovers on a later sync. Async public methods time
+out using the existing exchange timeout; cancellation clears timers even when
+an underlying adapter does not settle its cancelled promise.
+
+Offline validation on Linux/PHP 8.3.6:
+
+* All thirteen M3 suites pass: 592 checks, including 16 new inventory diagnostic
+  checks and 27 new public pricing/progress checks.
+* Coverage includes exact 24-place shortfalls, BUY/SELL/withdrawal/third-currency
+  failures, chronological exclusion of later inventory, repeatable references,
+  preview/live diagnostic parity, unchanged live rows after successful and failed
+  previews, rejected-write rollback, and unknown-cost readiness protection.
+* Pricing checks cover provider reuse, candle/inverse caching, missing-result
+  retry on a later snapshot, rejection of future candles, timeout/cancellation,
+  owned-client cleanup, visible pending requests, redacted progress, normal info
+  events, no self-account transfer FX, and shutdown without late financial writes.
+* The 10,000-event financial suite passes in 14.187 seconds with a 98,566,144-byte
+  peak. Network requests and submitted orders remain zero.
+* All Client PHP files pass syntax checks; whitespace and incremental patch
+  application checks pass. Delivered files match the tested source exactly.
+
+Schema 5 and dependencies are unchanged. No fee or balance adjustment is made.
+The precise missing acquisition on the live account still requires the new
+outflow diagnostic; these tests do not establish that history's completeness.
+
+## Bitso account-wide trade history
+
+Incremental base: `trademinator-client-m3-outflow-pricing.patch` applied after
+the currency-inventory and reconciliation-diagnostics patches, over GitHub main
+`1d6bb4cdd50241e5be7baf924d09be1ffe56c05d`. Main was checked again before this work.
+
+The new diagnostic identifies an earlier USD withdrawal with no attributable
+inventory. Reviewing that path found a confirmed coverage defect: the Client
+enumerated today's available spot markets and asked the pinned CCXT adapter
+for each book's trades. Executions from removed books were never requested.
+The adapter also required a current market for independent order-trade lookup.
+
+Bitso documents an optional `book` on
+[`GET /user_trades`](https://docs.bitso.com/bitso-api/docs/user-trades).
+Its [change history](https://docs.bitso.com/bitso-api/docs/history-of-changes)
+records that correction on 2021-07-19. The read extension now requests unfiltered
+account-wide trade pages, preserves the server's marker order and exact string
+identities, and verifies historical fills by order ID without requiring an
+available market. Currency identities and the configured/Hard H0 boundary remain
+intact. Existing open/uncertain orders cannot be resolved from missing details.
+
+The [open-order endpoint](https://docs.bitso.com/bitso-api/docs/list-open-orders)
+documents an account-wide list and limit, but no marker. Initial and confirming
+reads therefore request that list with a 500-row cap; reaching the cap blocks
+completeness. Old example configurations remain accepted. Partial filters,
+conflicting evidence, unsupported margin activity and invalid payloads fail with
+explicit local diagnostics.
+
+Offline validation on Linux/PHP 8.3.6:
+
+* All fourteen M3 suites pass: 642 checks, including 50 new account-history checks.
+* A regression reproduces a USD withdrawal shortfall when a removed market's
+  earlier sale is omitted. The full independently verified history reconciles,
+  replays without duplicates, and creates no balancing operation.
+* Real pinned CCXT signing, implicit GET methods and parsing run against an
+  intercepted HTTP fixture. Tests cover 205 trades over three pages, overlaps,
+  equal timestamps, markers above PHP integer range, history boundaries,
+  saturation, non-progress, page budgets and malformed/contradictory evidence.
+* Available terminal details keep their actual status; missing details keep
+  unknown original terms. Current-market catalogs are not augmented with
+  fabricated trading definitions. USD and USDC stay distinct.
+* The 10,000-event financial suite passes in 12.607 seconds with a 98,566,144-byte
+  peak. Network requests and submitted orders remain zero.
+* PHP syntax, whitespace and incremental patch application checks pass.
+
+This fixes a demonstrated import gap, not a verified explanation of the live
+account's particular withdrawal. Restart and reconcile to determine whether the
+additional records supply that acquisition. If the shortfall remains, inspect
+the earlier exchange deposit/trade/conversion evidence before deciding on any
+opening inventory. No schema, dependency or account-specific mapping is added.

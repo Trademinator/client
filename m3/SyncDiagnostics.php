@@ -54,6 +54,17 @@ final class SyncDiagnostics
     ];
 
     private const LOCAL = [
+        'Bitso trade history requires unfiltered backward marker pagination.',
+        'Bitso trade history is not in backward chronological order.',
+        'Bitso order trade verification requires the complete unfiltered order history.',
+        'Bitso open orders require an unfiltered account-wide list.',
+        'Bitso open-order list reached its limit; completeness cannot be confirmed.',
+        'Bitso open-order identity, market or status is invalid.',
+        'Bitso private history response is invalid.',
+        'Bitso private trade evidence is incomplete.',
+        'Bitso margin activity is unsupported by spot accounting.',
+        'Bitso private history market is invalid.',
+        'Bitso private history currencies conflict with its order book.',
         'Bitso transfer history requires unfiltered backward marker pagination.',
         'Bitso transfer history response is not a valid bounded payload list.',
         'Bitso transfer identity, direction or status is invalid.',
@@ -121,10 +132,106 @@ final class SyncDiagnostics
         'Unpriced open market order: wait for exchange confirmation.',
         'Conflicting transfer financial evidence.',
         'Unattributed outflow: history or acquisition inventory is incomplete.',
+
+        // M3 reuses M1's ledger and immutable archives. These fixed messages
+        // are safe to publish; exceptions containing paths or values are not.
+        'Unknown exchange account.',
+        'Unknown market.',
+        'Market belongs to another exchange account.',
+        'Amounts must be nonnegative decimal strings with at most 24 fractional places; floats are forbidden.',
+        'Amount must be positive.',
+        'Invalid currency identifier.',
+        'Market symbol must match BASE/QUOTE.',
+        'opening_lots must be an array.',
+        'Exchange order ID required.',
+        'Filled plus remaining must equal order quantity.',
+        'Invalid order side or status.',
+        'Order status disagrees with its cumulative fill quantities.',
+        'A fee currency is required for nonzero fees.',
+        'Base fee exceeds purchased quantity.',
+        'Order cumulative cost must be zero exactly when its filled quantity is zero.',
+        'An exchange order identity cannot change.',
+        'Cumulative order fills cannot decrease.',
+        'Closed order cannot reopen.',
+        'Out-of-order order update rejected.',
+        'Operation must be an identified deposit or withdrawal.',
+        'Market operations must reference its base currency; quote transfers are account operations.',
+        'Base-currency transfers need an explicit market for lot accounting.',
+        'Nonzero operation fee needs a currency.',
+        'Deposit fee must be smaller than its amount.',
+        'Conflicting replay of an immutable financial operation.',
+        'Withdrawal exceeds attributable market inventory.',
+        'Wallet reconciliation failed: supplied balances do not equal opening balances plus recorded financial activity.',
+        'Wallet reconciliation failed: market inventory does not match attributable base balances.',
+        'An allocation references missing acquisition inventory.',
+        'Acquisition inventory is overallocated.',
+        'SELL is overallocated.',
+        'Checkpoint requires a reconciled account wallet.',
+        'Checkpoint requires consistent market inventory attribution.',
+        'Checkpoint requires no open market orders, no dust, and fully matched SELL fills.',
+        'Snapshot contains another account.',
+        'Restored snapshot failed database integrity checks.',
+        'Invalid account ID.',
+        'Cannot lock hard point.',
+        'Cannot publish immutable candidate.',
+        'Hard-point identity does not match its directory.',
+        'Hard-point status SHA-256 mismatch.',
+        'Hard-point status identity mismatch.',
+        'Cyclic hard-point ancestry.',
+        'Cost correction changed archived wallet arithmetic.',
+        'Late transfer correction changed live wallet amounts.',
+        'Transfer cost provenance contains an unresolved dependency cycle.',
+        'Transfer source lot has ambiguous inventory attribution.',
+            'Cash inventory baseline is not part of the verified hard-point ancestry.',
+            'Incomplete M3 currency-inventory schema.',
+            'Allocation inventory currency differs from the SELL base currency.',
+        'Acquisition lot has ambiguous inventory ownership.',
+        'Quote inventory market is missing or has a different currency.',
+        'SQLite snapshot SHA-256 mismatch.',
+        'SQLite snapshot has no completed client schema.',
+        'SQLite snapshot failed foreign_key_check.',
+        'Cannot make a SQLite snapshot inside a transaction.',
+        'Refusing to overwrite an existing SQLite snapshot.',
+        'Cannot create temporary metadata file.',
+        'Incomplete metadata write.',
+        'Cannot flush metadata file.',
+        'Cannot atomically publish metadata file.',
+        'Invalid metadata object.',
+        'Cannot reopen snapshot for synchronization.',
+        'Cannot synchronize snapshot.',
+        'Cannot open directory for durable publication.',
+        'Cannot synchronize directory metadata.',
     ];
 
     public static function describe(Throwable $error, string $exchange): array
     {
+        return self::classify($error, $exchange) + self::source($error);
+    }
+
+    /** Only fixed source labels; no installation path, stack frames or arguments. */
+    private static function source(Throwable $error): array
+    {
+        $root = dirname(__DIR__);
+        foreach ([
+            'm1/Backup.php', 'm1/Database.php', 'm1/HardPoints.php', 'm1/Ledger.php',
+            'm3/Accounting.php', 'm3/BitsoInternalTransfer.php', 'm3/BitsoReadClient.php',
+            'm3/BitsoSpei.php', 'm3/CcxtAccount.php', 'm3/HardPoints.php', 'm3/History.php',
+            'm3/HistoricalOrder.php', 'm3/LightningInvoice.php', 'm3/Lots.php',
+            'm3/Normalize.php', 'm3/Numbers.php', 'm3/Prices.php', 'm3/Reconciler.php',
+            'm3/Runtime.php', 'm3/Transfers.php', 'm3/InventoryEvidenceError.php',
+        ] as $relative) {
+            if ($error->getFile() === realpath($root.'/'.$relative) && $error->getLine() > 0) {
+                return ['source_file' => $relative, 'source_line' => $error->getLine()];
+            }
+        }
+        return [];
+    }
+
+    private static function classify(Throwable $error, string $exchange): array
+    {
+        if ($error instanceof InventoryEvidenceError) {
+            return ['detail' => $error->getMessage()] + $error->diagnostic;
+        }
         if ($error instanceof LightningHashError) {
             return ['detail' => $error->getMessage()] + $error->diagnostic;
         }
@@ -132,6 +239,13 @@ final class SyncDiagnostics
             return ['reason' => 'withdrawal_fee_evidence_missing', 'detail' => $error->getMessage()] + $error->diagnostic;
         }
         $message = $error->getMessage();
+        if ($message === 'M1 does not yet support spending one market inventory as another market quote currency.') {
+            return ['reason' => 'inventory_currency_role_conflict',
+                'detail' => 'History uses a currency both as market inventory and as another market\'s quote currency. Current inventory accounting does not support that combination.'];
+        }
+        if ($message === 'Same-timestamp history has unresolved funding dependencies; finer exchange timing or acquisition evidence is required.') {
+            return ['reason' => 'ambiguous_same_timestamp_funding', 'detail' => $message];
+        }
         if (in_array($message, self::LOCAL, true)) {
             return ['reason' => 'reconciliation_validation', 'detail' => $message];
         }

@@ -21,7 +21,7 @@
                 "coingecko_ids": { "ATOM": "cosmos" },
                 "history_params": {
                     "fetch_my_trades": { "mode": "backward_id", "cursor_param": "marker", "params": { "sort": "desc" } },
-                    "fetch_open_orders": { "mode": "backward_id", "cursor_param": "marker", "params": { "sort": "desc" } },
+                    "fetch_open_orders": { "mode": "all" },
                     "fetch_order_trades": { "mode": "all" },
                     "fetch_deposits": { "mode": "backward_id", "cursor_param": "marker" },
                     "fetch_withdrawals": { "mode": "backward_id", "cursor_param": "marker" }

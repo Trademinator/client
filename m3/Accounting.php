@@ -29,27 +29,34 @@ final class Accounting
     public function market(string $account, string $symbol): array
     {
         [$base,$quote] = explode('/', Normalize::symbol($symbol));
-        $id = $this->ledger->registerMarket($account, $symbol, $base, $quote);
+        $id = $this->ledger->registerMarket($account, $symbol, $base, $quote, options: ['allow_currency_roles' => true]);
         return $this->rows('SELECT * FROM markets WHERE id=?', [$id])[0];
     }
     public function currencyMarket(string $account, string $currency, array $settings): ?array
     {
-        if ($currency === $settings['valuation_quote']) {
-            return null;
-        }
-        $matches = $this->rows('SELECT * FROM markets WHERE account_id=? AND base_currency=? ORDER BY id', [$account,$currency]);
+        $matches = $this->rows('SELECT * FROM markets WHERE account_id=? AND base_currency=? ORDER BY symbol', [$account,$currency]);
         $symbol = $settings['currency_markets'][$currency] ?? null;
         if ($symbol !== null) {
-            $market = $this->market($account, $symbol);
-            if ($market['base_currency'] !== $currency) {
+            if (explode('/', Normalize::symbol($symbol))[0] !== $currency) {
                 throw new RuntimeException('currency_markets must select the same base currency.');
             }
-            return $market;
+            return $this->market($account, $symbol);
         }
-        if (count($matches) > 1) {
-            throw new RuntimeException('Ambiguous inventory attribution: configure currency_markets.');
+        if ($currency === $settings['valuation_quote'] && $matches === []) {
+            return null;
         }
+        foreach ($matches as $market) {
+            if ($market['quote_currency'] === $settings['valuation_quote']) { return $market; }
+        }
+        // Ownership determines the denomination of a new lot's basis, not which
+        // wallet can spend it. Existing acquisitions retain their own owner.
         return $matches[0] ?? $this->market($account, $currency.'/'.$settings['valuation_quote']);
+    }
+    public function prepareMarkets(string $account, array $batch): void
+    {
+        $symbols = array_unique(array_merge(array_column($batch['orders'] ?? [], 'symbol'), array_column($batch['trades'] ?? [], 'symbol')));
+        sort($symbols, SORT_STRING);
+        foreach ($symbols as $symbol) { $this->market($account, $symbol); }
     }
     public function touch(string $account, ?string $market = null): void
     {
@@ -61,6 +68,7 @@ final class Accounting
     /** Call inside one account reconciliation transaction after all pages have been fetched. */
     public function ingest(string $account, array $batch, array $settings): void
     {
+        $this->prepareMarkets($account, $batch);
         $groups = [];
         foreach ($batch['trades'] as $trade) {
             $groups[$trade['order']][$trade['id']] = $trade;
@@ -172,115 +180,233 @@ final class Accounting
                 'metadata' => ['m3' => ['origin' => 'exchange','evidence' => $op,'fees' => $op['fees'],'basis' => $basis,'fx_rates' => $batch['transfer_rates'][$op['id']] ?? []]
                     + (isset($op['fee_evidence']) ? ['fee_evidence' => $op['fee_evidence']] : [])]]);
         }
+        foreach ($batch['transfer_rates'] ?? [] as $exchangeId => $rates) {
+            $op = $this->rows("SELECT * FROM operations WHERE account_id=? AND exchange_operation_id=? AND kind='deposit'", [$account,(string)$exchangeId])[0] ?? null;
+            if ($op === null) { continue; }
+            $meta = Numbers::decode($op['metadata_json']);
+            if (isset($meta['m3']['transfer'])) { continue; }
+            $changed = false;
+            foreach ($rates as $currency => $rate) {
+                if ($rate !== null && !isset($meta['m3']['fx_rates'][$currency])) {
+                    $meta['m3']['fx_rates'][$currency] = $rate;
+                    $changed = true;
+                }
+            }
+            if ($changed) {
+                $this->execute('UPDATE operations SET metadata_json=? WHERE id=?', [Numbers::json($meta),$op['id']]);
+                $this->touch($account, $op['market_id']);
+            }
+        }
+        $this->bindCashOperations($account, $settings);
+        $this->bindQuoteMarkets($account, $settings);
     }
-    /** Recompute attribution from all financial evidence; no fabricated balancing entries. */
+    /** Older cash rows can predate the snapshot that first introduces an inventory role. */
+    private function bindCashOperations(string $account, ?array $settings = null): void
+    {
+        foreach ($this->rows('SELECT * FROM operations WHERE account_id=? AND market_id IS NULL', [$account]) as $op) {
+            $matches = $this->rows('SELECT * FROM markets WHERE account_id=? AND base_currency=? ORDER BY symbol', [$account,$op['currency']]);
+            if ($matches === []) { continue; }
+            $owner = $settings === null ? $matches[0] : $this->currencyMarket($account, $op['currency'], $settings);
+            $meta = Numbers::decode($op['metadata_json']);
+            $meta['m3']['inventory_attribution'] = ['reason' => 'currency_inventory_role_added',
+                'previous_market_id' => null, 'previous_price_basis' => $op['price_basis'],
+                'previous_basis' => $meta['m3']['basis'] ?? null];
+            // A cash valuation is not an acquisition price in the new owner's quote currency.
+            $meta['m3']['basis'] = null;
+            $this->execute('UPDATE operations SET market_id=?,price_basis=NULL,metadata_json=? WHERE id=?',
+                [$owner['id'],Numbers::json($meta),$op['id']]);
+            $this->touch($account, $owner['id']);
+        }
+    }
+    private function bindQuoteMarkets(string $account, ?array $settings = null): void
+    {
+        foreach ($this->rows("SELECT orders.*,markets.quote_currency FROM orders JOIN markets ON markets.id=orders.market_id WHERE orders.account_id=? AND side='SELL'", [$account]) as $order) {
+            $meta = Numbers::decode($order['metadata_json']);
+            $matches = $this->rows('SELECT * FROM markets WHERE account_id=? AND base_currency=? ORDER BY symbol', [$account,$order['quote_currency']]);
+            if ($matches === []) { continue; }
+            $owner = $meta['m3']['quote_inventory_market_id'] ?? null;
+            if ($owner !== null) {
+                if (!in_array($owner, array_column($matches, 'id'), true)) {
+                    throw new RuntimeException('Quote inventory market is missing or has a different currency.');
+                }
+                continue;
+            }
+            $owner = ($settings === null ? $matches[0] : $this->currencyMarket($account, $order['quote_currency'], $settings))['id'];
+            $meta['m3']['quote_inventory_market_id'] = $owner;
+            $this->execute('UPDATE orders SET metadata_json=? WHERE id=?', [Numbers::json($meta),$order['id']]);
+            $this->touch($account, $owner);
+            $this->touch($account, $order['market_id']);
+        }
+    }
+    /** Recompute currency outflows from real evidence; never fabricate wallet entries. */
     public function rebuild(string $account): void
     {
         $this->db->transaction(function () use ($account): void {
-            $markets = $this->rows('SELECT * FROM markets WHERE account_id=? ORDER BY id', [$account]);
+            $this->bindCashOperations($account);
+            $this->bindQuoteMarkets($account);
+            $markets = $this->rows('SELECT * FROM markets WHERE account_id=? ORDER BY symbol', [$account]);
             $marketMap = array_column($markets, null, 'id');
-            $events = [];
-            $pool = [];
-            $feesUpdates = [];
+            $byCurrency = [];
+            foreach ($markets as $market) { $byCurrency[$market['base_currency']][] = $market['id']; }
             $old = $this->rows('SELECT * FROM buys_vs_sells WHERE account_id=? ORDER BY allocation_key', [$account]);
+            $previousDebits = [];
+            $previousWithdrawals = [];
             $this->execute('DELETE FROM buys_vs_sells WHERE account_id=?', [$account]);
             foreach (['orders','operations'] as $table) {
                 foreach ($this->rows('SELECT * FROM '.$table.' WHERE account_id=?', [$account]) as $row) {
                     $meta = Numbers::decode($row['metadata_json']);
                     if (isset($meta['m3']['inventory_debits'])) {
+                        $previousDebits[$table.':'.$row['id']] = $meta['m3']['inventory_debits'];
                         unset($meta['m3']['inventory_debits']);
                         $this->execute('UPDATE '.$table.' SET metadata_json=? WHERE id=?', [Numbers::json($meta),$row['id']]);
+                    }
+                    if ($table === 'operations' && $row['kind'] === 'withdrawal') {
+                        $previousWithdrawals[$row['id']] = Numbers::decode($row['lot_consumptions_json']);
                     }
                 }
             }
             $this->execute("UPDATE operations SET lot_consumptions_json='{}' WHERE account_id=? AND kind='withdrawal'", [$account]);
+            $pool = [];
             foreach ($markets as $market) {
-                foreach ($this->ledger->marketLots($market['id']) as $lot) {
+                foreach ($this->ledger->marketLots($market['id'], false) as $lot) {
+                    if (isset($pool[$lot['source_key']])) { throw new RuntimeException('Acquisition lot has ambiguous inventory ownership.'); }
                     $lot['market_id'] = $market['id'];
+                    $lot['currency'] = $market['base_currency'];
+                    $origin = $lot['origin'] ?? [];
+                    if (in_array($origin['kind'] ?? '', ['fill','quote_fill','order'], true)) {
+                        $tradeId = $origin['trade_id'] ?? 'legacy:'.$origin['exchange_order_id'];
+                        $lot['execution'] = 'order:'.$origin['order_id'].':'.$tradeId;
+                    }
                     $pool[$lot['source_key']] = $lot;
                 }
             }
+            $events = [];
             foreach ($this->rows('SELECT * FROM orders WHERE account_id=?', [$account]) as $order) {
                 $market = $marketMap[$order['market_id']];
                 $meta = Numbers::decode($order['metadata_json']);
-                if ($order['side'] === 'SELL') {
-                    if (isset($meta['m3']['fills'])) {
-                        foreach ($meta['m3']['fills'] as $fill) {
-                            $quantity = $fill['amount'];
-                            foreach ($fill['fees'] as $fee) {
-                                if ($fee['currency'] === $market['base_currency']) {
-                                    $quantity = Numbers::add($quantity, $fee['cost']);
-                                }
-                            }
-                            $events[] = ['at' => Numbers::iso($fill['timestamp']),'key' => 'sell:'.$order['id'].':'.$fill['id'],'kind' => 'sell','row' => $order,'market' => $market['id'],'quantity' => $quantity];
-                        }
-                    } else {
-                        $events[] = ['at' => $order['occurred_at'],'key' => 'sell:'.$order['id'],'kind' => 'sell','row' => $order,'market' => $market['id'],'quantity' => Numbers::add($order['filled_quantity'], Lots::fee($order, $market['base_currency']))];
-                    }
-                }
-                $feeEvents = $meta['m3']['fills'] ?? [['id' => 'legacy','timestamp' => Numbers::ms($order['occurred_at']),'fees' => Lots::fees($order)]];
-                foreach ($feeEvents as $fill) {
+                $fills = $meta['m3']['fills'] ?? [['id' => 'legacy:'.$order['exchange_order_id'],
+                    'timestamp' => Numbers::ms($order['occurred_at']), 'amount' => $order['filled_quantity'],
+                    'cost' => $order['cost_amount'], 'fees' => Lots::fees($order)]];
+                foreach ($fills as $fill) {
+                    $event = ['at' => Numbers::iso($fill['timestamp']), 'sequence' => [$fill['id'],$market['symbol']],
+                        'priority' => 1, 'table' => 'orders', 'row' => $order, 'symbol' => $market['symbol'],
+                        'execution' => 'order:'.$order['id'].':'.$fill['id']];
+                    $baseFee = '0'; $quoteFee = '0';
                     foreach ($fill['fees'] as $fee) {
-                        if (!in_array($fee['currency'], [$market['base_currency'],$market['quote_currency']], true)) {
-                            $events[] = ['at' => Numbers::iso($fill['timestamp']),'key' => 'fee:'.$order['id'].':'.$fill['id'].':'.$fee['currency'],'kind' => 'fee','table' => 'orders','row' => $order,'currency' => $fee['currency'],'quantity' => $fee['cost']];
+                        if ($fee['currency'] === $market['base_currency']) { $baseFee = Numbers::add($baseFee, $fee['cost']); }
+                        elseif ($fee['currency'] === $market['quote_currency']) { $quoteFee = Numbers::add($quoteFee, $fee['cost']); }
+                        else {
+                            $events[] = $event + ['key' => 'fee:'.$order['id'].':'.$fill['id'].':'.$fee['currency'],
+                                'kind' => 'fee', 'currency' => $fee['currency'], 'quantity' => $fee['cost']];
                         }
+                    }
+                    if ($order['side'] === 'SELL') {
+                        $events[] = $event + ['key' => 'sell:'.$order['id'].':'.$fill['id'], 'kind' => 'sell',
+                            'market' => $market['id'], 'currency' => $market['base_currency'],
+                            'quantity' => Numbers::add($fill['amount'], $baseFee)];
+                    } else {
+                        $events[] = $event + ['key' => 'quote:'.$order['id'].':'.$fill['id'], 'kind' => 'quote_spend',
+                            'currency' => $market['quote_currency'], 'quantity' => Numbers::add($fill['cost'], $quoteFee)];
                     }
                 }
             }
             foreach ($this->rows('SELECT * FROM operations WHERE account_id=?', [$account]) as $op) {
-                if ($op['kind'] === 'withdrawal' && $op['market_id'] !== null) {
-                    $events[] = ['at' => $op['occurred_at'],'key' => 'withdrawal:'.$op['id'],'kind' => 'withdrawal','row' => $op,'market' => $op['market_id'],'quantity' => Numbers::add($op['amount'], Lots::fee($op, $op['currency']))];
+                $event = ['at' => $op['occurred_at'], 'sequence' => [$op['exchange_operation_id']],
+                    'priority' => 2, 'table' => 'operations', 'row' => $op];
+                if ($op['kind'] === 'withdrawal') {
+                    $events[] = $event + ['key' => 'withdrawal:'.$op['id'], 'kind' => 'withdrawal',
+                        'currency' => $op['currency'], 'quantity' => Numbers::add($op['amount'], Lots::fee($op, $op['currency']))];
                 }
                 foreach (Lots::fees($op) as $fee) {
                     if ($fee['currency'] !== $op['currency']) {
-                        $events[] = ['at' => $op['occurred_at'],'key' => 'fee:'.$op['id'].':'.$fee['currency'],'kind' => 'fee','table' => 'operations','row' => $op,'currency' => $fee['currency'],'quantity' => $fee['cost']];
+                        $events[] = $event + ['key' => 'fee:'.$op['id'].':'.$fee['currency'], 'kind' => 'fee',
+                            'currency' => $fee['currency'], 'quantity' => $fee['cost']];
                     }
                 }
             }
-            usort($events, static fn ($a, $b) => [$a['at'],$a['key']] <=> [$b['at'],$b['key']]);
+            usort($events, static fn ($a, $b) => [$a['at'],$a['priority'],$a['sequence'],$a['key']] <=> [$b['at'],$b['priority'],$b['sequence'],$b['key']]);
             uasort($pool, static fn ($a, $b) => [$b['acquired_at'],$b['source_key']] <=> [$a['acquired_at'],$a['source_key']]);
-            $allocations = [];
-            $withdrawals = [];
+            $allocations = []; $withdrawals = []; $debits = [];
+            $groups = [];
             foreach ($events as $event) {
-                $left = $event['quantity'];
-                $taken = [];
-                $targets = isset($event['market']) ? [$event['market']] : array_column(array_filter($markets, static fn ($m) => $m['base_currency'] === $event['currency']), 'id');
-                if ($targets === [] && $event['kind'] === 'fee') {
-                    continue;
-                } // Fiat fee has no inventory lot.
-                foreach ($pool as $key => &$lot) {
-                    if (!in_array($lot['market_id'], $targets, true) || ($lot['available_at'] ?? $lot['acquired_at']) > $event['at']) {
-                        continue;
+                $key = $event['execution'] ?? 'operation:'.$event['row']['id'];
+                $groups[$event['at']][$key][] = $event;
+            }
+            $completed = [];
+            $available = static fn (array $lot, string $at, array $done): bool =>
+                ($lot['available_at'] ?? $lot['acquired_at']) <= $at
+                && (!isset($lot['execution']) || isset($done[$lot['execution']]));
+            foreach ($groups as $at => $pending) {
+                // Trade IDs do not establish chronology across markets. At one
+                // timestamp, release an execution's credits only after all its
+                // debits are funded. Deferred executions may then become funded;
+                // a cycle without preexisting inventory cannot bootstrap itself.
+                while ($pending !== []) {
+                    $progress = false;
+                    $blocked = [];
+                    foreach ($pending as $execution => $executionEvents) {
+                        $required = [];
+                        foreach ($executionEvents as $event) {
+                            if (isset($byCurrency[$event['currency']])) {
+                                $required[$event['currency']] = Numbers::add($required[$event['currency']] ?? '0', $event['quantity']);
+                            }
+                        }
+                        $required = array_filter($required, static fn ($n) => bccomp($n, '0', 24) > 0);
+                        if ($required !== []) {
+                            foreach ($pool as $lot) {
+                                $currency = $lot['currency'];
+                                if (!isset($required[$currency]) || !$available($lot, $at, $completed)) { continue; }
+                                $required[$currency] = Numbers::sub($required[$currency], Numbers::min($required[$currency], $lot['quantity']));
+                                if (bccomp($required[$currency], '0', 24) === 0) { unset($required[$currency]); }
+                                if ($required === []) { break; }
+                            }
+                        }
+                        if ($required !== []) { $blocked[$execution] = $required; continue; }
+                        foreach ($executionEvents as $event) {
+                            // Quote-only cash has no acquisition market. Its money still
+                            // reconciles through expectedBalances, including all fees.
+                            if (!isset($byCurrency[$event['currency']]) || bccomp($event['quantity'], '0', 24) === 0) { continue; }
+                            $left = $event['quantity']; $taken = [];
+                            foreach ($pool as $key => &$lot) {
+                                if ($lot['currency'] !== $event['currency'] || !$available($lot, $event['at'], $completed)) { continue; }
+                                $take = Numbers::min($left, $lot['quantity']);
+                                if (bccomp($take, '0', 24) === 0) { continue; }
+                                $lot['quantity'] = Numbers::sub($lot['quantity'], $take);
+                                $left = Numbers::sub($left, $take);
+                                $taken[$key] = $take;
+                                if ($event['kind'] === 'sell') {
+                                    $sourceId = $lot['source_id'] ?? $lot['id'];
+                                    $keyId = hash('sha256', $event['key'].'|'.$key);
+                                    $allocations[] = ['id' => $keyId, 'account_id' => $account, 'market_id' => $event['market'],
+                                        'inventory_market_id' => $lot['market_id'], 'allocation_key' => 'm3:'.$keyId,
+                                        'buy_order_id' => $lot['source_type'] === 'order' ? $sourceId : null,
+                                        'buy_operation_id' => $lot['source_type'] === 'operation' ? $sourceId : null,
+                                        'baseline_lot_id' => $lot['source_type'] === 'baseline' ? $sourceId : null,
+                                        'sell_order_id' => $event['row']['id'], 'quantity' => $take, 'created_at' => $event['at'], 'buy_lot_key' => $key];
+                                } elseif ($event['kind'] !== 'withdrawal') {
+                                    $fkey = $event['table'].':'.$event['row']['id'];
+                                    $debits[$fkey] ??= ['table' => $event['table'], 'row' => $event['row'], 'debits' => []];
+                                    $previous = $debits[$fkey]['debits'][$lot['market_id']][$key] ?? '0';
+                                    $debits[$fkey]['debits'][$lot['market_id']][$key] = Numbers::add($previous, $take);
+                                }
+                                if (bccomp($left, '0', 24) === 0) { break; }
+                            }
+                            unset($lot);
+                            if (bccomp($left, '0', 24) > 0) { throw new InventoryEvidenceError($event, $event['quantity'], $left, $pool, $completed); }
+                            if ($event['kind'] === 'withdrawal') { $withdrawals[$event['row']['id']] = $taken; }
+                        }
+                        $completed[$execution] = true;
+                        unset($pending[$execution]);
+                        $progress = true;
                     }
-                    $take = Numbers::min($left, $lot['quantity']);
-                    if (bccomp($take, '0', 24) === 0) {
-                        continue;
+                    if (!$progress) {
+                        $execution = array_key_first($blocked);
+                        $currency = array_key_first($blocked[$execution]);
+                        $matching = array_values(array_filter($pending[$execution], static fn ($event) => $event['currency'] === $currency));
+                        $required = '0';
+                        foreach ($matching as $event) { $required = Numbers::add($required, $event['quantity']); }
+                        throw new InventoryEvidenceError($matching[0], $required, $blocked[$execution][$currency], $pool, $completed, count($groups[$at]) > 1);
                     }
-                    $lot['quantity'] = Numbers::sub($lot['quantity'], $take);
-                    $left = Numbers::sub($left, $take);
-                    $taken[$key] = $take;
-                    if ($event['kind'] === 'sell') {
-                        $sourceId = $lot['source_id'] ?? $lot['id'];
-                        $keyId = hash('sha256', $event['key'].'|'.$key);
-                        $allocations[] = ['id' => $keyId,'account_id' => $account,'market_id' => $event['market'],'allocation_key' => 'm3:'.$keyId,
-                            'buy_order_id' => $lot['source_type'] === 'order' ? $sourceId : null,'buy_operation_id' => $lot['source_type'] === 'operation' ? $sourceId : null,
-                            'baseline_lot_id' => $lot['source_type'] === 'baseline' ? $sourceId : null,'sell_order_id' => $event['row']['id'],'quantity' => $take,'created_at' => $event['at'],'buy_lot_key' => $key];
-                    } elseif ($event['kind'] === 'fee') {
-                        $fkey = $event['table'].':'.$event['row']['id'];
-                        $feesUpdates[$fkey] ??= ['table' => $event['table'],'row' => $event['row'],'debits' => []];
-                        $previous = $feesUpdates[$fkey]['debits'][$lot['market_id']][$key] ?? '0';
-                        $feesUpdates[$fkey]['debits'][$lot['market_id']][$key] = Numbers::add($previous, $take);
-                    }
-                    if (bccomp($left, '0', 24) === 0) {
-                        break;
-                    }
-                }
-                unset($lot);
-                if (bccomp($left, '0', 24) > 0) {
-                    throw new RuntimeException('Unattributed outflow: history or acquisition inventory is incomplete.');
-                }
-                if ($event['kind'] === 'withdrawal') {
-                    $withdrawals[$event['row']['id']] = $taken;
                 }
             }
             foreach ($allocations as $a) {
@@ -290,24 +416,24 @@ final class Accounting
             foreach ($withdrawals as $id => $taken) {
                 $this->execute('UPDATE operations SET lot_consumptions_json=? WHERE id=?', [Numbers::json((object)$taken),$id]);
             }
-            foreach ($feesUpdates as $f) {
-                $meta = Numbers::decode($f['row']['metadata_json']);
-                $meta['m3']['inventory_debits'] = $f['debits'];
-                $this->execute('UPDATE '.$f['table'].' SET metadata_json=? WHERE id=?', [Numbers::json($meta),$f['row']['id']]);
+            $currentDebits = [];
+            foreach ($debits as $key => $entry) {
+                $meta = Numbers::decode($entry['row']['metadata_json']);
+                $meta['m3']['inventory_debits'] = $entry['debits'];
+                $currentDebits[$key] = $entry['debits'];
+                $this->execute('UPDATE '.$entry['table'].' SET metadata_json=? WHERE id=?', [Numbers::json($meta),$entry['row']['id']]);
             }
-            // Allocation updates invalidate checkpoints; duplicate histories remain idempotent.
             $canonical = static function (array $rows): array {
-                foreach ($rows as &$r) {
-                    unset($r['id'],$r['created_at']);
-                    ksort($r);
-                }unset($r);
+                foreach ($rows as &$r) { unset($r['id'],$r['created_at']); ksort($r); } unset($r);
                 usort($rows, static fn ($a, $b) => $a['allocation_key'] <=> $b['allocation_key']);
                 return $rows;
             };
-            if ($canonical($old) !== $canonical($allocations)) {
-                foreach ($markets as $market) {
-                    $this->touch($account, $market['id']);
-                }
+            $nonempty = static fn(array $rows): array => array_filter($rows, static fn(array $row): bool => $row !== []);
+            // Every owner's checkpoint reflects all currency legs. Repeating
+            // the same evidence must leave revisions and checkpoints intact.
+            if ($canonical($old) !== $canonical($allocations) || $previousDebits != $currentDebits
+                || $nonempty($previousWithdrawals) != $nonempty($withdrawals)) {
+                foreach ($markets as $market) { $this->touch($account, $market['id']); }
             }
         });
     }

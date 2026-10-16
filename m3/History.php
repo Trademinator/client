@@ -42,6 +42,26 @@ final class History
             }
             $chain = array_reverse($chain);
             $merged = $chain[0];
+            $originalOpening = Numbers::decode($merged['account']['opening_balances_json']);
+            $cashSeeds = [];
+            foreach ($chain as $snapshot) {
+                $point = Numbers::decode($snapshot['account']['hard_t0_json']);
+                foreach ($point['cash_inventory_seeds'] ?? [] as $marketId => $seed) {
+                    $cashSeeds[$marketId] ??= $seed;
+                }
+                foreach ($point['cost_corrections'] ?? [] as $correction) {
+                    foreach ($correction['cash_inventory_seeds'] ?? [] as $marketId => $seed) {
+                        $cashSeeds[$marketId] ??= $seed;
+                    }
+                }
+                foreach ($snapshot['markets'] as $market) {
+                    foreach (Numbers::decode($market['baseline_lots_json']) as $lot) {
+                        if (($lot['origin']['kind'] ?? null) === 'hard_point_cash') {
+                            $cashSeeds[$market['id']] ??= $lot;
+                        }
+                    }
+                }
+            }
             $maps = [];
             foreach (['markets','orders','operations','signal_decisions'] as $table) {
                 $maps[$table] = [];
@@ -51,6 +71,21 @@ final class History
                     foreach ($snapshot[$table] as $row) {
                         if ($table === 'markets' && isset($maps[$table][$row['id']])) {
                             $row['baseline_lots_json'] = $maps[$table][$row['id']]['baseline_lots_json'];
+                        } elseif ($table === 'markets' && isset($cashSeeds[$row['id']])) {
+                            // A currency first tracked after H0 was seeded from that
+                            // point's cash. Replaying the original financial history
+                            // must start from the original opening wallet instead.
+                            $seed = $cashSeeds[$row['id']];
+                            $origin = $seed['origin'] ?? [];
+                            if (($origin['kind'] ?? null) !== 'hard_point_cash' || ($origin['account_id'] ?? null) !== $account || !isset($visited[$origin['hardpoint_id'] ?? ''])) {
+                                throw new RuntimeException('Cash inventory baseline is not part of the verified hard-point ancestry.');
+                            }
+                            $quantity = $originalOpening[$row['base_currency']] ?? '0';
+                            $lots = bccomp($quantity, '0', 24) === 0 ? [] : [['id' => $seed['id'],'quantity' => $quantity,'unit_cost' => null,
+                                'cost_amount' => null,'acquisition_quantity' => $quantity,'acquisition_cost' => null,
+                                'acquired_at' => $merged['account']['created_at'],'available_at' => $merged['account']['created_at'],
+                                'origin' => ['kind' => 'initial_wallet','account_id' => $account,'reconstructed_from' => $origin]]];
+                            $row['baseline_lots_json'] = Numbers::json($lots);
                         }
                         $maps[$table][$row['id']] = $row;
                     }
@@ -107,6 +142,14 @@ final class History
                 $fullOps = array_column($full['operations'], null, 'id');
                 $changes = [];
                 if (($baseline['kind'] ?? '') === 'HardH0') {
+                    $cashSeeds = [];
+                    foreach ($current['markets'] as $market) {
+                        foreach (Numbers::decode($market['baseline_lots_json']) as $lot) {
+                            if (($lot['origin']['kind'] ?? null) === 'hard_point_cash') {
+                                $cashSeeds[$market['id']] = $lot;
+                            }
+                        }
+                    }
                     $cutoff = $baseline['cutoff_ms'];
                     $prefix = $full;
                     foreach (['orders','operations','signal_decisions'] as $table) {
@@ -145,7 +188,8 @@ final class History
                     foreach ($prefix['operations'] as $op) {
                         $changes[$op['id']] = $op['metadata_json'];
                     }
-                    $baseline['cost_corrections'][] = ['at' => gmdate('c'),'reason' => $reason,'archive_unchanged' => true,'operations' => $changes];
+                    $baseline['cost_corrections'][] = ['at' => gmdate('c'),'reason' => $reason,'archive_unchanged' => true,'operations' => $changes]
+                        + ($cashSeeds === [] ? [] : ['cash_inventory_seeds' => $cashSeeds]);
                     $math->execute('UPDATE exchange_accounts SET hard_t0_json=? WHERE id=?', [Numbers::json($baseline),$account]);
                 }
                 foreach ($current['operations'] as $op) {
