@@ -15,6 +15,7 @@ final class Daemon
     private ?\Closure $onTick;
     private ?\Closure $statusProvider;
     private ?\Closure $onReload;
+    private ?\Closure $eventSink;
     private ?\Closure $commandHandler = null;
     private ?Control $control = null;
     private bool $stopping = false;
@@ -26,13 +27,14 @@ final class Daemon
     private ?string $lastError = null;
     private array $componentStatus = [];
 
-    public function __construct(private Config $config, ?callable $onTick = null, ?callable $statusProvider = null, ?callable $onReload = null)
+    public function __construct(private Config $config, ?callable $onTick = null, ?callable $statusProvider = null, ?callable $onReload = null, ?callable $eventSink = null)
     {
         $this->paths = new Paths($config);
         $this->runId = bin2hex(random_bytes(12));
         $this->onTick = $onTick === null ? null : \Closure::fromCallable($onTick);
         $this->statusProvider = $statusProvider === null ? null : \Closure::fromCallable($statusProvider);
         $this->onReload = $onReload === null ? null : \Closure::fromCallable($onReload);
+        $this->eventSink = $eventSink === null ? null : \Closure::fromCallable($eventSink);
     }
 
     public function setHandler(callable $handler): void { $this->commandHandler = \Closure::fromCallable($handler); }
@@ -48,6 +50,7 @@ final class Daemon
         $this->state = 'starting';
         $signals = [];
         try {
+            $this->log('info', 'daemon_starting', ['pid' => getmypid(), 'mode' => $this->config->serverUrl === '' ? 'local_core' : 'server_intelligence'], 'Starting Trademinator Client.');
             if (is_file($this->paths->statusFile)) {
                 $previous = json_decode((string) file_get_contents($this->paths->statusFile), true);
                 $this->recovered = is_array($previous) && in_array($previous['state'] ?? '', ['running', 'starting', 'stopping', 'failed'], true);
@@ -64,7 +67,7 @@ final class Daemon
             $this->tick();
             $this->control = new Control($this->paths, fn(string $command, array $args): array => $this->dispatch($command, $args));
             $this->state = 'running';
-            $this->log('info', 'daemon_started', ['recovered_after_unclean_shutdown' => $this->recovered]);
+            $this->log('info', 'daemon_started', ['recovered_after_unclean_shutdown' => $this->recovered, 'trading_enabled' => false], 'Client is running; local control is ready.');
             $this->writeStatus();
             $nextTick = hrtime(true) / 1e9 + $this->config->tickMs / 1000;
             $nextStatus = hrtime(true) / 1e9 + 1;
@@ -82,15 +85,15 @@ final class Daemon
             }
         } catch (Throwable $error) {
             $exitCode = 1;
-            $this->lastError = $error->getMessage();
+            $this->lastError = EventRecord::safeText($error->getMessage());
             $this->state = 'failed';
-            fwrite(STDERR, json_encode(['ok' => false, 'milestone' => 'M2', 'error' => $error->getMessage()], JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE).PHP_EOL);
-            try { $this->log('error', 'daemon_failed', ['error_type' => get_class($error), 'message' => $error->getMessage()]); } catch (Throwable) { /* Preserve the original storage failure. */ }
+            if ($this->eventSink === null) { fwrite(STDERR, json_encode(['ok' => false, 'milestone' => 'M2', 'error' => $this->lastError], JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE).PHP_EOL); }
+            try { $this->log('error', 'daemon_failed', ['error_type' => get_class($error), 'message' => $error->getMessage()], 'Client stopped because an operation failed.'); } catch (Throwable) { /* Preserve the original storage failure. */ }
         } finally {
             $this->stopping = true;
             if ($this->state !== 'failed') { $this->state = 'stopped'; }
-            try { $this->log('info', 'daemon_stopped', ['exit_code' => $exitCode]); $this->writeStatus(); }
-            catch (Throwable $error) { $exitCode = 1; $this->state = 'failed'; $this->lastError ??= $error->getMessage(); }
+            try { $this->log('info', 'daemon_stopped', ['exit_code' => $exitCode], 'Client process stopped.'); $this->writeStatus(); }
+            catch (Throwable $error) { $exitCode = 1; $this->state = 'failed'; $this->lastError ??= EventRecord::safeText($error->getMessage()); }
             $this->control?->close();
             foreach ($signals as $signal => $handler) { pcntl_signal($signal, $handler); }
             flock($lock, LOCK_UN);
@@ -108,8 +111,12 @@ final class Daemon
 
     public function stop(): void
     {
+        $firstRequest = !$this->stopping;
         $this->stopping = true;
         if ($this->state === 'running') { $this->state = 'stopping'; }
+        if ($firstRequest) {
+            try { $this->log('info', 'daemon_stopping', [], 'Shutdown requested; stopping the client.'); } catch (Throwable) { /* Shutdown remains available if file logging fails. */ }
+        }
     }
 
     private function dispatch(string $command, array $arguments): array
@@ -117,11 +124,12 @@ final class Daemon
         if ($command === 'status') { return $this->status(); }
         if ($command === 'stop') { $this->stop(); return ['state' => 'stopping', 'run_id' => $this->runId]; }
         if ($command === 'reload') {
+            try { $this->log('info', 'configuration_reloading', [], 'Checking the updated configuration.'); } catch (Throwable) { /* Continue validation if file logging fails. */ }
             try {
                 $candidate = $this->config->reload();
                 if ($this->onReload !== null) { ($this->onReload)($candidate); }
             } catch (Throwable $error) {
-                try { $this->log('warning', 'configuration_rejected', ['message' => $error->getMessage()]); } catch (Throwable) { /* Keep the original validation error. */ }
+                try { $this->log('warning', 'configuration_rejected', ['message' => $error->getMessage()], 'Configuration rejected; keeping the current settings.'); } catch (Throwable) { /* Keep the original validation error. */ }
                 throw $error;
             }
             // The runtime has committed its new settings. A reporting failure must
@@ -130,13 +138,21 @@ final class Daemon
             $this->configGeneration++;
             $result = ['state' => $this->state, 'config_generation' => $this->configGeneration, 'config' => $this->config->toArray()];
             try {
-                $this->log('info', 'configuration_reloaded', ['generation' => $this->configGeneration]);
+                $this->log('info', 'configuration_reloaded', ['generation' => $this->configGeneration], 'Updated configuration applied.');
                 $this->writeStatus();
             } catch (Throwable) { $result['warning'] = 'configuration_applied_reporting_failed'; }
             return $result;
         }
-        if ($this->commandHandler !== null) { return ($this->commandHandler)($command, $arguments); }
-        throw new RuntimeException('Unsupported local control command.');
+        try {
+            if ($this->commandHandler !== null) { return ($this->commandHandler)($command, $arguments); }
+            throw new RuntimeException('Unsupported local control command.');
+        } catch (Throwable $error) {
+            if (!in_array($command, ['accounts', 'markets', 'subscriptions'], true)) {
+                try { $this->log('warning', 'control_command_failed', ['command' => $command, 'error_type' => get_class($error), 'message' => $error->getMessage()], 'Local command was rejected.'); }
+                catch (Throwable) { /* Preserve the command failure even if file logging fails. */ }
+            }
+            throw $error;
+        }
     }
 
     public function status(): array
@@ -159,12 +175,16 @@ final class Daemon
         Paths::atomicJson($this->paths->statusFile, $snapshot);
     }
 
-    public function log(string $level, string $event, array $context = []): void
+    public function log(string $level, string $event, array $context = [], string $message = ''): void
     {
         $levels = ['debug' => 0, 'info' => 1, 'warning' => 2, 'error' => 3];
         if (!isset($levels[$level])) { throw new RuntimeException('Unknown log level.'); }
+        $record = EventRecord::create($level, $event, $context, $this->runId, $message);
+        if ($this->eventSink !== null) {
+            try { ($this->eventSink)($record); } catch (Throwable) { /* Console failures cannot interrupt the daemon or disk logging. */ }
+        }
         if ($levels[$level] < $levels[$this->config->logLevel]) { return; }
-        $line = json_encode(['at' => gmdate('Y-m-d\TH:i:s\Z'), 'level' => $level, 'event' => $event, 'run_id' => $this->runId, 'context' => $context], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n";
+        $line = json_encode($record, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)."\n";
         $path = $this->paths->logDir.'/client.jsonl';
         if (is_link($path)) { throw new RuntimeException('Unsafe log path.'); }
         clearstatcache(true, $path);

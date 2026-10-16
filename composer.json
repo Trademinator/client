@@ -18,6 +18,7 @@
         "react/http": "^1.11",
         "react/promise-timer": "^1.11",
         "react/socket": "^1.17",
+        "symfony/console": "^7.4",
         "trademinator/bcmath": "^0.1.0",
         "trademinator/indicators": "^0.1.0"
     },
@@ -46,7 +47,10 @@
     },
     "config": {
         "sort-packages": true,
-        "allow-plugins": false
+        "allow-plugins": false,
+        "platform": {
+            "php": "8.3.0"
+        }
     },
     "minimum-stability": "stable",
     "prefer-stable": true

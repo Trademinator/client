@@ -32,8 +32,11 @@ final class Runtime
     private int $failures = 0;
     private int $freshnessHighWaterMs = 0;
     private ?string $serverWarning = null;
+    private ?\Closure $eventSink;
+    private array $observedMarketStates = [];
+    private ?string $observedContextWarning = null;
 
-    public function __construct(Database $database, array $settings, ?object $api = null, ?callable $clock = null)
+    public function __construct(Database $database, array $settings, ?object $api = null, ?callable $clock = null, ?callable $eventSink = null)
     {
         $this->markets = new Markets($database);
         $this->scheduler = new Scheduler();
@@ -41,6 +44,8 @@ final class Runtime
         $this->settings = $settings;
         $this->injectedApi = $api !== null;
         $this->api = $api ?? $this->buildApi($settings);
+        $this->eventSink = $eventSink === null ? null : \Closure::fromCallable($eventSink);
+        foreach ($this->markets->all() as $market) { $this->observedMarketStates[$market['id']] = $market['state']; }
     }
 
     private function buildApi(array $settings): ?object
@@ -61,8 +66,11 @@ final class Runtime
         $this->risk = null;
         $this->catalogDue = $this->riskDue = $this->nextRequestAt = $this->blockedUntil = $this->failures = 0;
         $this->serverWarning = null;
+        $this->observedContextWarning = null;
         $this->scheduler->reset();
         foreach ($this->generation as &$generation) { ++$generation; }
+        $this->emit('info', 'server_configuration_reloaded', ['enabled' => (bool) ($settings['enabled'] ?? false)],
+            'Server configuration reloaded; operational context will be fetched again.');
     }
 
     public function tick(?int $nowMs = null): void
@@ -102,6 +110,20 @@ final class Runtime
             if ($kind === 'catalog') { $this->api->markets($id); }
             elseif ($kind === 'risk') { $this->api->risk($id); }
             else { $this->api->market($id, $context['subscription_id']); }
+            if ($kind === 'market') {
+                $market = $this->markets->get($context['market_id']);
+                $this->emit('info', 'market_check_started', $this->marketContext($market) + [
+                    'request_id' => $id, 'period' => $context['period'], 'started_at_ms' => $nowMs,
+                    'slot' => $context['slot'],
+                ], 'Checking '.$market['exchange'].' '.$market['symbol'].' Server signal.');
+            } else {
+                $this->emit('debug', 'server_request_started', ['request_id' => $id, 'kind' => $kind, 'started_at_ms' => $nowMs],
+                    'Fetching Server '.($kind === 'catalog' ? 'subscriptions' : 'risk factor').'.');
+            }
+            if ($this->failures > 0) {
+                $this->emit('info', 'server_retry_started', ['request_id' => $id, 'kind' => $kind, 'failures' => $this->failures],
+                    'Retrying Server communication.');
+            }
         } catch (Throwable) {
             unset($this->requests[$id]);
             $this->communicationFailure('transport_error', $nowMs, 0);
@@ -120,7 +142,8 @@ final class Runtime
             if ($request['kind'] === 'market' && in_array($response['status'] ?? 0, [403, 404], true) && $code !== 'account_unavailable') {
                 if (!$current) { return; }
                 $id = $request['market_id'];
-                $this->markets->stop($id);
+                $market = $this->markets->stop($id);
+                $this->observeMarketState($market, 'subscription_unavailable');
                 $this->invalidate($id);
                 $this->warnings[$id] = 'subscription_unavailable';
                 return;
@@ -135,11 +158,16 @@ final class Runtime
                 $this->catalog = array_column($catalog, null, 'subscription_id');
                 $this->catalogAt = $nowMs;
                 $this->catalogDue = $nowMs + $this->settings['catalog_interval_ms'];
+                $this->emit('info', 'server_catalog_refreshed', ['subscriptions' => count($catalog),
+                    'active_subscriptions' => count(array_filter($catalog, static fn(array $row): bool => $row['is_active'])),
+                    'fetched_at_ms' => $nowMs], 'Server subscriptions refreshed: '.count($catalog).' available.');
                 $this->synchronize($nowMs);
             } elseif ($request['kind'] === 'risk') {
                 $this->risk = ServerApi::validateRisk($response['data']);
                 $this->riskAt = $nowMs;
                 $this->riskDue = $nowMs + $this->settings['risk_interval_ms'];
+                $this->emit('info', 'server_risk_refreshed', ['risk_factor' => $this->risk['risk_factor'],
+                    'source' => $this->risk['source'], 'fetched_at_ms' => $nowMs], 'Server risk factor refreshed.');
             } else {
                 $id = $request['market_id'];
                 $detail = $response['data']['market'] ?? null;
@@ -154,13 +182,15 @@ final class Runtime
                     throw new RuntimeException('Invalid market detail identity.');
                 }
                 if (!$detail['active']) {
-                    $this->markets->stop($id);
+                    $market = $this->markets->stop($id);
+                    $this->observeMarketState($market, 'subscription_unavailable');
                     $this->invalidate($id);
                     $this->warnings[$id] = 'subscription_unavailable';
                     $this->catalogDue = $nowMs;
                     return;
                 }
                 $validated = Intelligence::validate($response['data'], $request['subscription_id'], $request['period'], $nowMs, 5000, $market['exchange'], $market['symbol']);
+                $this->signalEvent($market, $validated, $nowMs);
                 if ($validated['reason'] === 'candle_period_changed') {
                     // A new Server period changes scheduling, never local market identity.
                     $this->catalogDue = $nowMs;
@@ -172,18 +202,30 @@ final class Runtime
                     'subscription_id' => $request['subscription_id'], 'period' => $request['period']];
                 $this->warnings[$id] = $validated['eligible'] ? null : $validated['reason'];
             }
-            if ($this->risk !== null) { $this->failures = 0; $this->serverWarning = null; }
+            if ($this->risk !== null) {
+                $recovered = $this->serverWarning !== null;
+                $this->failures = 0; $this->serverWarning = null;
+                if ($recovered) {
+                    $this->emit('info', 'server_connection_restored', ['restored_at_ms' => $nowMs],
+                        'Server communication restored; scheduled market checks will resume.');
+                }
+            }
         } catch (Throwable $error) {
             if ($error instanceof \PDOException) { throw $error; }
             if ($request['kind'] === 'market') {
                 unset($this->cache[$request['market_id']]);
                 $this->warnings[$request['market_id']] = 'invalid_intelligence_contract';
+                $market = $this->markets->get($request['market_id']);
+                $this->emit('warning', 'market_signal_rejected', $this->marketContext($market) + [
+                    'reason' => 'invalid_intelligence_contract', 'intelligence_eligible' => false, 'trade_authorized' => false,
+                ], 'Rejected invalid Server signal for '.$market['exchange'].' '.$market['symbol'].'.');
             } else { $this->communicationFailure('invalid_server_contract', $nowMs, 0); }
         }
     }
 
     private function communicationFailure(string $warning, int $nowMs, int $retryAfterMs): void
     {
+        $alreadyFailed = $this->serverWarning !== null;
         ++$this->failures;
         $delay = min($this->settings['retry_max_ms'], $this->settings['retry_base_ms'] * (2 ** min(16, $this->failures - 1)));
         $this->blockedUntil = $nowMs + (int) max($delay, $retryAfterMs);
@@ -193,6 +235,11 @@ final class Runtime
         $this->risk = null;
         $this->riskAt = null;
         $this->catalogDue = $this->riskDue = $nowMs;
+        $this->emit('warning', $alreadyFailed ? 'server_retry_failed' : 'server_connection_lost', [
+            'reason' => self::eventCode($warning, 'server_error'), 'failures' => $this->failures,
+            'retry_at_ms' => $this->blockedUntil, 'retry_delay_ms' => $this->blockedUntil - $nowMs,
+        ], $alreadyFailed ? 'Server retry failed; another retry is scheduled.'
+            : 'Server communication failed; active markets remain selected and cached intelligence was cleared.');
     }
 
     private function isCurrent(array $request): bool
@@ -215,6 +262,7 @@ final class Runtime
     {
         foreach ($this->markets->all() as $market) {
             $id = $market['id'];
+            $this->observeMarketState($market, 'authoritative_settlement');
             $this->generation[$id] ??= 0;
             if ($market['state'] !== 'ACTIVE') {
                 if (isset($this->configured[$id]) || isset($this->cache[$id])) { $this->invalidate($id); }
@@ -223,7 +271,8 @@ final class Runtime
             if ($this->catalogAt === null) { continue; }
             $subscription = $this->catalog[$market['subscription_id']] ?? null;
             if ($subscription === null || !$subscription['is_active'] || $subscription['exchange'] !== $market['exchange'] || $subscription['symbol'] !== $market['symbol']) {
-                $this->markets->stop($id);
+                $market = $this->markets->stop($id);
+                $this->observeMarketState($market, 'subscription_unavailable');
                 $this->invalidate($id);
                 $this->warnings[$id] = 'subscription_unavailable';
                 continue;
@@ -232,6 +281,10 @@ final class Runtime
             $checks = $market['checks_per_candle'] ?? $this->settings['checks_per_candle'];
             if ($period === null) {
                 if (isset($this->configured[$id])) { $this->invalidate($id); }
+                if (($this->warnings[$id] ?? null) !== 'candle_period_unavailable') {
+                    $this->emit('warning', 'market_schedule_unavailable', $this->marketContext($market) + ['reason' => 'candle_period_unavailable'],
+                        'Waiting for a candle period for '.$market['exchange'].' '.$market['symbol'].'.');
+                }
                 $this->warnings[$id] = 'candle_period_unavailable';
                 continue;
             }
@@ -242,8 +295,14 @@ final class Runtime
                 $this->scheduler->configure($id, $period, $checks, $nowMs);
                 $this->configured[$id] = $signature;
                 $this->warnings[$id] = 'awaiting_intelligence';
+                $this->emit('info', 'market_schedule_updated', $this->marketContext($market) + $this->scheduler->status($id, $nowMs),
+                    'Scheduled '.$checks.' checks per '.$period.' candle for '.$market['exchange'].' '.$market['symbol'].'.');
             } catch (\InvalidArgumentException) {
                 $this->scheduler->remove($id);
+                if (($this->warnings[$id] ?? null) !== 'unsupported_candle_period') {
+                    $this->emit('warning', 'market_schedule_unavailable', $this->marketContext($market) + ['reason' => 'unsupported_candle_period', 'period' => $period],
+                        'Unsupported candle period for '.$market['exchange'].' '.$market['symbol'].'.');
+                }
                 $this->warnings[$id] = 'unsupported_candle_period';
             }
         }
@@ -258,6 +317,7 @@ final class Runtime
         if ($command === 'markets') { return $this->page('markets', $this->marketStatus($nowMs), $arguments); }
         if ($command === 'server-refresh') {
             $this->catalogDue = $this->riskDue = $nowMs;
+            $this->emit('info', 'server_refresh_requested', [], 'Server subscriptions and risk refresh requested.');
             return ['status' => 'refresh_scheduled'];
         }
         if ($command === 'market-activate') {
@@ -268,6 +328,7 @@ final class Runtime
             $subscription = $this->catalog[$arguments['subscription'] ?? ''] ?? throw new RuntimeException('Unknown subscription; refresh the Server catalog first.');
             $checks = isset($arguments['checks']) ? Scheduler::checks($arguments['checks']) : null;
             $market = $this->markets->activate((string) ($arguments['account'] ?? ''), $subscription, $checks);
+            $this->observeMarketState($market, 'operator_request');
             $this->generation[$market['id']] ??= 0;
             $this->invalidate($market['id']);
             $this->synchronize($nowMs);
@@ -277,6 +338,13 @@ final class Runtime
             $id = (string) ($arguments['market'] ?? '');
             $market = $command === 'market-stop' ? $this->markets->stop($id)
                 : $this->markets->setChecks($id, isset($arguments['checks']) && $arguments['checks'] !== 'default' ? Scheduler::checks($arguments['checks']) : null);
+            if ($command === 'market-stop') { $this->observeMarketState($market, 'operator_request'); }
+            else {
+                $this->emit('info', 'market_checks_updated', $this->marketContext($market) + [
+                    'checks_per_candle' => $market['checks_per_candle'],
+                    'effective_checks_per_candle' => $market['checks_per_candle'] ?? $this->settings['checks_per_candle'],
+                ], 'Polling frequency updated for '.$market['exchange'].' '.$market['symbol'].'.');
+            }
             $this->generation[$id] ??= 0;
             $this->invalidate($id, $command === 'market-checks');
             if ($command === 'market-stop') { $this->warnings[$id] = null; }
@@ -307,8 +375,7 @@ final class Runtime
                         $entry['signal'] = $valid['signal'] === null ? null : array_intersect_key($valid['signal'], array_flip(['id', 'action', 'period', 'reason', 'evidence_status', 'decision_at_ms', 'recorded_at_ms', 'is_current_model', 'is_fresh', 'expires_at_ms']));
                         $entry['warning'] = $valid['eligible'] ? null : $valid['reason'];
                         if ($valid['reason'] === 'intelligence_expired') {
-                            unset($this->cache[$id]);
-                            $this->warnings[$id] = 'intelligence_expired';
+                            $this->expireSignal($market);
                         }
                     } catch (Throwable) { $entry['warning'] = 'invalid_intelligence_contract'; }
                 }
@@ -322,23 +389,23 @@ final class Runtime
     {
         $rawNowMs = $nowMs;
         $nowMs = $this->freshnessTime($nowMs);
-        if (!($this->settings['enabled'] ?? false)) { return 'server_disabled'; }
+        if (!($this->settings['enabled'] ?? false)) { return $this->observeContextWarning('server_disabled', $nowMs); }
         if ($rawNowMs < $nowMs) {
             $this->discardEvidence();
-            return 'clock_rollback';
+            return $this->observeContextWarning('clock_rollback', $rawNowMs);
         }
-        if ($this->serverWarning !== null) { return $this->serverWarning; }
-        if ($this->catalogAt === null) { return 'subscription_catalog_unavailable'; }
+        if ($this->serverWarning !== null) { return $this->observeContextWarning($this->serverWarning, $nowMs); }
+        if ($this->catalogAt === null) { return $this->observeContextWarning('subscription_catalog_unavailable', $nowMs); }
         if ($nowMs > $this->catalogAt + $this->settings['catalog_interval_ms'] + $this->settings['timeout_ms']) {
             $this->discardEvidence();
-            return 'subscription_catalog_expired';
+            return $this->observeContextWarning('subscription_catalog_expired', $nowMs);
         }
-        if ($this->risk === null || $this->riskAt === null) { return 'risk_factor_unavailable'; }
+        if ($this->risk === null || $this->riskAt === null) { return $this->observeContextWarning('risk_factor_unavailable', $nowMs); }
         if ($nowMs > $this->riskAt + $this->settings['risk_interval_ms'] + $this->settings['timeout_ms']) {
             $this->discardEvidence();
-            return 'risk_factor_expired';
+            return $this->observeContextWarning('risk_factor_expired', $nowMs);
         }
-        return null;
+        return $this->observeContextWarning(null, $nowMs);
     }
 
     private function discardEvidence(): void
@@ -384,8 +451,7 @@ final class Runtime
             try {
                 $valid = Intelligence::validate($cache['detail'], $cache['subscription_id'], $cache['period'], $nowMs, 5000, $market['exchange'], $market['symbol']);
                 if ($valid['reason'] === 'intelligence_expired') {
-                    unset($this->cache[$market['id']]);
-                    $this->warnings[$market['id']] = 'intelligence_expired';
+                    $this->expireSignal($market);
                 }
                 if ($valid['eligible']) {
                     $result[] = ['market_id' => $market['id'], 'account_id' => $market['account_id'],
@@ -413,6 +479,85 @@ final class Runtime
             'requests_per_minute' => ['required' => round($requiredPerMinute, 3), 'available' => round($availablePerMinute, 3),
                 'capacity_exceeded' => $requiredPerMinute > $availablePerMinute], 'markets' => array_slice($markets, 0, 50),
             'markets_total' => count($markets), 'markets_has_more' => count($markets) > 50];
+    }
+
+    private function marketContext(array $market): array
+    {
+        return ['market_id' => $market['id'], 'exchange' => $market['exchange'], 'symbol' => $market['symbol'],
+            'subscription_id' => $market['subscription_id']];
+    }
+
+    private function observeMarketState(array $market, string $cause): void
+    {
+        $previous = $this->observedMarketStates[$market['id']] ?? null;
+        $this->observedMarketStates[$market['id']] = $market['state'];
+        if ($previous === $market['state']) { return; }
+        $event = match ($market['state']) {
+            'ACTIVE' => 'market_activated', 'STOPPING' => 'market_stopping', default => 'market_stopped',
+        };
+        $details = match ($market['state']) {
+            'ACTIVE' => 'activated', 'STOPPING' => 'stopping; intelligence polling is disabled while orders settle',
+            default => 'stopped; intelligence polling is disabled',
+        };
+        $this->emit('info', $event, $this->marketContext($market) + ['previous_state' => $previous,
+            'state' => $market['state'], 'cause' => $cause], $market['exchange'].' '.$market['symbol'].' '.$details.'.');
+    }
+
+    private function signalEvent(array $market, array $validated, int $nowMs): void
+    {
+        $signal = $validated['signal'];
+        $reason = self::eventCode($signal['reason'] ?? $validated['reason'], 'unspecified');
+        $outcome = self::eventCode($validated['reason'], 'unavailable');
+        $action = $signal['action'] ?? 'hold';
+        $this->emit('info', 'market_signal_received', $this->marketContext($market) + [
+            'signal_id' => $signal['id'] ?? null, 'action' => $action, 'reason' => $reason,
+            'evidence_status' => $signal['evidence_status'] ?? null, 'period' => $validated['detail']['market']['period'],
+            'outcome' => $outcome, 'intelligence_eligible' => $validated['eligible'], 'trade_authorized' => false,
+            'is_current_model' => $signal['is_current_model'] ?? null, 'is_fresh' => $signal['is_fresh'] ?? null,
+            'expires_at_ms' => $signal['expires_at_ms'] ?? null, 'received_at_ms' => $nowMs,
+        ], $market['exchange'].' '.$market['symbol'].' signal: '.strtoupper($action).' ('.$outcome.').');
+    }
+
+    private function expireSignal(array $market): void
+    {
+        unset($this->cache[$market['id']]);
+        $this->warnings[$market['id']] = 'intelligence_expired';
+        $this->emit('info', 'market_signal_expired', $this->marketContext($market) + [
+            'reason' => 'intelligence_expired', 'intelligence_eligible' => false, 'trade_authorized' => false,
+        ], 'Cached signal expired for '.$market['exchange'].' '.$market['symbol'].'.');
+    }
+
+    private function observeContextWarning(?string $warning, int $nowMs): ?string
+    {
+        if ($this->observedContextWarning !== $warning
+            && in_array($warning, ['clock_rollback', 'subscription_catalog_expired', 'risk_factor_expired'], true)) {
+            $this->emit('warning', 'server_context_invalidated', ['reason' => $warning, 'observed_at_ms' => $nowMs],
+                'Server context is no longer usable ('.$warning.'); cached intelligence was cleared.');
+        }
+        $this->observedContextWarning = $warning;
+        return $warning;
+    }
+
+    private static function eventCode(string $value, string $fallback): string
+    {
+        return preg_match('/^[a-z][a-z0-9_]{0,99}$/D', $value) === 1 ? $value : $fallback;
+    }
+
+    /** Telemetry is local, selected metadata only, and must never alter operational behavior. */
+    private function emit(string $level, string $event, array $context, string $message): void
+    {
+        if ($this->eventSink === null) { return; }
+        try {
+            // Defense in depth if a remote metadata field unexpectedly repeats our credential.
+            $token = $this->settings['token'] ?? '';
+            if (is_string($token) && $token !== '') {
+                array_walk_recursive($context, static function (mixed &$value) use ($token): void {
+                    if (is_string($value)) { $value = str_replace($token, '[redacted]', $value); }
+                });
+                $message = str_replace($token, '[redacted]', $message);
+            }
+            ($this->eventSink)($level, $event, $context, $message);
+        } catch (Throwable) { /* An unavailable output sink cannot change market or request state. */ }
     }
 
     public function __debugInfo(): array { return ['enabled' => (bool) ($this->settings['enabled'] ?? false), 'markets' => count($this->configured)]; }

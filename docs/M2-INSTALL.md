@@ -1,5 +1,9 @@
 # M2 installation and validation
 
+For Client 2.1.0-rc1, also follow [console event installation](M2-CONSOLE.md).
+The `run` command now requires `composer install` and produces structured
+operational output. Earlier M2 validation counts below describe the API release.
+
 M2 adds authenticated Server reads, explicit market selection, persistent market
 state and candle-aligned scheduling. It does not place orders. Exchange
 reconciliation is M3; private decision logic and sizing remain later milestones.

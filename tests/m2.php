@@ -2,10 +2,10 @@
 declare(strict_types=1);
 
 // Isolate test clocks, credentials and fixture state between suites.
-$allowed = ['storage', 'api', 'scheduler', 'runtime', 'config'];
+$allowed = ['storage', 'api', 'scheduler', 'runtime', 'config', 'console', 'runtime-events', 'console-cli'];
 $selected = $allowed;
 foreach (array_slice($argv, 1) as $argument) {
-    if (!str_starts_with($argument, '--suite=')) { fwrite(STDERR, "Usage: php tests/m2.php [--suite=storage,api,scheduler,runtime,config]\n"); exit(2); }
+    if (!str_starts_with($argument, '--suite=')) { fwrite(STDERR, "Usage: php tests/m2.php [--suite=storage,api,scheduler,runtime,config,console,runtime-events,console-cli]\n"); exit(2); }
     $selected = explode(',', substr($argument, 8));
 }
 if ($selected === [] || array_diff($selected, $allowed) !== []) { fwrite(STDERR, "Unknown M2 suite.\n"); exit(2); }

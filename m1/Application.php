@@ -9,18 +9,36 @@ final class Application
 {
     public function run(array $argv): int
     {
+        $command = $argv[1] ?? 'help';
+        $console = null;
+        $daemon = null;
         try {
-            $command = $argv[1] ?? 'help';
             $options = [];
             foreach (array_slice($argv, 2) as $arg) {
-                if (!preg_match('/^--(config|data-dir|seconds|account|approve|point|exchange|label|subscription|market|checks|offset|limit)=(.+)$/D', $arg, $m) || isset($options[$m[1]])) {
+                if (in_array($arg, ['--verbose', '-v'], true)) {
+                    if (isset($options['verbose'])) { throw new RuntimeException('Duplicate verbose option.'); }
+                    $options['verbose'] = true;
+                    continue;
+                }
+                if (!preg_match('/^--(config|data-dir|seconds|account|approve|point|exchange|label|subscription|market|checks|offset|limit|output|color)=(.+)$/D', $arg, $m) || isset($options[$m[1]])) {
                     throw new RuntimeException('Unknown or duplicate option. See help.');
                 }
                 $options[$m[1]] = $m[2];
             }
             if ($command === 'help') { $this->help(); return 0; }
-            if ($command === 'version') { self::output(['milestone'=>'M2','version'=>'2.0.0-rc2']); return 0; }
+            if ($command === 'version') { self::output(['milestone'=>'M2','version'=>'2.1.0-rc1']); return 0; }
             if ($command === 'doctor') { return $this->doctor(); }
+            if ($command === 'run') {
+                $autoload = dirname(__DIR__).'/vendor/autoload.php';
+                if (!is_file($autoload)) { throw new RuntimeException('Console dependencies are missing. Run composer install.'); }
+                require_once $autoload;
+                if (!class_exists(\Symfony\Component\Console\Output\StreamOutput::class)) {
+                    throw new RuntimeException('Symfony Console is missing. Run composer install.');
+                }
+                $console = new ConsoleEvents($options['output'] ?? 'human', $options['color'] ?? 'auto', isset($options['verbose']));
+            } elseif (isset($options['output']) || isset($options['color']) || isset($options['verbose'])) {
+                throw new RuntimeException('Output, color and verbose options apply to run only.');
+            }
             self::requirements();
             $config = Config::load($options['config'] ?? null, $options['data-dir'] ?? null);
             if ($command === 'recover-backup') {
@@ -50,22 +68,34 @@ final class Application
                 if (!ctype_digit($seconds) || strlen($seconds)>7 || (int)$seconds>604800) {
                     throw new RuntimeException('seconds must be an integer from 0 to 604800.');
                 }
-                $db = null; $backup = null; $hard = null; $runtime = null; $nextMaintenance = 0.0;
-                $tick = function (Daemon $daemon, Config $config) use (&$db, &$backup, &$hard, &$runtime, &$nextMaintenance): void {
+                $db = null; $backup = null; $hard = null; $runtime = null; $nextMaintenance = 0.0; $hardCandidates = [];
+                $tick = function (Daemon $daemon, Config $config) use (&$db, &$backup, &$hard, &$runtime, &$nextMaintenance, &$hardCandidates): void {
                     if ($db === null) {
                         $db = new Database($config->dataDir.'/client.sqlite');
                         $backup = new Backup($db, $config->dataDir);
                         $hard = new HardPoints($db, $config->dataDir);
                         $hard->recover();
                         if (!$db->integrityCheck()['ok']) { throw new RuntimeException('Database integrity validation failed.'); }
-                        $runtime = new \Trademinator\Client\M2\Runtime($db, $config->serverSettings());
+                        $settings = $config->serverSettings();
+                        EventRecord::hideSecret($settings['token']);
+                        $runtime = new \Trademinator\Client\M2\Runtime($db, $settings, null, null,
+                            fn(string $level, string $event, array $context, string $message) => $daemon->log($level, $event, $context, $message));
+                        $daemon->log('info', 'storage_ready', ['schema_version'=>Database::SCHEMA_VERSION, 'live_order_execution'=>false], 'Local storage verified; live trading is disabled.');
+                        if (!$settings['enabled']) { $daemon->log('info', 'server_disabled', [], 'Server integration is disabled; local core is running.'); }
                     }
                     $runtime->tick();
                     $now = hrtime(true) / 1e9;
                     if ($now < $nextMaintenance) { return; }
-                    $backup->tick();
+                    foreach ($backup->tick() as $reason => $snapshot) {
+                        $daemon->log('info', 'backup_created', ['reason'=>$reason, 'backup_id'=>$snapshot['id'] ?? null], 'Local database backup created.');
+                    }
                     foreach ($db->pdo()->query('SELECT id FROM exchange_accounts')->fetchAll(\PDO::FETCH_COLUMN) as $id) {
-                        $hard->proposeT1($id);
+                        $candidate = $hard->proposeT1($id);
+                        $candidateId = $candidate['token'] ?? null;
+                        if ($candidateId !== null && ($hardCandidates[$id] ?? null) !== $candidateId) {
+                            $daemon->log('info', 'hard_t1_available', ['account_id'=>$id, 'requires_approval'=>true], 'A new Hard T1 candidate is ready for local review.');
+                        }
+                        $hardCandidates[$id] = $candidateId;
                     }
                     $nextMaintenance = $now + 60;
                 };
@@ -74,9 +104,13 @@ final class Application
                         'accounts'=>$db ? (int)$db->pdo()->query('SELECT COUNT(*) FROM exchange_accounts')->fetchColumn() : 0,
                         'server'=>$runtime?->status()];
                 };
-                $reload = function (Config $candidate) use (&$runtime): void { $runtime?->reconfigure($candidate->serverSettings()); };
-                $daemon = new Daemon($config, $tick, $status, $reload);
-                $daemon->setHandler(function (string $command, array $arguments) use (&$runtime, &$db): array {
+                $reload = function (Config $candidate) use (&$runtime): void {
+                    $settings = $candidate->serverSettings();
+                    EventRecord::hideSecret($settings['token']);
+                    $runtime?->reconfigure($settings);
+                };
+                $daemon = new Daemon($config, $tick, $status, $reload, [$console, 'write']);
+                $daemon->setHandler(function (string $command, array $arguments) use (&$runtime, &$db, $daemon): array {
                     if ($db === null || $runtime === null) { throw new RuntimeException('Local storage is not ready.'); }
                     if ($command === 'accounts') {
                         return ['accounts'=>$db->pdo()->query('SELECT id,exchange,label FROM exchange_accounts ORDER BY created_at,id')->fetchAll()];
@@ -85,7 +119,11 @@ final class Application
                         $exchange = $arguments['exchange'] ?? null; $label = $arguments['label'] ?? null;
                         if (!is_string($exchange) || !is_string($label)) { throw new RuntimeException('Supply --exchange and --label for the local account.'); }
                         if (strlen($label) > 128) { throw new RuntimeException('Account label is too long.'); }
-                        return ['account_id'=>(new Ledger($db))->createAccount($exchange, $label), 'exchange_connected'=>false];
+                        $account = (new Ledger($db))->createAccount($exchange, $label);
+                        $result = ['account_id'=>$account, 'exchange_connected'=>false];
+                        try { $daemon->log('info', 'account_created', ['account_id'=>$account, 'exchange'=>$exchange, 'exchange_connected'=>false], 'Local exchange account registered.'); }
+                        catch (Throwable) { $result['warning'] = 'account_created_reporting_failed'; }
+                        return $result;
                     }
                     return $runtime->command($command, $arguments);
                 });
@@ -117,7 +155,12 @@ final class Application
             } finally { flock($lock,LOCK_UN); fclose($lock); }
             return 0;
         } catch (Throwable $error) {
-            fwrite(STDERR,json_encode(['ok'=>false,'error'=>$error->getMessage()],JSON_INVALID_UTF8_SUBSTITUTE|JSON_UNESCAPED_SLASHES).PHP_EOL);
+            if ($console !== null) {
+                $console->write(EventRecord::create('error', 'startup_failed', ['error_type'=>get_class($error), 'message'=>$error->getMessage()],
+                    $daemon?->status()['run_id'] ?? '', 'Client could not start.'));
+            } else {
+                fwrite(STDERR,json_encode(['ok'=>false,'error'=>$error->getMessage()],JSON_INVALID_UTF8_SUBSTITUTE|JSON_UNESCAPED_SLASHES).PHP_EOL);
+            }
             return 1;
         }
     }
@@ -132,9 +175,13 @@ final class Application
     private function doctor(): int
     {
         $asyncDns = extension_loaded('curl') && (curl_version()['features'] & CURL_VERSION_ASYNCHDNS) !== 0;
-        $ready = PHP_VERSION_ID>=80300 && PHP_INT_SIZE===8 && extension_loaded('pdo_sqlite') && extension_loaded('bcmath') && extension_loaded('curl') && extension_loaded('openssl') && $asyncDns;
+        $consoleAvailable = is_file(dirname(__DIR__).'/vendor/autoload.php')
+            && is_file(dirname(__DIR__).'/vendor/symfony/console/Output/StreamOutput.php')
+            && is_file(dirname(__DIR__).'/vendor/symfony/service-contracts/ResetInterface.php');
+        $ready = PHP_VERSION_ID>=80300 && PHP_INT_SIZE===8 && extension_loaded('pdo_sqlite') && extension_loaded('bcmath') && extension_loaded('curl') && extension_loaded('openssl') && extension_loaded('gmp') && extension_loaded('mbstring') && $asyncDns && $consoleAvailable;
         self::output(['milestone'=>'M2','status'=>$ready?'ready':'missing_requirements','php'=>PHP_VERSION,'platform'=>PHP_OS_FAMILY,
-            'architecture_bits'=>PHP_INT_SIZE*8,'extensions'=>['pdo_sqlite'=>extension_loaded('pdo_sqlite'),'bcmath'=>extension_loaded('bcmath'),'curl'=>extension_loaded('curl'),'openssl'=>extension_loaded('openssl')],
+            'architecture_bits'=>PHP_INT_SIZE*8,'extensions'=>['pdo_sqlite'=>extension_loaded('pdo_sqlite'),'bcmath'=>extension_loaded('bcmath'),'curl'=>extension_loaded('curl'),'openssl'=>extension_loaded('openssl'),'gmp'=>extension_loaded('gmp'),'mbstring'=>extension_loaded('mbstring')],
+            'console_dependencies'=>$consoleAvailable, 'console_dependency_hint'=>$consoleAvailable?null:'Run composer install from the Client directory.',
             'curl_async_dns'=>$asyncDns,
             'ipc'=>PHP_OS_FAMILY==='Windows'?'Windows named pipe (PowerShell bridge)':'Unix domain socket',
             'live_order_execution'=>false,'native_build'=>'separate validation required']);
@@ -153,6 +200,7 @@ Trademinator Client M2 — authenticated intelligence (no live order execution)
   php bin/client.php doctor
   php bin/client.php init [--config=PATH] [--data-dir=PATH]
   php bin/client.php run [--config=PATH] [--data-dir=PATH] [--seconds=60]
+                         [--output=human|json] [--color=auto|always|never] [--verbose|-v]
   php bin/client.php status|stop|reload [--config=PATH] [--data-dir=PATH]
   php bin/client.php subscriptions|markets|accounts|server-refresh [--config=PATH]
   php bin/client.php subscriptions|markets --offset=0 --limit=50 [--config=PATH]

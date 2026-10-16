@@ -6,7 +6,10 @@ and their supporting data; it does not execute or size orders. Exchange state
 integration remains M3 and local trading decisions remain later milestones.
 
 Read [M2 installation and validation](docs/M2-INSTALL.md) before upgrading.
-M2 requires **64-bit PHP 8.3+**, **PDO SQLite**, **BCMath**, **curl** and **OpenSSL**.
+Read [console events and installation](docs/M2-CONSOLE.md) for the coloured
+two-line event stream, `--verbose`, colour controls and JSON-lines TUI input.
+Run `composer install` before starting this version. M2 requires **64-bit PHP
+8.3+**, **PDO SQLite**, **BCMath**, **curl**, **OpenSSL**, **GMP** and **mbstring**.
 Use the existing Server GET endpoint at commit `164a329` or a compatible later revision.
 Its `market.signal` supplies freshness, expiry and model provenance. The optional
 Server M2 patch adds regression tests only; no Server API change is required.
@@ -34,10 +37,12 @@ below remains applicable to the local core.
 
 ## Start and test
 
-M1 needs **64-bit PHP 8.3+**, **PDO SQLite** and **BCMath**. Composer is not needed
-for the M1 core. This full distribution also includes M0’s locked PHP libraries. On Windows, local named-pipe control also needs PowerShell.
+The storage/control core needs **64-bit PHP 8.3+**, **PDO SQLite** and **BCMath**.
+The current `run` command also requires the Composer dependencies described
+above. On Windows, local named-pipe control also needs PowerShell.
 
 ```bash
+composer install
 php bin/client.php doctor
 php tests/m1.php
 php tools/m1-simulate.php --data-dir=/tmp/trademinator-m1-fixture --orders=10000 --scenario=all

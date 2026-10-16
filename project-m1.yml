@@ -7,8 +7,12 @@ sources:
 embedded-files:
   - m1
   - m2
+  - vendor
+  - compat
 ext-deps:
   - bcmath
   - pdo_sqlite
   - curl
   - openssl
+  - gmp
+  - mbstring

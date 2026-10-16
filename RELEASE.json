@@ -1,11 +1,11 @@
 {
   "name": "Trademinator Client",
   "milestone": "M2",
-  "version": "2.0.0-rc2",
+  "version": "2.1.0-rc1",
   "source_base": "b30777977dd548229f67188d414a28e04bd2e89a",
   "source_repository": "https://github.com/Trademinator/client",
-  "release_date": "2026-10-15",
-  "scope": "Authenticated Server intelligence, selected market lifecycle and candle-aligned scheduling",
+  "release_date": "2026-10-16",
+  "scope": "M2 authenticated Server intelligence, market scheduling and structured console events",
   "live_order_execution": false,
   "m0_entry": "bin/m0.php",
   "m1_entry": "bin/client.php",
@@ -14,5 +14,8 @@
   "m2_entry": "bin/client.php",
   "server_contract_base": "164a3298653b4c31ecf44fcfbfae63108c69d614",
   "server_signal_path": "market.signal",
-  "requires_server_m2_patch": false
+  "requires_server_m2_patch": false,
+  "console_events_schema": 1,
+  "console_formatter": "symfony/console ^7.4",
+  "console_patch_base": "M2 2.0.0-rc2 plus recovery-warning follow-up"
 }
