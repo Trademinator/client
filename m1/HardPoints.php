@@ -139,6 +139,10 @@ final class HardPoints
                         throw new RuntimeException('Account changed while preparing restore.');
                     }
                     $this->ledger->restoreAccountSnapshot($hard['snapshot']);
+                    // Restore the financial history, never historical authorization to trade.
+                    // M1 snapshots omit these columns and are accepted using the M2 defaults.
+                    $q = $this->db->pdo()->prepare("UPDATE markets SET subscription_id=NULL,checks_per_candle=NULL,state=CASE WHEN EXISTS (SELECT 1 FROM orders WHERE orders.market_id=markets.id AND orders.status IN ('open','partially_filled')) THEN 'STOPPING' ELSE 'STOPPED' END WHERE account_id=?");
+                    $q->execute([$account]);
                     $baseline = $hard;
                     $baseline['activation_nonce'] = $pending['activation_nonce'];
                     $baseline['hardpoint_id'] = $hard['id'];

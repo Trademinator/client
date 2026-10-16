@@ -11,6 +11,8 @@ use Throwable;
 /** SQLite is the durable authority; all financial writers serialize with BEGIN IMMEDIATE. */
 final class Database
 {
+    public const SCHEMA_VERSION = 2;
+
     private PDO $connection;
     private int $depth = 0;
 
@@ -48,13 +50,26 @@ final class Database
 
     private function assertSupportedSchema(): void
     {
-        $tables = $this->connection->query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")->fetchAll(PDO::FETCH_COLUMN);
-        if ($tables === []) { return; }
+        self::schemaVersion($this->connection);
+    }
+
+    /** Validate snapshots without opening a Database and accidentally migrating them. */
+    public static function schemaVersion(PDO $connection): int
+    {
+        $tables = $connection->query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")->fetchAll(PDO::FETCH_COLUMN);
+        if ($tables === []) { return 0; }
         if (!in_array('schema_migrations', $tables, true)) { throw new RuntimeException('This is not an M1 database. Use a new M1 data directory; M0 data is not migrated implicitly.'); }
-        $version = (int) $this->connection->query('SELECT COALESCE(MAX(version),0) FROM schema_migrations')->fetchColumn();
-        if ($version > 1) { throw new RuntimeException('Database schema is newer than this M1 release.'); }
+        $version = (int) $connection->query('SELECT COALESCE(MAX(version),0) FROM schema_migrations')->fetchColumn();
+        if ($version > self::SCHEMA_VERSION) { throw new RuntimeException('Database schema is newer than this M2 release.'); }
         $expected = ['buys_vs_sells','checkpoints','exchange_accounts','markets','operations','orders','schema_migrations','signal_decisions'];
-        if (($version === 1 && $tables !== $expected) || ($version === 0 && $tables !== ['schema_migrations'])) { throw new RuntimeException('Unrecognized or incomplete M1 database schema.'); }
+        if (($version >= 1 && $tables !== $expected) || ($version === 0 && $tables !== ['schema_migrations'])) { throw new RuntimeException('Unrecognized or incomplete client database schema.'); }
+        if ($version === 2) {
+            $columns = array_column($connection->query('PRAGMA table_info(markets)')->fetchAll(PDO::FETCH_ASSOC), 'name');
+            if (array_diff(['state', 'subscription_id', 'checks_per_candle'], $columns) !== []) {
+                throw new RuntimeException('Incomplete M2 market schema.');
+            }
+        }
+        return $version;
     }
 
     public function transaction(callable $callback): mixed
@@ -82,12 +97,12 @@ final class Database
     {
         $this->assertSupportedSchema();
         $existing = $this->connection->query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'")->fetchColumn();
-        if ($existing && (int) $this->connection->query('SELECT COALESCE(MAX(version),0) FROM schema_migrations')->fetchColumn() === 1) { return; }
-        if ($existing && $this->filename !== ':memory:') {
-            // Any future schema upgrade must use this pre-transaction verified snapshot path.
-            $destination = dirname($this->filename) . '/backups/pre-migration/' . gmdate('Ymd\THis\Z') . '-' . bin2hex(random_bytes(6)) . '/database.sqlite';
-            $verified = Backup::snapshot($this, $destination);
-            Backup::atomicJson(dirname($destination) . '/manifest.json', ['reason' => 'pre-migration', 'schema_target' => 1] + $verified);
+        $version = $existing ? (int) $this->connection->query('SELECT COALESCE(MAX(version),0) FROM schema_migrations')->fetchColumn() : 0;
+        if ($version === self::SCHEMA_VERSION) { return; }
+        if ($version > 0 && $this->filename !== ':memory:') {
+            // The regular manifest makes this verified M1 snapshot discoverable by recover-backup.
+            // Publication must succeed before any schema or financial record is changed.
+            (new Backup($this, dirname($this->filename)))->preMigration();
         }
         $this->transaction(function (): void {
             $this->connection->exec(<<<'SQL'
@@ -96,8 +111,9 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 SQL);
             $version = (int) $this->connection->query('SELECT COALESCE(MAX(version),0) FROM schema_migrations')->fetchColumn();
-            if ($version > 1) { throw new RuntimeException('Database schema is newer than this M1 release.'); }
-            if ($version === 1) { return; }
+            if ($version > self::SCHEMA_VERSION) { throw new RuntimeException('Database schema is newer than this M2 release.'); }
+            if ($version === self::SCHEMA_VERSION) { return; }
+            if ($version === 0) {
             $this->connection->exec(<<<'SQL'
 CREATE TABLE exchange_accounts (
  id TEXT PRIMARY KEY, exchange TEXT NOT NULL, label TEXT NOT NULL,
@@ -171,6 +187,16 @@ CREATE INDEX checkpoints_account ON checkpoints(account_id);
 SQL);
             $statement = $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(1,?)');
             $statement->execute([gmdate('c')]);
+            }
+            // Additive migration only: no financial table is rebuilt and no M1 value is rewritten.
+            $this->connection->exec(<<<'SQL'
+ALTER TABLE markets ADD COLUMN state TEXT NOT NULL DEFAULT 'STOPPED' CHECK(state IN ('ACTIVE','STOPPING','STOPPED'));
+ALTER TABLE markets ADD COLUMN subscription_id TEXT;
+ALTER TABLE markets ADD COLUMN checks_per_candle INTEGER CHECK(checks_per_candle IS NULL OR (typeof(checks_per_candle)='integer' AND checks_per_candle BETWEEN 1 AND 59));
+SQL);
+            $statement = $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(2,?)');
+            $statement->execute([gmdate('c')]);
+            if (!$this->integrityCheck()['ok']) { throw new RuntimeException('M2 migration failed database integrity checks.'); }
         });
     }
 

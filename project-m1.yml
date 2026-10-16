@@ -6,6 +6,9 @@ sources:
   - native/m1.php
 embedded-files:
   - m1
+  - m2
 ext-deps:
   - bcmath
   - pdo_sqlite
+  - curl
+  - openssl

@@ -7,7 +7,7 @@ namespace Trademinator\Client\M1;
 use RuntimeException;
 use Throwable;
 
-/** M1 core loop: persistence/control only. It never submits exchange orders. */
+/** Local core loop with nonblocking M2 reads. It never submits exchange orders. */
 final class Daemon
 {
     private readonly Paths $paths;
@@ -84,7 +84,7 @@ final class Daemon
             $exitCode = 1;
             $this->lastError = $error->getMessage();
             $this->state = 'failed';
-            fwrite(STDERR, json_encode(['ok' => false, 'milestone' => 'M1', 'error' => $error->getMessage()], JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE).PHP_EOL);
+            fwrite(STDERR, json_encode(['ok' => false, 'milestone' => 'M2', 'error' => $error->getMessage()], JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE).PHP_EOL);
             try { $this->log('error', 'daemon_failed', ['error_type' => get_class($error), 'message' => $error->getMessage()]); } catch (Throwable) { /* Preserve the original storage failure. */ }
         } finally {
             $this->stopping = true;
@@ -117,22 +117,23 @@ final class Daemon
         if ($command === 'status') { return $this->status(); }
         if ($command === 'stop') { $this->stop(); return ['state' => 'stopping', 'run_id' => $this->runId]; }
         if ($command === 'reload') {
-            $previousConfig = $this->config;
-            $previousGeneration = $this->configGeneration;
             try {
                 $candidate = $this->config->reload();
                 if ($this->onReload !== null) { ($this->onReload)($candidate); }
-                $this->config = $candidate;
-                $this->configGeneration++;
-                $this->log('info', 'configuration_reloaded', ['generation' => $this->configGeneration]);
-                $this->writeStatus();
-                return ['state' => $this->state, 'config_generation' => $this->configGeneration, 'config' => $this->config->toArray()];
             } catch (Throwable $error) {
-                $this->config = $previousConfig;
-                $this->configGeneration = $previousGeneration;
-                $this->log('warning', 'configuration_rejected', ['message' => $error->getMessage()]);
+                try { $this->log('warning', 'configuration_rejected', ['message' => $error->getMessage()]); } catch (Throwable) { /* Keep the original validation error. */ }
                 throw $error;
             }
+            // The runtime has committed its new settings. A reporting failure must
+            // never make the displayed Config silently disagree with that runtime.
+            $this->config = $candidate;
+            $this->configGeneration++;
+            $result = ['state' => $this->state, 'config_generation' => $this->configGeneration, 'config' => $this->config->toArray()];
+            try {
+                $this->log('info', 'configuration_reloaded', ['generation' => $this->configGeneration]);
+                $this->writeStatus();
+            } catch (Throwable) { $result['warning'] = 'configuration_applied_reporting_failed'; }
+            return $result;
         }
         if ($this->commandHandler !== null) { return ($this->commandHandler)($command, $arguments); }
         throw new RuntimeException('Unsupported local control command.');
@@ -140,7 +141,7 @@ final class Daemon
 
     public function status(): array
     {
-        return ['milestone' => 'M1', 'mode' => 'local_core', 'trading_enabled' => false, 'state' => $this->state,
+        return ['milestone' => 'M2', 'mode' => $this->config->serverUrl === '' ? 'local_core' : 'server_intelligence', 'trading_enabled' => false, 'state' => $this->state,
             'pid' => getmypid(), 'run_id' => $this->runId, 'uptime_seconds' => $this->started > 0 ? round(hrtime(true) / 1e9 - $this->started, 3) : 0,
             'updated_at' => gmdate('Y-m-d\TH:i:s\Z'), 'data_dir' => $this->paths->dataDir,
             'ipc_transport' => PHP_OS_FAMILY === 'Windows' ? 'windows_named_pipe' : 'unix_socket',
@@ -149,7 +150,14 @@ final class Daemon
             'last_error' => $this->lastError, 'memory_bytes' => memory_get_usage(true), 'ledger' => $this->componentStatus];
     }
 
-    private function writeStatus(): void { Paths::atomicJson($this->paths->statusFile, $this->status()); }
+    private function writeStatus(): void
+    {
+        $snapshot = $this->status();
+        // Server catalog, timers, warnings and intelligence are process-local.
+        // Live IPC status can show them; restart never reloads them from disk.
+        unset($snapshot['ledger']['server']);
+        Paths::atomicJson($this->paths->statusFile, $snapshot);
+    }
 
     public function log(string $level, string $event, array $context = []): void
     {

@@ -1,0 +1,13 @@
+{
+    "tick_ms": 100,
+    "log_level": "info",
+    "log_max_bytes": 5242880,
+    "log_keep": 5,
+    "server_url": "https://server.trademinator.com",
+    "server_api_key_env": "TRADEMINATOR_API_KEY",
+    "checks_per_candle": 3,
+    "server_timeout_ms": 10000,
+    "server_catalog_interval_ms": 60000,
+    "server_risk_interval_ms": 60000,
+    "server_min_request_interval_ms": 600
+}

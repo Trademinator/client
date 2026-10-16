@@ -157,6 +157,11 @@ final class Backup
             self::verifySnapshot($stage, $chosen['database']['sha256']);
             $pdo = new PDO('sqlite:' . $stage, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
             $pdo->exec('UPDATE exchange_accounts SET reconciled_revision=NULL,reconciled_at=NULL,revision=revision+1');
+            if (Database::schemaVersion($pdo) >= 2) {
+                // An old subscription choice is not current authorization to resume a market.
+                // Open orders still need monitoring until an authoritative reconciliation closes them.
+                $pdo->exec("UPDATE markets SET subscription_id=NULL,checks_per_candle=NULL,state=CASE WHEN EXISTS (SELECT 1 FROM orders WHERE orders.market_id=markets.id AND orders.status IN ('open','partially_filled')) THEN 'STOPPING' ELSE 'STOPPED' END");
+            }
             $accounts = $pdo->query('SELECT id,revision,hard_t0_json FROM exchange_accounts')->fetchAll(PDO::FETCH_ASSOC);
             $pdo = null;
             self::syncFile($stage);
@@ -222,6 +227,8 @@ final class Backup
             throw new RuntimeException('SQLite snapshot SHA-256 mismatch.');
         }
         $pdo = new PDO('sqlite:' . $path, null, null, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $schemaVersion = Database::schemaVersion($pdo);
+        if ($schemaVersion < 1) { throw new RuntimeException('SQLite snapshot has no completed client schema.'); }
         $results = $pdo->query('PRAGMA integrity_check')->fetchAll(PDO::FETCH_COLUMN);
         if ($results !== ['ok']) {
             throw new RuntimeException('SQLite snapshot failed integrity_check: ' . implode('; ', $results));
@@ -231,7 +238,7 @@ final class Backup
             throw new RuntimeException('SQLite snapshot failed foreign_key_check.');
         }
         $pdo = null;
-        return ['sha256' => hash_file('sha256', $path), 'bytes' => filesize($path), 'integrity_check' => 'ok'];
+        return ['sha256' => hash_file('sha256', $path), 'bytes' => filesize($path), 'integrity_check' => 'ok', 'schema_version' => $schemaVersion];
     }
 
     /** VACUUM INTO includes committed WAL content and never copies a live main file alone. */

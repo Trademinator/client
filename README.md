@@ -1,10 +1,36 @@
-# Trademinator Client — M1
+# Trademinator Client — M2
+
+M2 adds authenticated Server intelligence, explicit market selection and
+candle-aligned scheduling to the M1 core. It consumes final BUY/SELL opportunities
+and their supporting data; it does not execute or size orders. Exchange state
+integration remains M3 and local trading decisions remain later milestones.
+
+Read [M2 installation and validation](docs/M2-INSTALL.md) before upgrading.
+M2 requires **64-bit PHP 8.3+**, **PDO SQLite**, **BCMath**, **curl** and **OpenSSL**.
+Use the existing Server GET endpoint at commit `164a329` or a compatible later revision.
+Its `market.signal` supplies freshness, expiry and model provenance. The optional
+Server M2 patch adds regression tests only; no Server API change is required.
+Use `config.m2.example.json` and `php tests/m2.php`. The API key is read from
+`TRADEMINATOR_API_KEY` or a private key file; never put it in JSON configuration.
+
+Only explicitly activated markets poll intelligence. Market state is durable:
+`ACTIVE → STOPPING → STOPPED`; a stopping market waits for authoritative terminal
+order status. Network failures keep markets active with a warning and disable
+cached opportunities. Subscription catalogs, timers, signals and warnings remain
+in memory and are reconstructed on restart.
+
+Checks per candle default to three and can be set per market. With period `P`
+and count `N`, checks `1..N-1` occur at `iP/N`; the last targets `P-P/60`.
+For one minute, the default targets are 20, 40 and 59 seconds after candle open.
+Scheduling is UTC-aligned and obeys a shared request budget.
+
+## Preserved M1 core
 
 M1 supplies the per-user local daemon, SQLite accounting storage, native local
 control, backups, reconstruction points and deterministic simulation. It does
 not connect to a private exchange account or execute live orders. Those belong
-to later milestones. This is the first M1 release candidate, for acceptance
-on your Linux and Windows machines (and macOS before deployment there).
+to later milestones. The original M1 installation and accounting guidance
+below remains applicable to the local core.
 
 ## Start and test
 
@@ -87,9 +113,10 @@ composer test:m0
 php tools/soak.php 60
 ```
 
-M0's `native/main.php` and `project*.yml` experiments still target M0. The separate
-`project-m1.yml` is an M1 embedded-runtime build candidate and must be validated
-on each target toolchain; an M0 executable does not run M1.
+M0's `native/main.php` and its build experiments still target M0. The separate
+`project-m1.yml` now embeds the M1 core and M2 sources and requires curl/OpenSSL.
+It must be rebuilt and validated on each target toolchain; existing M0/M1
+executables do not acquire M2 merely by applying the source patch.
 
 The archive contains source, not your private configuration, local state,
 credentials, existing local test evidence or old locally compiled executables.

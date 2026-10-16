@@ -1,12 +1,18 @@
 {
   "name": "Trademinator Client",
-  "milestone": "M1",
-  "version": "1.0.0-rc1",
+  "milestone": "M2",
+  "version": "2.0.0-rc2",
   "source_base": "b30777977dd548229f67188d414a28e04bd2e89a",
   "source_repository": "https://github.com/Trademinator/client",
   "release_date": "2026-10-15",
-  "scope": "Local daemon, persistence, backup, hard points and deterministic simulation",
+  "scope": "Authenticated Server intelligence, selected market lifecycle and candle-aligned scheduling",
   "live_order_execution": false,
   "m0_entry": "bin/m0.php",
-  "m1_entry": "bin/client.php"
+  "m1_entry": "bin/client.php",
+  "patch_base": "M1 1.0.0-rc1 full archive",
+  "patch_base_sha256": "8977c1d454b17c839f3fe7bca0a266ae30a7cfea9043f17a8343429811ffe35e",
+  "m2_entry": "bin/client.php",
+  "server_contract_base": "164a3298653b4c31ecf44fcfbfae63108c69d614",
+  "server_signal_path": "market.signal",
+  "requires_server_m2_patch": false
 }
