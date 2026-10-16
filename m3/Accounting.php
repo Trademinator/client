@@ -87,6 +87,16 @@ final class Accounting
             if ($order === null) {
                 throw new RuntimeException('Trade requires authoritative order details.');
             }
+            // Never replace already observed lifecycle details with a history-only summary.
+            if ($order['status'] === 'history_only' && $existing !== null && $existing['status'] !== 'history_only') {
+                if (in_array($existing['status'], ['open','partially_filled'], true)) {
+                    throw new RuntimeException('Historical trade evidence cannot resolve a locally open or uncertain order.');
+                }
+                $order = array_replace($order, ['status' => $existing['status'], 'amount' => $existing['quantity'],
+                    'type' => $existing['order_type'], 'price' => $existing['price'],
+                    'client_order_id' => $meta['m3']['client_order_id'] ?? null]);
+                unset($order['history_evidence']);
+            }
             $market = $this->market($account, $order['symbol']);
             $filled = '0';
             $cost = '0';
@@ -118,6 +128,11 @@ final class Accounting
             }
             $meta['m3'] = array_replace($meta['m3'] ?? [], ['origin' => $meta['m3']['origin'] ?? 'manual', 'client_order_id' => $order['client_order_id'],
                 'submission' => 'confirmed','fills' => $fills,'fees' => $feeRows]);
+            if ($order['status'] === 'history_only') {
+                $meta['m3']['history_evidence'] = $order['history_evidence'];
+            } else {
+                unset($meta['m3']['history_evidence']);
+            }
             $this->ledger->recordOrder(['account_id' => $account,'market_id' => $market['id'],'exchange_order_id' => (string)$id,
                 'side' => $order['side'],'order_type' => $order['type'],'status' => $order['status'],'quantity' => $order['amount'],
                 'filled_quantity' => $filled,'price' => $price,'average_price' => bccomp($filled, '0', 24) > 0 ? Numbers::decimal(bcdiv($cost, $filled, 24)) : $price,
@@ -125,6 +140,10 @@ final class Accounting
                 'metadata' => $meta]);
         }
         foreach ($batch['operations'] as $op) {
+            if (($op['fee_evidence']['source'] ?? null) === 'operator_bitso_lightning_invoice'
+                && ($op['fee_evidence']['operator_confirmation']['account_id'] ?? null) !== $account) {
+                throw new RuntimeException('Bitso Lightning operator confirmation belongs to another account.');
+            }
             $existing = $this->rows('SELECT * FROM operations WHERE account_id=? AND exchange_operation_id=?', [$account,$op['id']])[0] ?? null;
             if ($existing !== null) {
                 $meta = Numbers::decode($existing['metadata_json']);
@@ -135,6 +154,9 @@ final class Accounting
                         if ($previous[$key] !== $op[$key]) {
                             throw new RuntimeException('Conflicting transfer financial evidence.');
                         }
+                    }
+                    if (isset($op['fee_evidence']) || isset($previous['fee_evidence'])) {
+                        $meta['m3']['fee_evidence'] ??= $previous['fee_evidence'] ?? $op['fee_evidence'];
                     }
                     $meta['m3']['evidence'] = $op;
                     $this->execute('UPDATE operations SET metadata_json=? WHERE id=?', [Numbers::json($meta),$existing['id']]);
@@ -147,7 +169,8 @@ final class Accounting
             $this->ledger->recordOperation(['account_id' => $account,'market_id' => $market['id'] ?? null,'exchange_operation_id' => $op['id'],
                 'kind' => $op['kind'],'currency' => $op['currency'],'amount' => $op['amount'],'price_basis' => $basis['price'] ?? null,
                 'occurred_at' => Numbers::iso($op['timestamp']),
-                'metadata' => ['m3' => ['origin' => 'exchange','evidence' => $op,'fees' => $op['fees'],'basis' => $basis,'fx_rates' => $batch['transfer_rates'][$op['id']] ?? []]]]);
+                'metadata' => ['m3' => ['origin' => 'exchange','evidence' => $op,'fees' => $op['fees'],'basis' => $basis,'fx_rates' => $batch['transfer_rates'][$op['id']] ?? []]
+                    + (isset($op['fee_evidence']) ? ['fee_evidence' => $op['fee_evidence']] : [])]]);
         }
     }
     /** Recompute attribution from all financial evidence; no fabricated balancing entries. */

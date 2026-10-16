@@ -11,7 +11,7 @@ use Throwable;
 /** SQLite is the durable authority; all financial writers serialize with BEGIN IMMEDIATE. */
 final class Database
 {
-    public const SCHEMA_VERSION = 3;
+    public const SCHEMA_VERSION = 4;
 
     private PDO $connection;
     private int $depth = 0;
@@ -73,6 +73,12 @@ final class Database
             $columns = array_column($connection->query('PRAGMA table_info(buys_vs_sells)')->fetchAll(PDO::FETCH_ASSOC), 'name');
             if (!in_array('buy_lot_key', $columns, true)) { throw new RuntimeException('Incomplete M3 lot schema.'); }
         }
+        if ($version >= 4) {
+            $columns = array_column($connection->query('PRAGMA table_info(orders)')->fetchAll(PDO::FETCH_ASSOC), null, 'name');
+            if (($columns['quantity']['notnull'] ?? 1) !== 0 || ($columns['remaining_quantity']['notnull'] ?? 1) !== 0) {
+                throw new RuntimeException('Incomplete M3 historical-order schema.');
+            }
+        }
         return $version;
     }
 
@@ -108,6 +114,10 @@ final class Database
             // Publication must succeed before any schema or financial record is changed.
             (new Backup($this, dirname($this->filename)))->preMigration();
         }
+        // SQLite's documented table-rebuild procedure: disable FK enforcement BEFORE
+        // BEGIN, retain every row/ID, validate all foreign keys before committing.
+        $this->connection->exec('PRAGMA foreign_keys = OFF');
+        try {
         $this->transaction(function (): void {
             $this->connection->exec(<<<'SQL'
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -202,10 +212,39 @@ SQL);
             $statement = $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(2,?)');
             $statement->execute([gmdate('c')]);
             }
-            $this->connection->exec('ALTER TABLE buys_vs_sells ADD COLUMN buy_lot_key TEXT');
-            $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(3,?)')->execute([gmdate('c')]);
-            if (!$this->integrityCheck()['ok']) { throw new RuntimeException('M2 migration failed database integrity checks.'); }
+            if ($version < 3) {
+                $this->connection->exec('ALTER TABLE buys_vs_sells ADD COLUMN buy_lot_key TEXT');
+                $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(3,?)')->execute([gmdate('c')]);
+            }
+            if ($version < 4) {
+                $this->connection->exec(<<<'SQL'
+CREATE TABLE orders_v4 (
+ id TEXT PRIMARY KEY, account_id TEXT NOT NULL, market_id TEXT NOT NULL,
+ exchange_order_id TEXT NOT NULL, side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
+ order_type TEXT NOT NULL DEFAULT 'LIMIT' CHECK(order_type IN ('LIMIT','MARKET','UNKNOWN')),
+ status TEXT NOT NULL CHECK(status IN ('open','partially_filled','filled','cancelled','rejected','expired','history_only')),
+ quantity TEXT, filled_quantity TEXT NOT NULL, remaining_quantity TEXT,
+ price TEXT NOT NULL, average_price TEXT NOT NULL, cost_amount TEXT NOT NULL,
+ fee_amount TEXT NOT NULL DEFAULT '0', fee_currency TEXT,
+ occurred_at TEXT NOT NULL, updated_at TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}',
+ observations_json TEXT NOT NULL DEFAULT '[]',
+ CHECK((status='history_only' AND quantity IS NULL AND remaining_quantity IS NULL AND order_type='UNKNOWN')
+    OR (status<>'history_only' AND quantity IS NOT NULL AND remaining_quantity IS NOT NULL AND order_type<>'UNKNOWN')),
+ UNIQUE(account_id,exchange_order_id), UNIQUE(id,account_id,market_id),
+ FOREIGN KEY(market_id,account_id) REFERENCES markets(id,account_id) ON DELETE CASCADE
+);
+INSERT INTO orders_v4 SELECT * FROM orders;
+DROP TABLE orders;
+ALTER TABLE orders_v4 RENAME TO orders;
+CREATE INDEX orders_market_status ON orders(market_id,status);
+SQL);
+                $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(4,?)')->execute([gmdate('c')]);
+            }
+            if (!$this->integrityCheck()['ok']) { throw new RuntimeException('M3 migration failed database integrity checks.'); }
         });
+        } finally {
+            $this->connection->exec('PRAGMA foreign_keys = ON');
+        }
     }
 
     public function revision(string $accountId): int

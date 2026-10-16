@@ -20,6 +20,8 @@ final class Runtime
     private array $clients = [];
     private array $states = [];
     private array $tasks = [];
+    private array $syncs = [];
+    private const PROGRESS_INTERVAL_MS = 30000;
     private array $watchers = [];
     private array $generation = [];
     private Reconciler $reconciler;
@@ -45,7 +47,7 @@ final class Runtime
             } catch (Throwable $error) {
                 if (!self::auth($error)) {
                     throw $error;
-                } $this->blockAuth($id);
+                } $this->blockAuth($id, $error, 'initialization');
             }
         }
         foreach (array_keys($this->states) as $id) {
@@ -77,6 +79,15 @@ final class Runtime
             }
             if (!isset($this->tasks[$id]) && $now >= $s['due']) {
                 $this->start($id, $account, $now);
+            }
+            if (isset($this->tasks[$id]) && $now >= $this->syncs[$id]['next_log_at_ms']) {
+                $progress = $this->progressFor($id, $now);
+                $request = $progress['request'] ?? [];
+                $operation = $request['operation'] ?? $progress['stage'];
+                $label = $operation.(empty($request['symbol']) ? '' : ' '.$request['symbol']);
+                $this->emit('info', 'exchange_sync_progress', ['account_id' => $id] + $progress,
+                    'Exchange synchronization is still running: '.$label.'; elapsed '.intdiv($progress['elapsed_ms'], 1000).' seconds.');
+                $this->syncs[$id]['next_log_at_ms'] = $now + self::PROGRESS_INTERVAL_MS;
             }
             unset($s);
         }
@@ -122,7 +133,7 @@ final class Runtime
                 $now = (int)floor(microtime(true) * 1000);
                 $this->states[$id]['ws'][$key] = ['state' => 'unavailable','due' => $now + $this->settings['ws_retry_ms']];
                 if (self::auth($error)) {
-                    $this->blockAuth($id);
+                    $this->blockAuth($id, $error, 'websocket:'.$key);
                 } else {
                     $this->states[$id]['due'] = $now;
                     $this->states[$id]['rest_ok'] = false;
@@ -138,7 +149,7 @@ final class Runtime
             unset($this->watchers[$id][$key]);
             $this->states[$id]['ws'][$key] = ['state' => 'unavailable','due' => $now + $this->settings['ws_retry_ms']];
             if (self::auth($error)) {
-                $this->blockAuth($id);
+                $this->blockAuth($id, $error, 'websocket:'.$key);
             }
         }
     }
@@ -147,15 +158,18 @@ final class Runtime
         $generation = $this->generation[$id];
         $eventSequence = $this->states[$id]['event_sequence'];
         $this->tasks[$id] = true;
+        $this->syncs[$id] = ['started_at_ms' => $now, 'stage' => 'rest_snapshot', 'next_log_at_ms' => $now + self::PROGRESS_INTERVAL_MS];
         $this->states[$id]['due'] = $now + $this->settings['sync_interval_ms'];
-        $this->emit('debug', 'exchange_sync_started', ['account_id' => $id], 'Synchronizing exchange account.');
+        $this->emit('info', 'exchange_sync_started', ['account_id' => $id], 'Synchronizing exchange account; collecting authoritative REST history.');
         try {
             $promise = async(function () use ($id, $account): array {
                 $context = $this->reconciler->context($id, $account);
+                $context['transfer_since_ms'] = $context['since_ms'];
                 if ($this->states[$id]['cursor_ms'] !== null && !($this->hard?->verificationPending($id) ?? false)) {
                     $context['since_ms'] = max($context['since_ms'], $this->states[$id]['cursor_ms'] - $this->settings['overlap_ms']);
                 }
                 $batch = await($this->clients[$id]->snapshot($context));
+                $this->syncs[$id]['stage'] = 'deposit_pricing';
                 if ($this->clients[$id] instanceof CcxtAccount) {
                     $prices = new Prices($this->clients[$id]->publicClient(), $account, $this->settings['timeout_ms']);
                     foreach ($batch['operations'] as $op) {
@@ -182,6 +196,7 @@ final class Runtime
                     return;
                 }
                 try {
+                    $this->syncs[$id]['stage'] = 'reconcile_account';
                     if ($eventSequence !== $this->states[$id]['event_sequence']) {
                         $this->states[$id]['due'] = 0;
                         return;
@@ -210,20 +225,26 @@ final class Runtime
                         $this->hard->verifyPending($id, $batch);
                         $this->hard->capture($id);
                     }
+                    if (($batch['history_only_orders'] ?? 0) > 0) {
+                        $this->emit('info', 'exchange_historical_orders_imported',
+                            ['account_id' => $id, 'orders' => $batch['history_only_orders']],
+                            'Verified historical executions retained. Original order details and final status are unavailable.');
+                    }
+                    unset($this->states[$id]['last_error']);
                     $this->emit($result['reconciled'] ? 'info' : 'warning', 'exchange_sync_completed', ['account_id' => $id,'reconciled' => $result['reconciled'],'discrepancies' => $result['discrepancies']], 'Exchange account synchronization completed.');
                 } catch (Throwable $error) {
                     $this->failed($id, $error);
                 } finally {
-                    unset($this->tasks[$id]);
+                    unset($this->tasks[$id], $this->syncs[$id]);
                 }
             }, function (Throwable $error) use ($id, $generation): void {
                 if ($this->closed || $generation !== $this->generation[$id]) {
                     return;
-                }unset($this->tasks[$id]);
+                }unset($this->tasks[$id], $this->syncs[$id]);
                 $this->failed($id, $error);
             });
         } catch (Throwable $error) {
-            unset($this->tasks[$id]);
+            unset($this->tasks[$id], $this->syncs[$id]);
             $this->failed($id, $error);
         }
     }
@@ -236,7 +257,7 @@ final class Runtime
         $this->reconciler->invalidate($id);
         $this->states[$id]['rest_ok'] = false;
         if (self::auth($error)) {
-            $this->blockAuth($id);
+            $this->blockAuth($id, $error, 'rest_snapshot');
             return;
         }
         $failures = ++$this->states[$id]['failures'];
@@ -245,15 +266,39 @@ final class Runtime
         $this->states[$id]['warning'] = 'exchange_reconciliation_required';
         $this->states[$id]['due'] = (int)floor(microtime(true) * 1000) + $delay;
         $this->clients[$id]->resetRest();
-        $this->emit('warning', 'exchange_sync_failed', ['account_id' => $id,'error_type' => get_class($error),'retry_in_ms' => $delay], 'Exchange synchronization failed; new orders are blocked.');
+        $exchange = $this->accounting->rows('SELECT exchange FROM exchange_accounts WHERE id=?', [$id])[0]['exchange'];
+        $call = $this->clients[$id] instanceof CcxtAccount ? $this->clients[$id]->failureContext($error) : [];
+        $diagnostic = array_merge(['account_id' => $id, 'exchange' => $exchange,
+            'operation' => 'reconcile_account', 'error_type' => get_class($error)],
+            $call, SyncDiagnostics::describe($error, $exchange));
+        $this->states[$id]['last_error'] = $diagnostic;
+        $summary = $exchange.' '.$diagnostic['operation'].(empty($diagnostic['symbol']) ? '' : ' '.$diagnostic['symbol']);
+        if (isset($diagnostic['exchange_code'])) {
+            $summary .= ' ('.$diagnostic['exchange_code'].')';
+        }
+        if (isset($diagnostic['http_status'])) {
+            $summary .= ' (HTTP '.$diagnostic['http_status'].')';
+        }
+        $this->emit('warning', 'exchange_sync_failed', $diagnostic + ['retry_in_ms' => $delay],
+            $summary.': '.$diagnostic['detail'].' New orders are blocked.');
     }
-    private function blockAuth(string $id): void
+    private function blockAuth(string $id, Throwable $error, string $stage): void
     {
         $this->states[$id]['state'] = 'AUTH_BLOCKED';
         $this->states[$id]['rest_ok'] = false;
         $this->states[$id]['warning'] = 'credentials_or_permissions';
         $this->reconciler->invalidate($id);
-        $this->emit('error', 'exchange_auth_blocked', ['account_id' => $id], 'Exchange authentication or permissions need attention. Reload after correcting credentials.');
+        // Do not emit raw exception messages: exchange responses can echo keys/signatures.
+        $diagnostic = $error instanceof CredentialError ? $error->diagnostic : match (true) {
+            is_a($error, 'ccxt\\AccountSuspended') => ['reason' => 'account_suspended', 'detail' => 'Exchange reports that this account is suspended. Check account status with the exchange.'],
+            is_a($error, 'ccxt\\PermissionDenied') => ['reason' => 'permission_denied', 'detail' => 'Exchange denied access. Check private balance/order/trade/ledger read permissions and API IP restrictions.'],
+            default => ['reason' => 'authentication_rejected', 'detail' => 'Exchange rejected authentication. Check the API key/secret pair, key validity, IP restrictions, and system clock.'],
+        };
+        $exchange = $this->accounting->rows('SELECT exchange FROM exchange_accounts WHERE id=?', [$id])[0]['exchange'];
+        $diagnostic = array_merge(['account_id' => $id, 'exchange' => $exchange, 'stage' => $stage], $diagnostic);
+        $this->states[$id]['auth_error'] = $diagnostic;
+        $this->emit('error', 'exchange_auth_blocked', $diagnostic,
+            ($diagnostic['config_field'] ?? $exchange).': '.$diagnostic['detail'].' Reload after correcting the problem.');
     }
     public function ready(string $marketId, ?int $now = null): array
     {
@@ -282,11 +327,26 @@ final class Runtime
         }
         return ['ready' => $reasons === [],'reasons' => array_values(array_unique($reasons)),'live_execution_enabled' => false];
     }
+    private function progressFor(string $id, ?int $now = null): array
+    {
+        if (!isset($this->tasks[$id])) {
+            return ['in_progress' => false];
+        }
+        $now ??= (int)floor(microtime(true) * 1000);
+        $sync = $this->syncs[$id];
+        $progress = ['in_progress' => true, 'started_at_ms' => $sync['started_at_ms'],
+            'elapsed_ms' => max(0, $now - $sync['started_at_ms']), 'stage' => $sync['stage']];
+        if ($sync['stage'] === 'rest_snapshot' && $this->clients[$id] instanceof CcxtAccount) {
+            $progress += $this->clients[$id]->snapshotProgress($now);
+        }
+        return $progress;
+    }
     public function status(): array
     {
         $accounts = $this->states;
         foreach ($accounts as $id => &$state) {
             unset($state['due']);
+            $state['sync'] = $this->progressFor($id);
             if ($state['discrepancies'] !== []) {
                 $state['adjustment_token'] = $this->adjustmentToken($id, $state);
             }$state['transport'] = count(array_filter($state['ws'], static fn ($s) => $s['state'] === 'connected')) > 0 ? 'websocket_with_rest' : 'rest';
@@ -361,6 +421,6 @@ final class Runtime
                 $task->cancel();
             }
         }
-        $this->tasks = $this->watchers = [];
+        $this->tasks = $this->watchers = $this->syncs = [];
     }
 }

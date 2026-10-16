@@ -16,6 +16,9 @@ final class CcxtAccount
     private object $rest;
     private ?object $pro = null;
     private array $options;
+    private array $requestContext = [];
+    private array $progress = [];
+    private ?\WeakMap $failureContexts = null;
     public function __construct(private string $exchange, private array $settings, private array $account, ?object $rest = null, ?object $pro = null)
     {
         if (!preg_match('/^[a-z][a-z0-9]{1,40}$/D', $exchange)) {
@@ -23,15 +26,11 @@ final class CcxtAccount
         }
         $this->options = ['enableRateLimit' => true,'timeout' => $settings['timeout_ms'],'newUpdates' => true,'number' => 'strval','options' => ['defaultType' => 'spot']];
         if ($rest === null) {
-            $class = '\\ccxt\\async\\'.$exchange;
+            $class = $exchange === 'bitso' ? BitsoReadClient::class : '\\ccxt\\async\\'.$exchange;
             if (!class_exists($class)) {
                 throw new RuntimeException('Exchange is unavailable in installed CCXT.');
             }
-            try {
-                $this->options += Settings::credentials($account);
-            } catch (\RuntimeException $error) {
-                throw new \ccxt\AuthenticationError('Exchange credentials are unavailable.');
-            }
+            $this->options += Settings::credentials($account);
             $rest = new $class($this->options);
             $class = '\\ccxt\\pro\\'.$exchange;
             if (class_exists($class)) {
@@ -69,8 +68,10 @@ final class CcxtAccount
     {
         return async(function () use ($context): array {
             $started = (int)floor(microtime(true) * 1000);
-            $loaded = await($this->rest->load_markets());
-            $balanceBefore = Normalize::balances(await($this->rest->fetch_balance()));
+            $this->requestContext = [];
+            $this->progress = ['requests_started' => 0, 'requests_finished' => 0];
+            $loaded = $this->read('load_markets');
+            $balanceBefore = Normalize::balances($this->read('fetch_balance', [], ['phase' => 'opening_balance']));
             $symbols = $context['symbols'];
             // Some exchanges require a symbol for private trade history. Scan all spot markets
             // to include manual activity outside the subscription list; CCXT limits every call.
@@ -96,9 +97,13 @@ final class CcxtAccount
                     $open[$o['id']] = true;
                 }
             }
+            $historicalSymbols = [];
+            $historyOnlyCount = 0;
             $wanted = $context['known_orders'];
+            $observedByOrder = [];
             foreach ($trades as $trade) {
                 $wanted[$trade['order']] = $trade['symbol'];
+                $observedByOrder[$trade['order']][] = $trade;
             }
             foreach ($orders as $order) {
                 $wanted[$order['id']] = $order['symbol'];
@@ -106,13 +111,46 @@ final class CcxtAccount
             foreach ($wanted as $id => $symbol) {
                 // Absence from open-orders never means filled or cancelled.
                 if (!isset($orders[$id])) {
-                    $orders[$id] = Normalize::order(await($this->rest->fetch_order((string)$id, $symbol)));
+                    try {
+                        $orders[$id] = Normalize::order($this->read('fetch_order', [(string)$id, $symbol], ['symbol' => $symbol]));
+                    } catch (\Throwable $error) {
+                        // Bitso removes terminal order details after about one hour. Verify
+                        // ownership and amounts using full order trades; never invent FILLED.
+                        $missing = $this->exchange === 'bitso' &&
+                            (is_a($error, 'ccxt\\OrderNotFound') || (SyncDiagnostics::describe($error, 'bitso')['exchange_code'] ?? null) === '0312');
+                        $observed = $observedByOrder[$id] ?? [];
+                        if (!$missing || is_a($error, 'ccxt\\AuthenticationError') || is_a($error, 'ccxt\\PermissionDenied')
+                            || is_a($error, 'ccxt\\AccountSuspended') || isset($context['known_orders'][$id]) || $observed === [] || !$this->supports('fetchOrderTrades')) {
+                            throw $error;
+                        }
+                        // The documented order-trades endpoint returns the full set; no
+                        // limit/since/cursor or configurable origin_id can truncate/redirect it.
+                        $rows = $this->read('fetch_order_trades', [(string)$id, $symbol, null, null, []],
+                            ['symbol' => $symbol, 'phase' => 'historical_order_verification']);
+                        if (!is_array($rows)) { throw new RuntimeException('Invalid history page.'); }
+                        $history = HistoricalOrder::summarize((string)$id, $symbol, $observed, array_map(Normalize::trade(...), $rows), $started);
+                        $orders[$id] = $history['order'];
+                        foreach ($history['trades'] as $trade) {
+                            $trades[$trade['symbol'].'|'.$trade['id']] = $trade;
+                        }
+                        $historicalSymbols[$symbol][] = (string)$id;
+                        ++$historyOnlyCount;
+                    }
                 }
                 $o = $orders[$id];
+                if ($o['status'] === 'history_only') { continue; }
                 if (bccomp($o['filled'], '0', 24) > 0 && $this->supports('fetchOrderTrades')) {
                     foreach ($this->history('fetch_order_trades', $symbol, null, (string)$id) as $row) {
                         $trade = Normalize::trade($row);
                         $trades[$trade['symbol'].'|'.$trade['id']] = $trade;
+                    }
+                }
+            }
+            foreach ($historicalSymbols as $symbol => $ids) {
+                // Confirm the complete open-order list again after the history fetch.
+                foreach ($this->history('fetch_open_orders', $symbol, null) as $row) {
+                    if (in_array((string)($row['id'] ?? ''), $ids, true)) {
+                        throw new RuntimeException('Historical order appeared in the open-order confirmation; retry synchronization.');
                     }
                 }
             }
@@ -137,8 +175,11 @@ final class CcxtAccount
                     }
                 }
             } else {
+                // Transfer status may settle long after its creation timestamp.
+                // Re-read from the configured/Hard H0 boundary, not the trade cursor.
+                $transferSince = $this->rest instanceof BitsoReadClient ? ($context['transfer_since_ms'] ?? $since) : $since;
                 foreach (['fetch_deposits' => 'deposit','fetch_withdrawals' => 'withdrawal'] as $method => $kind) {
-                    foreach ($this->history($method, null, $since) as $row) {
+                    foreach ($this->history($method, null, $transferSince) as $row) {
                         $op = Normalize::operation($row, $kind);
                         if ($op !== null) {
                             $operations[$op['id']] = $op;
@@ -146,7 +187,7 @@ final class CcxtAccount
                     }
                 }
             }
-            $balance = Normalize::balances(await($this->rest->fetch_balance()));
+            $balance = Normalize::balances($this->read('fetch_balance', [], ['phase' => 'closing_balance']));
             if ($balanceBefore !== $balance) {
                 throw new RuntimeException('Wallet changed during reconciliation; repeat the account snapshot.');
             }
@@ -154,15 +195,50 @@ final class CcxtAccount
             foreach ($context['symbols'] as $symbol) {
                 if (isset($loaded[$symbol]) && $this->supports('fetchTicker')) {
                     try {
-                        $quotes[$symbol] = Normalize::quote(await($this->rest->fetch_ticker($symbol)));
+                        $quotes[$symbol] = Normalize::quote($this->read('fetch_ticker', [$symbol], ['symbol' => $symbol]));
                     } catch (\Throwable) {/* Quote failure does not invent a price or authorize future execution. */
                     }
                 }
             }
             $at = (int)floor(microtime(true) * 1000);
             return ['at_ms' => $at,'started_at_ms' => $started,'since_ms' => $since,'balances' => $balance,'orders' => array_values($orders),'trades' => array_values($trades),
-                'operations' => array_values($operations),'markets' => $loaded,'quotes' => $quotes,'complete' => true,'prices' => []];
-        })();
+                'operations' => array_values($operations),'markets' => $loaded,'quotes' => $quotes,'complete' => true,'prices' => [],'history_only_orders' => $historyOnlyCount];
+        })()->then(null, function (\Throwable $error): never {
+            $this->failureContexts ??= new \WeakMap();
+            $this->failureContexts[$error] = array_merge($this->requestContext,
+                $this->rest instanceof BitsoReadClient ? $this->rest->failureContext($error) : []);
+            // Preserve the exact exception class for existing authentication/retry handling.
+            throw $error;
+        });
+    }
+    /** Request metadata only; never persist/return credentials, IDs, params or signed URLs. */
+    private function read(string $method, array $arguments = [], array $context = []): mixed
+    {
+        $this->requestContext = ['operation' => $method] + $context;
+        $started = (int)floor(microtime(true) * 1000);
+        ++$this->progress['requests_started'];
+        $this->progress['request'] = $this->requestContext + ['started_at_ms' => $started, 'in_flight' => true];
+        try {
+            return await($this->rest->$method(...$arguments));
+        } finally {
+            ++$this->progress['requests_finished'];
+            $this->progress['request']['in_flight'] = false;
+            $this->progress['request']['elapsed_ms'] = max(0, (int)floor(microtime(true) * 1000) - $started);
+        }
+    }
+    /** Safe metadata only; elapsed time includes CCXT rate-limit waiting. */
+    public function snapshotProgress(?int $now = null): array
+    {
+        $progress = $this->progress;
+        if ($progress['request']['in_flight'] ?? false) {
+            $now ??= (int)floor(microtime(true) * 1000);
+            $progress['request']['elapsed_ms'] = max(0, $now - $progress['request']['started_at_ms']);
+        }
+        return $progress;
+    }
+    public function failureContext(\Throwable $error): array
+    {
+        return $this->failureContexts[$error] ?? [];
     }
     /** Bounded overlapping pagination; full or non-progressing pages never become a complete history. */
     private function history(string $method, ?string $symbol, ?int $since, ?string $orderId = null): array
@@ -171,13 +247,27 @@ final class CcxtAccount
         $mode = $config['mode'] ?? 'time';
         $params = $config['params'] ?? [];
         $limit = $this->settings['history_limit'];
+        $bitsoTransfers = $this->rest instanceof BitsoReadClient && in_array($method, ['fetch_deposits', 'fetch_withdrawals'], true);
+        if ($bitsoTransfers) {
+            $this->requestContext = ['operation' => $method, 'phase' => 'history_configuration'];
+            $mode = $config['mode'] ?? 'backward_id';
+            if ($mode !== 'backward_id' || ($config['cursor_param'] ?? 'marker') !== 'marker' || array_key_exists('marker', $params)) {
+                throw new RuntimeException('Bitso transfer history requires unfiltered backward marker pagination.');
+            }
+            $limit = min(100, $limit);
+        }
         $result = [];
         $seen = [];
         $cursor = $since;
         for ($page = 0;$page < $this->settings['history_max_pages'];$page++) {
             $requestSince = $mode === 'time' ? $cursor : null;
-            $rows = $orderId === null ? await($this->rest->$method($symbol, $requestSince, $limit, $params))
-                : await($this->rest->$method($orderId, $symbol, $requestSince, $limit, $params));
+            $arguments = $orderId === null ? [$symbol, $requestSince, $limit, $params]
+                : [$orderId, $symbol, $requestSince, $limit, $params];
+            $rows = $this->read($method, $arguments, [
+                'symbol' => $symbol, 'page' => $page + 1, 'limit' => $limit,
+                'pagination_mode' => $mode, 'since_ms' => $requestSince,
+                'cursor_present' => isset($params[$config['cursor_param'] ?? 'marker']),
+            ]);
             if (!is_array($rows)) {
                 throw new RuntimeException('Invalid history page.');
             }
@@ -190,11 +280,14 @@ final class CcxtAccount
                 $timestamp = Normalize::timestamp($row);
                 $min = min($min, $timestamp);
                 $max = max($max, $timestamp);
-                if ($edge === null || ($mode === 'backward_id' ? [$timestamp,$id] < [$edge['timestamp'],$edge['id']] : [$timestamp,$id] > [$edge['timestamp'],$edge['id']])) {
+                if ($bitsoTransfers || $edge === null || ($mode === 'backward_id' ? [$timestamp,$id] < [$edge['timestamp'],$edge['id']] : [$timestamp,$id] > [$edge['timestamp'],$edge['id']])) {
                     $edge = ['id' => $id,'timestamp' => $timestamp];
                 }
+                if ($bitsoTransfers && isset($seen[$id]) && $seen[$id] !== $row) {
+                    throw new RuntimeException('Bitso transfer changed during pagination; repeat the account snapshot.');
+                }
                 if (!isset($seen[$id])) {
-                    $seen[$id] = true;
+                    $seen[$id] = $bitsoTransfers ? $row : true;
                     $new++;
                     if ($since === null || $timestamp >= $since) {
                         $result[] = $row;

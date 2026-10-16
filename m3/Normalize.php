@@ -109,10 +109,35 @@ final class Normalize
         if (bccomp($amount, '0', 24) <= 0) {
             throw new RuntimeException('Transfer amount must be positive.');
         }
-        return ['id' => $kind.':'.self::id($row['id'] ?? null),'kind' => $kind,'currency' => $currency,'amount' => $amount,
+        $operation = ['id' => $kind.':'.self::id($row['id'] ?? null),'kind' => $kind,'currency' => $currency,'amount' => $amount,
             'fees' => self::fees($row),'timestamp' => self::timestamp($row),
             'txid' => self::optional($row['txid'] ?? null),'address' => self::optional($row['address'] ?? null),
             'tag' => self::optional($row['tag'] ?? null),'network' => self::optional($row['network'] ?? null)];
+        if (isset($row['m3_fee_evidence'])) {
+            $evidence = $row['m3_fee_evidence'];
+            if (is_array($evidence) && ($evidence['source'] ?? null) === 'bitso_spei_contract') {
+                $operation['fee_evidence'] = BitsoSpei::normalizeEvidence($evidence, $operation);
+                return $operation;
+            }
+            if (is_array($evidence) && ($evidence['source'] ?? null) === 'bitso_transfer_contract') {
+                $operation['fee_evidence'] = BitsoInternalTransfer::normalizeEvidence($evidence, $operation);
+                return $operation;
+            }
+            if (!is_array($evidence) || ($evidence['source'] ?? null) !== 'bitso_lightning_invoice'
+                || !in_array($evidence['payment_hash_source'] ?? 'exchange', ['exchange', 'invoice'], true)
+                || isset($evidence['operator_confirmation'])
+                || $kind !== 'withdrawal' || $currency !== 'BTC' || $operation['fees'] !== []
+                || ($evidence['fee'] ?? null) !== '0' || ($evidence['amount'] ?? null) !== $amount
+                || !is_string($evidence['invoice_sha256'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $evidence['invoice_sha256'])
+                || !is_string($evidence['payment_hash'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $evidence['payment_hash'])
+                || $evidence['payment_hash'] !== strtolower($operation['txid'] ?? '') || $operation['network'] !== 'LIGHTNING') {
+                throw new RuntimeException('Invalid Lightning fee accounting evidence.');
+            }
+            $operation['fee_evidence'] = ['source' => $evidence['source'], 'invoice_sha256' => $evidence['invoice_sha256'],
+                'payment_hash' => $evidence['payment_hash'], 'amount' => $amount, 'fee' => '0',
+                'payment_hash_source' => $evidence['payment_hash_source'] ?? 'exchange'];
+        }
+        return $operation;
     }
     private static function optional(mixed $v): ?string
     {

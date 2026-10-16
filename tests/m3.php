@@ -23,7 +23,7 @@ try {
  $db=new Database($root.'/client.sqlite');$ledger=new Ledger($db);$account=$ledger->createAccount('fixture','M3',null,['USD'=>'1000']);$market=$ledger->registerMarket($account,'ATOM/USD','ATOM','USD');
  $db->pdo()->prepare("UPDATE markets SET state='ACTIVE' WHERE id=?")->execute([$market]);
  $s=Settings::validate(['accounts'=>[config($account)]]);$a=$s['accounts'][0];$r=new Reconciler($db);$math=new Accounting($db);
- check(Database::SCHEMA_VERSION===3&&$db->integrityCheck()['ok'],'schema 3 migration is valid');
+ check(Database::SCHEMA_VERSION===4&&$db->integrityCheck()['ok'],'schema 4 migration is valid');
  check(Numbers::decimal(1e-8)==='0.00000001','CCXT scientific notation converts once to decimal');
  refuses(fn()=>Normalize::balances(['total'=>['USD'=>'2'],'free'=>['USD'=>'1'],'used'=>['USD'=>'0']]),'inconsistent locked/free balances rejected');
  $t=1000000;$b1=fill('t1','b1','BUY','10','10',$t);$b2=fill('t2','b2','BUY','5','12',$t+1000);

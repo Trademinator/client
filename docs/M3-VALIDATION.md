@@ -46,3 +46,297 @@ model still fails closed for crypto used as another market's quote; that boundar
 is documented in the installation guide and requires a separate inventory-model
 extension. This patch does not claim all exchange/account combinations are ready
 for live trading.
+
+## Bitso historical-order update
+
+Incremental base: GitHub M3 `6b6f93b5593fbfd12cdad922b3e8773bb34637e0`
+plus the delivered sync-diagnostics patch (authentication diagnostics may also be
+present). The update adds schema 4 and verified historical execution imports.
+
+Validation on Linux/PHP 8.3.6, with no exchange credentials or network requests:
+
+* 29 historical-order checks: full order trades, correct IDs/markets/sides,
+  unknown original terms, actual fee/cost preservation, duplicate replay,
+  120 fills for one order, H1 evidence, later authoritative details, uncertain
+  submissions, and rejection of incomplete/conflicting/open/recent evidence.
+* 12 schema checks: exact v3 rows/IDs/allocations preserved, verified pre-migration
+  backup, foreign-key validation/enforcement, atomic rollback under injected
+  failure, and no repeat migration on reopen.
+* Existing M3 accounting (38 checks, 10,000 events), runtime (26 checks including
+  authentication diagnostics), transport (8), and sync diagnostics (20) passed.
+* M1 ledger, hard points and simulation plus all M2 suites passed. M1 daemon
+  reports 14 passing checks and one explicit native-IPC environment skip.
+* PHP syntax, whitespace and incremental patch application verified.
+
+This fixes the historical-lookup assumption; it does not establish acceptance
+against a real Bitso account. Restart the local read-only run after applying.
+
+## Bitso transfer endpoints and empty-response update
+
+Incremental base: GitHub M3 `6b6f93b5593fbfd12cdad922b3e8773bb34637e0` plus
+the delivered authentication, synchronization diagnostics, historical-order and
+HTTP/progress patches. GitHub main was checked again before this update.
+
+The live ledger request returned HTTP 404. The Bitso read extension now uses the
+documented funding and withdrawal GET endpoints through CCXT. Vendor code and
+the dependency lock are unchanged. An empty-response guard fixes the reported
+CCXT string-offset warnings without hiding the HTTP failure.
+
+Validation on Linux/PHP 8.3.6:
+
+* 43 new checks exercise the real CCXT signing/implicit-GET/HTTP-parser path with
+  a fully replaced HTTP browser and synthetic credentials: 205 deposits over
+  three pages, actual page limits, equal timestamps, overlap, duplicate conflicts,
+  page-budget and repeated-page rejection, status handling, exact gross/net/fee
+  accounting, financial replay, transfer history independent of the trade cursor,
+  financial boundaries, forbidden filters, malformed responses and empty 404s.
+* All 213 M3 checks pass, including 10,000 accounting events (9.232 seconds,
+  81,788,928-byte peak memory in this run), runtime, transport, diagnostics,
+  historical orders and schema migration suites.
+* PHP lint and whitespace checks pass. The incremental patch applies to the
+  preceding delivered patches and reproduces the tested files exactly.
+
+These are offline validations. A successful reconciliation of the user's live
+Bitso account and the remaining read-only acceptance gates are still required.
+
+## Bitso individual withdrawal evidence and diagnostics
+
+Incremental base: GitHub M3 `6b6f93b5593fbfd12cdad922b3e8773bb34637e0` plus
+the previously delivered patches through `m3-bitso-transfers`. GitHub main was
+checked before this update. No vendor, dependency lock or database schema change
+is required.
+
+Completed list records without fee/net evidence now get one individual GET.
+The returned withdrawal must match the list's identity and financial fields.
+If both fields remain absent, the normal warning and status include its UTC
+creation time, currency and total debit for lookup in Bitso's console. A separate
+read-only tool checks the newest 100 withdrawals without scanning market trades
+or opening the local database. Missing fee evidence is never treated as zero.
+
+Validation on Linux/PHP 8.3.6, using synthetic credentials and offline transports:
+
+* All 243 M3 checks pass, including 10,000 accounting events (9.813 seconds,
+  81,788,928-byte peak memory).
+* The Bitso transfer suite now has 73 checks. Its 30 additional checks cover
+  individual reads, explicit zero fees, exact total/fee/net arithmetic, mismatched
+  identities and financial fields, malformed payloads, retained authentication
+  and HTTP error types, private-data exclusion, normal warning/status diagnostics,
+  and blocked runtime authorization while evidence is missing.
+* CLI help, required arguments and sanitized configuration failures pass without
+  network access. PHP lint, whitespace and incremental patch application pass.
+
+The individual endpoint may return the same incomplete fields as the list.
+These tests do not establish the fee of the user's live withdrawal; its console
+details are still needed if the new lookup cannot supply that evidence.
+
+## Bitso Lightning invoice evidence
+
+Incremental base: GitHub M3 `6b6f93b5593fbfd12cdad922b3e8773bb34637e0` plus
+all previous delivered patches through `m3-withdrawal-details`. GitHub main was
+checked again before this change. No dependency or schema migration is added.
+
+The reported console entry says no fee. Its BOLT11 invoice was verified locally
+with Python cryptography and with the new PHP parser: checksum and signature
+valid, payment hash matching the supplied Bitso transaction, and invoice amount
+exactly equal to the total debit. That establishes zero additional expense
+charged to this balance; no network expense paid by another party is invented.
+
+The adapter recognizes this evidence when an authenticated completed withdrawal
+contains the invoice. It records zero fee only for an exact amount/hash match,
+keeps the invoice digest for audit and removes invoice values from addresses.
+The check tool exposes recognized zero-fee records without printing invoices.
+
+Offline validation on Linux/PHP 8.3.6:
+
+* All 278 M3 checks pass, including 10,000 accounting events (9.538 seconds,
+  81,788,928-byte peak memory).
+* The 108-check Bitso suite includes 35 new checks for independent signed
+  synthetic fixtures, exact amount units, checksum/signature/identity validation,
+  malformed and unsupported invoice rejection, list/detail reads, no fee inferred
+  from network labels, correct wallet debit, replay and durable audit evidence.
+* PHP lint, whitespace and application of the incremental patch pass.
+* The user's actual invoice is absent from source, fixtures and the patch.
+
+The fallback requires a mainnet BOLT11 amount and an explicit payee key. It does
+not recover omitted payee keys, infer fees from current schedules, or access the
+Bitso console. If the API omits the invoice as well as fee/net fields, it still
+needs additional evidence; live reconciliation has not been verified here.
+
+## Bitso Lightning hash lookup and diagnostics
+
+Incremental base: the preceding `m3-bitso-lightning` patch, on GitHub M3
+`6b6f93b5593fbfd12cdad922b3e8773bb34637e0` and the earlier delivered fixes.
+The old message treated missing, malformed and conflicting hashes alike and
+stopped before an individual lookup when an invoice was already present.
+
+Missing hashes now permit one lookup by withdrawal ID. Verified list/detail
+identity permits combining the list's invoice with the lookup's hash (or the
+reverse). Explicit root/details `tx_hash` and `payment_hash` values must all
+agree with the signed invoice. Invalid formats, conflicting hashes and
+conflicting invoices remain blocked. Diagnostics identify fixed field paths,
+states and hashed references without exposing private response values.
+
+Offline validation on Linux/PHP 8.3.6:
+
+* All 299 M3 checks pass, including 10,000 financial events (9.996 seconds,
+  81,788,928-byte peak memory).
+* The 129-check Bitso suite adds 21 checks covering missing/empty list hashes,
+  split list/detail evidence, explicit hash fields, precise missing/invalid/
+  mismatch diagnostics, privacy, conflicting fields/invoices, identity checks,
+  retained HTTP errors, blocked authorization and unchanged financial state.
+* Wallet reconciliation, replay and retained invoice audit evidence also pass
+  using the new missing-hash lookup path.
+* PHP lint, whitespace and incremental patch application pass.
+
+No schema or dependency changes and no live exchange requests were made.
+The supplied log does not establish which hash condition the live API returned;
+the read-only checker now distinguishes those conditions. A genuine conflict
+or evidence still missing after lookup continues to block reconciliation.
+
+## Bitso console-confirmed Lightning payment hash
+
+Incremental base: the preceding `m3-bitso-lightning-hash` patch. GitHub main
+was checked again and remains M3 `6b6f93b5593fbfd12cdad922b3e8773bb34637e0`.
+
+The read-only diagnostic confirms that both list and individual API responses
+contain the invoice but omit the payment hash. Its invoice hash reference agrees
+with the hash supplied from Bitso's console. An optional account-level
+`bitso_lightning_payment_hashes` map now records that operator confirmation for
+one withdrawal reference. No user-specific confirmation is hard-coded in source.
+
+The confirmed hash must match the signed invoice. Zero fee still requires an
+authenticated completed BTC withdrawal, a matching individual lookup and exact
+equality of invoice amount and balance debit. It cannot override malformed or
+conflicting API evidence. Normalized accounting records distinguish operator
+confirmation from exchange-supplied hashes and enforce the account binding.
+
+Offline validation on Linux/PHP 8.3.6:
+
+* All seven M3 suites pass: 336 checks in total. The final Bitso suite has 166
+  checks, including 37 new checks for configuration validation, operator
+  provenance, lookup requirements, privacy, account and withdrawal scoping,
+  rejected configuration replacement, conflicting evidence, exact amounts,
+  invoice signatures, pending transfers, authoritative API fees and audit data.
+* The financial suite processes 10,000 events in 9.647 seconds with an
+  81,788,928-byte peak. Operator-confirmed withdrawals reconcile and replay
+  without duplicating debits; cross-account ingestion rolls back.
+* Later API enrichment preserves the original operator audit record. PHP lint,
+  whitespace and incremental patch application pass.
+
+There are no schema or dependency changes, live exchange requests or submitted
+orders. The operator must add the account-specific config entry and restart the
+daemon. The checker reports accepted records as `operator_bitso_lightning_invoice`;
+checking the first page alone does not establish full account reconciliation.
+
+## Generic Bitso withdrawal evidence
+
+Incremental base: the preceding `m3-bitso-console-hash` patch. GitHub main was
+checked again and remains M3 `6b6f93b5593fbfd12cdad922b3e8773bb34637e0`.
+This change supersedes the account configuration workaround described above.
+
+An authenticated completed withdrawal already associates its ID with its attached
+invoice. If Bitso omits a separate payment hash, one matching individual lookup
+confirms the record, and its verified signed invoice supplies the hash. Exact
+amount equality and rejection of supplied conflicting hashes remain mandatory.
+No per-withdrawal configuration is needed. The obsolete config key is discarded;
+existing operator audit metadata remains historical evidence.
+
+The reported MXN failure revealed another response format: Bitso's documented
+SPEI service omits fee/net fields and defines its three protocols as fee-free.
+The adapter recognizes only the documented MXN/praxis/SPEI classification,
+checks matching individual withdrawal data and records its method-rule basis
+explicitly. Explicit API fee/net amounts take precedence. This is a documented
+method interpretation, including historical records, not verification of an
+individual historical bank receipt. Unrecognized methods remain blocked and
+now expose safe taxonomy and receipt-presence diagnostics.
+
+Offline validation on Linux/PHP 8.3.6:
+
+* All seven M3 suites pass: 353 checks, including 183 Bitso transfer checks.
+* The financial suite processes 10,000 events in 9.602 seconds with an
+  81,788,928-byte peak. Network requests and submitted orders remain zero.
+* Generic invoice coverage includes unrelated accounts, IDs and amounts,
+  invoices present only in one response, omitted hashes, supplied hash conflicts,
+  exact amounts, signatures, obsolete-config removal and audit preservation.
+* SPEI coverage includes all three documented protocols, explicit nonzero fees,
+  missing/unknown/conflicting classifications, lookup identity mismatches,
+  pending transactions, privacy, exact balance reconciliation and duplicate
+  replay. Audit metadata distinguishes the method rule from an API-reported fee.
+* PHP lint, whitespace validation and incremental patch application pass.
+
+No schema or dependency changes were made. Live Bitso credentials were not used.
+The user's MXN log does not include its taxonomy, so live applicability to that
+particular withdrawal is not yet established. Re-run the read-only checker and
+full reconciliation after restarting the daemon; passing the first page does
+not establish completion of M3's remaining acceptance gates.
+
+## Bitso withdrawal taxonomy diagnostics
+
+Incremental base: `m3-bitso-generic-withdrawals`. GitHub main was checked again
+and remains `6b6f93b5593fbfd12cdad922b3e8773bb34637e0`.
+
+The live MXN failure reported four `unrecognized` values from both endpoints.
+Those labels were produced by the diagnostic allowlist; they were not the
+actual codes returned by Bitso. The output therefore cannot identify the method
+or establish a fee. This patch displays bounded machine codes for the four
+taxonomy fields, independently of the accounting adapter's supported methods.
+It preserves credential redaction, excludes personal details and distinguishes
+missing, nonstring and redacted values. No fee or reconciliation rules change.
+
+Offline validation on Linux/PHP 8.3.6:
+
+* All 274 targeted checks pass: 191 Bitso transfer checks, 57 synchronization
+  diagnostic checks and 26 runtime checks.
+* Eight new checks cover unknown codes in both list and lookup diagnostics,
+  sanitized transport context, malformed values, URLs, identifiers, invoices,
+  all four configured credentials and individual-lookup network failures.
+* Unknown methods still block reconciliation. Existing invoice and SPEI
+  accounting tests pass without changing the accepted fee evidence.
+* PHP lint for changed PHP files, whitespace validation and incremental patch
+  application pass. No live exchange requests or orders were made.
+
+The actual method of the user's MXN withdrawal remains unknown. Re-running the
+read-only checker with this patch supplies the missing classification evidence;
+the earlier redacted output does not justify a new zero-fee assumption.
+
+## Bitso internal transfers
+
+Incremental base: `m3-bitso-taxonomy-diagnostics`. GitHub main was checked again
+and remains `6b6f93b5593fbfd12cdad922b3e8773bb34637e0`.
+
+The updated live diagnostic exposes `bt` for method, network, protocol and
+integration in both completed withdrawal responses. The adapter now interprets
+that exact tuple as internal Bitso Transfer, whose public service documentation
+describes transfers between Bitso users as fee-free for any supported currency:
+<https://bitso.com/products/transfer>. The API-code mapping is an interpretation
+of the observed format; the public page documents the service fee, not the enum.
+
+The rule requires a matching individual lookup, including withdrawal ID,
+currency, timestamp, completed status and exact total debit. Explicit fee or net
+amount fields take precedence. Missing, mixed or contradictory classification
+data still blocks reconciliation. The entire debit becomes principal and its
+zero-fee evidence records `bitso_transfer_bt_v1`, `exchange_documentation`, the
+currency, the four classification codes and the documentation URL. This records
+the method-rule basis, including for historical records; it does not represent
+an independently verified historical receipt. No customer IDs, withdrawal
+references, amounts, dates or hashes are hardcoded into the rule.
+
+Offline validation on Linux/PHP 8.3.6:
+
+* All seven M3 suites pass: 407 checks, including 237 Bitso transfer checks.
+* The 46 new checks cover unrelated accounts and currencies, exact amounts,
+  missing/mixed classifications, inconsistent list/lookup identity, pending and
+  failed transfers, explicit fee precedence, rejected audit evidence, privacy,
+  financial reconciliation, duplicate replay and later fee-evidence changes.
+* A synthetic internal withdrawal debits its principal once, without a fee
+  expense. Later explicit zero-fee evidence preserves the original audit trail;
+  a contradictory later fee rolls back without changing balances or revision.
+* The financial suite processes 10,000 events in 9.493 seconds with an
+  81,788,928-byte peak. Network requests and submitted orders remain zero.
+* PHP lint, whitespace validation and incremental patch application pass.
+
+No schema or dependency changes were made. Live credentials were not used. The
+read-only checker reports accepted records in
+`documented_bitso_transfer_zero_fees`. Live full-history reconciliation remains
+to be run after applying the patch and restarting the daemon; a successful
+first-page check does not complete M3's remaining acceptance gates.

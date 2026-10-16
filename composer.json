@@ -40,7 +40,11 @@
             "@php tests/m2.php",
             "@php tests/m3.php",
             "@php tests/m3-runtime.php",
-            "@php tests/m3-transport.php"
+            "@php tests/m3-transport.php",
+            "@php tests/m3-sync-diagnostics.php",
+            "@php tests/m3-historical-orders.php",
+            "@php tests/m3-schema4.php",
+            "@php tests/m3-bitso-transfers.php"
         ],
         "lint": "@php tools/lint.php",
         "doctor": "@php bin/client.php doctor",
@@ -51,7 +55,11 @@
         "test:m3": [
             "@php tests/m3.php",
             "@php tests/m3-runtime.php",
-            "@php tests/m3-transport.php"
+            "@php tests/m3-transport.php",
+            "@php tests/m3-sync-diagnostics.php",
+            "@php tests/m3-historical-orders.php",
+            "@php tests/m3-schema4.php",
+            "@php tests/m3-bitso-transfers.php"
         ]
     },
     "config": {

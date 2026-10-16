@@ -176,13 +176,23 @@ final class Ledger
             $market = $this->market((string) ($input['market_id'] ?? ''), $accountId);
             $exchangeId = (string) ($input['exchange_order_id'] ?? '');
             if ($exchangeId === '' || strlen($exchangeId) > 255) { throw new InvalidArgumentException('Exchange order ID required.'); }
-            $quantity = self::decimal($input['quantity'] ?? '', true);
+            $historyOnly = ($input['status'] ?? '') === 'history_only';
             $filled = self::decimal($input['filled_quantity'] ?? '0');
-            $remaining = self::decimal($input['remaining_quantity'] ?? bcsub($quantity, $filled, self::SCALE));
-            if (bccomp(bcadd($filled, $remaining, self::SCALE), $quantity, self::SCALE) !== 0) { throw new RuntimeException('Filled plus remaining must equal order quantity.'); }
+            if ($historyOnly) {
+                if (($input['quantity'] ?? null) !== null || ($input['remaining_quantity'] ?? null) !== null
+                    || ($input['order_type'] ?? '') !== 'UNKNOWN' || bccomp($filled, '0', self::SCALE) <= 0
+                    || ($input['metadata']['m3']['history_evidence']['source'] ?? '') !== 'bitso:fetch_order_trades') {
+                    throw new RuntimeException('Historical executions require verified fill evidence and unknown original order details.');
+                }
+                $quantity = $remaining = null;
+            } else {
+                $quantity = self::decimal($input['quantity'] ?? '', true);
+                $remaining = self::decimal($input['remaining_quantity'] ?? bcsub($quantity, $filled, self::SCALE));
+                if (bccomp(bcadd($filled, $remaining, self::SCALE), $quantity, self::SCALE) !== 0) { throw new RuntimeException('Filled plus remaining must equal order quantity.'); }
+            }
             $side = strtoupper((string) ($input['side'] ?? ''));
             $status = (string) ($input['status'] ?? (bccomp($filled, '0', self::SCALE) === 0 ? 'open' : (bccomp($remaining, '0', self::SCALE) === 0 ? 'filled' : 'partially_filled')));
-            if (!in_array($side, ['BUY','SELL'], true) || !in_array($status, ['open','partially_filled','filled','cancelled','rejected','expired'], true)) { throw new InvalidArgumentException('Invalid order side or status.'); }
+            if (!in_array($side, ['BUY','SELL'], true) || !in_array($status, ['open','partially_filled','filled','cancelled','rejected','expired','history_only'], true)) { throw new InvalidArgumentException('Invalid order side or status.'); }
             if (($status === 'filled' && bccomp($remaining, '0', self::SCALE) !== 0)
                 || ($status === 'partially_filled' && (bccomp($filled, '0', self::SCALE) === 0 || bccomp($remaining, '0', self::SCALE) === 0))
                 || ($status === 'open' && bccomp($filled, '0', self::SCALE) !== 0)) { throw new RuntimeException('Order status disagrees with its cumulative fill quantities.'); }
@@ -205,12 +215,13 @@ final class Ledger
                 'updated_at' => self::timestamp($input['updated_at'] ?? null), 'metadata_json' => self::json($input['metadata'] ?? new \stdClass())];
             $existing = $this->one('SELECT * FROM orders WHERE account_id=? AND exchange_order_id=?', [$accountId, $exchangeId]);
             if ($existing) {
-                foreach (['market_id','side','quantity','order_type'] as $field) {
+                $identityFields = $existing['status'] === 'history_only' && !$historyOnly ? ['market_id','side'] : ['market_id','side','quantity','order_type'];
+                foreach ($identityFields as $field) {
                     if ($existing[$field] !== $row[$field]) { throw new RuntimeException('An exchange order identity cannot change.'); }
                 }
                 if (bccomp($filled, $existing['filled_quantity'], self::SCALE) < 0) { throw new RuntimeException('Cumulative order fills cannot decrease.'); }
                 $same = true;
-                foreach (['status','filled_quantity','remaining_quantity','price','average_price','cost_amount','fee_amount','fee_currency','metadata_json'] as $field) { $same = $same && $existing[$field] === $row[$field]; }
+                foreach (['status','quantity','order_type','filled_quantity','remaining_quantity','price','average_price','cost_amount','fee_amount','fee_currency','metadata_json'] as $field) { $same = $same && $existing[$field] === $row[$field]; }
                 if ($same) { return $existing['id']; }
                 if (in_array($existing['status'], ['filled','cancelled','rejected','expired'], true) && in_array($status, ['open','partially_filled'], true)) { throw new RuntimeException('Closed order cannot reopen.'); }
                 $row['occurred_at'] = $existing['occurred_at'];

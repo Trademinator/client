@@ -34,6 +34,37 @@ $r->close();check($f->closed,'shutdown closes exchange transport');
 $missing=new Runtime($db,$s,fn($e,$settings,$a)=>throw new ccxt\AuthenticationError('missing-secret'));
 check($missing->status()['accounts'][$id]['state']==='AUTH_BLOCKED','unavailable local credentials block the account without killing the daemon');
 $missing->tick($now);check(!$missing->ready($m)['ready'],'missing credential account cannot become ready');$missing->close();
+// Diagnostics use trusted categories, never raw exchange text or credential values.
+check($r->status()['accounts'][$id]['auth_error']['reason']==='authentication_rejected', 'exchange rejection has an explicit reason');
+check($r->status()['accounts'][$id]['auth_error']['stage']==='rest_snapshot', 'REST rejection identifies its stage');
+foreach ([new ccxt\PermissionDenied('SECRET_RESPONSE'),new ccxt\AccountSuspended('SECRET_RESPONSE')] as $index=>$error) {
+ $blocked=new Runtime($db,$s,fn()=>throw $error);
+ $diagnostic=$blocked->status()['accounts'][$id]['auth_error'];
+ check($diagnostic['reason']===['permission_denied','account_suspended'][$index], 'exchange exception category is preserved');
+ check(!str_contains(json_encode($diagnostic),'SECRET_RESPONSE'),'raw exchange response is excluded');
+ $blocked->close();
+}
+$credentialFile=tempnam(sys_get_temp_dir(),'tm-auth-');
+try {
+ file_put_contents($credentialFile,"PRIVATE_FIXTURE_KEY\n");chmod($credentialFile,0600);
+ $local=$a;unset($local['api_key_env']);$local['api_key_file']=$credentialFile;
+ $local['secret_env']='TRADEMINATOR_M3_ABSENT_AUTH_TEST';putenv($local['secret_env']);
+ $localSettings=Settings::validate(['accounts'=>[$local]]);$localEvents=[];
+ $blocked=new Runtime($db,$localSettings,function($exchange,$settings,$account){Settings::credentials($account);throw new RuntimeException('Unexpected success');},function($l,$e,$c,$m)use(&$localEvents){$localEvents[]=[$c,$m];});
+ $diagnostic=$blocked->status()['accounts'][$id]['auth_error'];
+ check($diagnostic['credential_field']==='secret'&&$diagnostic['config_field']==='secret_env'&&$diagnostic['stage']==='initialization','missing secret identifies exact configuration field and stage');
+ check(!str_contains(json_encode([$localEvents,$blocked->status()]),'PRIVATE_FIXTURE_KEY'),'local credential values never enter diagnostics');$blocked->close();
+ if(PHP_OS_FAMILY!=='Windows') {
+  chmod($credentialFile,0644);
+  try {Settings::credentials($local);throw new RuntimeException('Expected private-mode rejection');} catch(Trademinator\Client\M3\CredentialError $error) {
+   check($error->diagnostic['reason']==='credential_file_permissions'&&$error->diagnostic['config_field']==='api_key_file','unsafe file permissions identify key field and chmod remedy');
+  }
+ }
+ unlink($credentialFile);
+ try {Settings::credentials($local);throw new RuntimeException('Expected missing-file rejection');} catch(Trademinator\Client\M3\CredentialError $error) {
+  check($error->diagnostic['reason']==='credential_file_unreadable','missing file has an explicit local reason');
+ }
+} finally {if(is_file($credentialFile)){unlink($credentialFile);}}
 // No execution capabilities exist on the adapter offered to M3.
 foreach(['create_order','cancel_order','withdraw','transfer'] as $method){check(!method_exists(CcxtAccount::class,$method),'M3 has no '.$method.' capability');}
 echo json_encode(['suite'=>'m3-runtime','status'=>'passed','checks'=>$checks,'network_requests'=>0],JSON_PRETTY_PRINT)."\n";

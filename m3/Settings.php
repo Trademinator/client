@@ -39,13 +39,16 @@ final class Settings
         }
         $ids = [];
         foreach ($s['accounts'] as &$a) {
-            if (!is_array($a) || array_diff(array_keys($a), ['account_id','api_key_env','secret_env','password_env','uid_env','api_key_file','secret_file','password_file','uid_file','history_since_ms','valuation_quote','currency_markets','public_price_exchanges','coingecko_ids','coingecko_api_key_env','history_params'])) {
+            if (!is_array($a) || array_diff(array_keys($a), ['account_id','api_key_env','secret_env','password_env','uid_env','api_key_file','secret_file','password_file','uid_file','history_since_ms','valuation_quote','currency_markets','public_price_exchanges','coingecko_ids','coingecko_api_key_env','history_params','bitso_lightning_payment_hashes'])) {
                 throw new InvalidArgumentException('Invalid exchange account configuration.');
             }
             if (!is_string($a['account_id'] ?? null) || !preg_match('/^[A-Za-z0-9_-]{1,128}$/D', $a['account_id']) || isset($ids[$a['account_id']])) {
                 throw new InvalidArgumentException('Unique local account_id required.');
             }
             $ids[$a['account_id']] = true;
+            // Compatibility for the superseded workaround. It has no effect on
+            // reconciliation and is not forwarded to an exchange adapter.
+            unset($a['bitso_lightning_payment_hashes']);
             foreach (['api_key','secret','password','uid'] as $key) {
                 foreach (['env','file'] as $kind) {
                     $field = $key.'_'.$kind;
@@ -109,7 +112,28 @@ final class Settings
             if (!isset($account[$field.'_env']) && !isset($account[$field.'_file'])) {
                 continue;
             }
-            $result[$ccxt] = Credentials::read($account[$field.'_env'] ?? '', $account[$field.'_file'] ?? null);
+            try {
+                $result[$ccxt] = Credentials::read($account[$field.'_env'] ?? '', $account[$field.'_file'] ?? null);
+            } catch (\RuntimeException $error) {
+                $file = isset($account[$field.'_file']);
+                $reason = match ($error->getMessage()) {
+                    'API key file must be a readable regular file.' => 'credential_file_unreadable',
+                    'API key file is too large.' => 'credential_file_too_large',
+                    'API key file must be private to its owner (chmod 600).' => 'credential_file_permissions',
+                    'Cannot read API key file.' => 'credential_file_read_failed',
+                    default => 'credential_empty_or_invalid',
+                };
+                $detail = match ($reason) {
+                    'credential_file_unreadable' => 'Credential file is missing, unreadable, not a regular file, or a symbolic link.',
+                    'credential_file_too_large' => 'Credential file exceeds 4096 bytes.',
+                    'credential_file_permissions' => 'Credential file allows group or other access. Set mode 0600.',
+                    'credential_file_read_failed' => 'Credential file could not be read by the Client process.',
+                    default => $file ? 'Credential file is empty or contains invalid characters; use only the credential value.' : 'Credential environment variable is unset, empty, or contains invalid characters in the Client process.',
+                };
+                throw new CredentialError(['reason' => $reason, 'credential_field' => $field,
+                    'config_field' => $field.($file ? '_file' : '_env'),
+                    'source_type' => $file ? 'file' : 'environment', 'detail' => $detail]);
+            }
             EventRecord::hideSecret($result[$ccxt]);
         }
         return $result;
