@@ -1,0 +1,31 @@
+{
+    "tick_ms": 100,
+    "log_level": "info",
+    "server_url": "https://server.trademinator.com",
+    "server_api_key_env": "TRADEMINATOR_API_KEY",
+    "checks_per_candle": 3,
+    "exchange": {
+        "sync_interval_ms": 60000,
+        "timeout_ms": 15000,
+        "history_limit": 100,
+        "history_max_pages": 1000,
+        "accounts": [
+            {
+                "account_id": "REPLACE_WITH_LOCAL_ACCOUNT_UUID",
+                "api_key_env": "BITSO_API_KEY",
+                "secret_env": "BITSO_API_SECRET",
+                "history_since_ms": 0,
+                "valuation_quote": "USD",
+                "currency_markets": { "ATOM": "ATOM/USD" },
+                "public_price_exchanges": ["kraken"],
+                "coingecko_ids": { "ATOM": "cosmos" },
+                "history_params": {
+                    "fetch_my_trades": { "mode": "backward_id", "cursor_param": "marker", "params": { "sort": "desc" } },
+                    "fetch_open_orders": { "mode": "backward_id", "cursor_param": "marker", "params": { "sort": "desc" } },
+                    "fetch_order_trades": { "mode": "all" },
+                    "fetch_ledger": { "mode": "backward_id", "cursor_param": "marker", "params": { "sort": "desc" } }
+                }
+            }
+        ]
+    }
+}

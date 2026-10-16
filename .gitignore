@@ -12,3 +12,5 @@
 /config.m1.local.json
 /config.m2.local.json
 /*.key
+
+/config.m3.local.json

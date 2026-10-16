@@ -101,7 +101,7 @@ try {
     }
 
     $result = cli(['version']);
-    check($result['code'] === 0 && $result['err'] === '' && jsonDocument($result['out']) === ['milestone' => 'M2', 'version' => '2.1.0-rc1'], 'Version remains a plain JSON command with the new release number.');
+    check($result['code'] === 0 && $result['err'] === '' && jsonDocument($result['out']) === ['milestone' => 'M3', 'version' => '3.0.0-rc1'], 'Version remains a plain JSON command with the new release number.');
     $result = cli(['doctor']);
     $doctor = jsonDocument($result['out']);
     check($result['code'] === 0 && $result['err'] === '' && $doctor['status'] === 'ready', 'Doctor reports this fully provisioned test environment ready.');

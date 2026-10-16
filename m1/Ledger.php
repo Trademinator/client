@@ -191,7 +191,7 @@ final class Ledger
             $fee = self::decimal($input['fee_amount'] ?? '0');
             $feeCurrency = isset($input['fee_currency']) ? self::currency((string) $input['fee_currency']) : null;
             if (bccomp($fee, '0', self::SCALE) > 0 && $feeCurrency === null) { throw new InvalidArgumentException('A fee currency is required for nonzero fees.'); }
-            if (bccomp($fee, '0', self::SCALE) > 0 && !in_array($feeCurrency, [$market['base_currency'], $market['quote_currency']], true)) { throw new RuntimeException('M1 supports order fees only in the market base or quote currency; third-currency inventory attribution is not implemented.'); }
+            if (empty($input['metadata']['m3']) && bccomp($fee, '0', self::SCALE) > 0 && !in_array($feeCurrency, [$market['base_currency'], $market['quote_currency']], true)) { throw new RuntimeException('M1 supports order fees only in the market base or quote currency; third-currency inventory attribution is not implemented.'); }
             if ($side === 'BUY' && $feeCurrency === $market['base_currency'] && bccomp($fee, $filled, self::SCALE) > 0) { throw new RuntimeException('Base fee exceeds purchased quantity.'); }
             $cost = self::decimal($input['cost_amount'] ?? bcmul($filled, $average, self::SCALE));
             if ((bccomp($filled, '0', self::SCALE) === 0) !== (bccomp($cost, '0', self::SCALE) === 0)) { throw new RuntimeException('Order cumulative cost must be zero exactly when its filled quantity is zero.'); }
@@ -261,7 +261,7 @@ final class Ledger
             $feeCurrency = isset($input['fee_currency']) ? self::currency((string) $input['fee_currency']) : null;
             if (bccomp($fee, '0', self::SCALE) > 0 && $feeCurrency === null) { throw new InvalidArgumentException('Nonzero operation fee needs a currency.'); }
             $allowedFeeCurrencies = $market === null ? [$currency] : [$currency, $market['quote_currency']];
-            if (bccomp($fee, '0', self::SCALE) > 0 && !in_array($feeCurrency, $allowedFeeCurrencies, true)) { throw new RuntimeException('M1 cannot attribute a transfer fee in an unrelated inventory currency.'); }
+            if (empty($input['metadata']['m3']) && bccomp($fee, '0', self::SCALE) > 0 && !in_array($feeCurrency, $allowedFeeCurrencies, true)) { throw new RuntimeException('M1 cannot attribute a transfer fee in an unrelated inventory currency.'); }
             if ($kind === 'deposit' && $feeCurrency === $currency && bccomp($fee, $amount, self::SCALE) >= 0) { throw new RuntimeException('Deposit fee must be smaller than its amount.'); }
             $row = ['account_id' => $accountId, 'market_id' => $marketId, 'exchange_operation_id' => $exchangeId,
                 'kind' => $kind, 'currency' => $currency, 'amount' => $amount, 'price_basis' => $basis,
@@ -275,9 +275,9 @@ final class Ledger
                 return $existing['id'];
             }
             $consumptions = [];
-            if ($market && $kind === 'withdrawal') {
+            if ($market && $kind === 'withdrawal' && empty($input['metadata']['m3'])) {
                 $left = bcadd($amount, $feeCurrency === $currency ? $fee : '0', self::SCALE);
-                foreach ($this->marketLots($marketId) as $lot) {
+                foreach (array_reverse($this->marketLots($marketId)) as $lot) {
                     if ($lot['acquired_at'] > $row['occurred_at']) { continue; }
                     $take = bccomp($lot['quantity'], $left, self::SCALE) <= 0 ? $lot['quantity'] : $left;
                     if (bccomp($take, '0', self::SCALE) > 0) { $consumptions[$lot['source_key']] = self::trimDecimal($take); $left = bcsub($left, $take, self::SCALE); }
@@ -302,7 +302,7 @@ final class Ledger
             $row = ['account_id' => $accountId, 'market_id' => $market['id'], 'allocation_key' => $key,
                 'buy_order_id' => $input['buy_order_id'] ?? null, 'buy_operation_id' => $input['buy_operation_id'] ?? null,
                 'baseline_lot_id' => $input['baseline_lot_id'] ?? null, 'sell_order_id' => (string) ($input['sell_order_id'] ?? ''),
-                'quantity' => self::decimal($input['quantity'] ?? '', true)];
+                'quantity' => self::decimal($input['quantity'] ?? '', true), 'buy_lot_key' => $input['buy_lot_key'] ?? null];
             if (count(array_filter([$row['buy_order_id'], $row['buy_operation_id'], $row['baseline_lot_id']], static fn ($v) => $v !== null)) !== 1) { throw new InvalidArgumentException('Exactly one BUY-equivalent source is required.'); }
             if ($existing = $this->one('SELECT * FROM buys_vs_sells WHERE account_id=? AND allocation_key=?', [$accountId, $key])) {
                 foreach ($row as $field => $value) { if ($existing[$field] !== $value) { throw new RuntimeException('Conflicting replay of an allocation.'); } }
@@ -310,13 +310,15 @@ final class Ledger
             }
             $sell = $this->one('SELECT * FROM orders WHERE id=? AND account_id=? AND market_id=? AND side=\'SELL\'', [$row['sell_order_id'], $accountId, $market['id']]) ?? throw new RuntimeException('Allocation requires a SELL in the same market/account.');
             $sourceKey = $row['buy_order_id'] !== null ? 'order:' . $row['buy_order_id'] : ($row['buy_operation_id'] !== null ? 'operation:' . $row['buy_operation_id'] : 'baseline:' . $row['baseline_lot_id']);
+            if ($row['buy_lot_key'] !== null && $row['buy_lot_key'] !== $sourceKey && !str_starts_with($row['buy_lot_key'], $sourceKey.':')) { throw new RuntimeException('Lot fragment does not belong to the selected acquisition.'); }
+            $sourceKey = $row['buy_lot_key'] ?? $sourceKey;
             $source = null;
             foreach ($this->marketLots($market['id']) as $lot) { if ($lot['source_key'] === $sourceKey) { $source = $lot; break; } }
             if ($source === null || bccomp($row['quantity'], $source['quantity'], self::SCALE) > 0) { throw new RuntimeException('Allocation exceeds remaining BUY-equivalent inventory.'); }
-            if ($source['acquired_at'] > $sell['occurred_at']) { throw new RuntimeException('A SELL cannot consume a later acquisition.'); }
+            if (($source['available_at'] ?? $source['acquired_at']) > $sell['occurred_at']) { throw new RuntimeException('A SELL cannot consume a later acquisition.'); }
             $allocated = '0';
             foreach ($this->rows('SELECT quantity FROM buys_vs_sells WHERE sell_order_id=?', [$sell['id']]) as $allocation) { $allocated = bcadd($allocated, $allocation['quantity'], self::SCALE); }
-            $sellOutflow = bcadd($sell['filled_quantity'], $sell['fee_currency'] === $market['base_currency'] ? $sell['fee_amount'] : '0', self::SCALE);
+            $sellOutflow = bcadd($sell['filled_quantity'], \Trademinator\Client\M3\Lots::fee($sell, $market['base_currency']), self::SCALE);
             if (bccomp(bcadd($allocated, $row['quantity'], self::SCALE), $sellOutflow, self::SCALE) > 0) { throw new RuntimeException('Allocation exceeds actual SELL fills including base fees.'); }
             $id = self::uuid();
             $this->insert('buys_vs_sells', ['id' => $id] + $row + ['created_at' => self::timestamp($input['created_at'] ?? null)]);
@@ -348,11 +350,11 @@ final class Ledger
             $buy = $order['side'] === 'BUY';
             $add($order['base_currency'], ($buy ? '' : '-') . $order['filled_quantity']);
             $add($order['quote_currency'], ($buy ? '-' : '') . $order['cost_amount']);
-            if ($order['fee_currency'] !== null) { $add($order['fee_currency'], '-' . $order['fee_amount']); }
+            foreach (\Trademinator\Client\M3\Lots::fees($order) as $fee) { $add($fee['currency'], '-' . $fee['cost']); }
         }
         foreach ($this->rows('SELECT * FROM operations WHERE account_id=?', [$accountId]) as $operation) {
             $add($operation['currency'], ($operation['kind'] === 'deposit' ? '' : '-') . $operation['amount']);
-            if ($operation['fee_currency'] !== null) { $add($operation['fee_currency'], '-' . $operation['fee_amount']); }
+            foreach (\Trademinator\Client\M3\Lots::fees($operation) as $fee) { $add($fee['currency'], '-' . $fee['cost']); }
         }
         $balances = array_filter($balances, static fn ($amount) => bccomp($amount, '0', self::SCALE) !== 0);
         ksort($balances);
@@ -386,6 +388,8 @@ final class Ledger
             $lots[$lot['source_key']] = $lot;
         }
         foreach ($this->rows('SELECT * FROM orders WHERE market_id=? AND side=\'BUY\' ORDER BY occurred_at,id', [$marketId]) as $order) {
+            $fragments = \Trademinator\Client\M3\Lots::acquisition($order, $market);
+            if ($fragments !== null) { foreach ($fragments as $fragment) { $lots[$fragment['source_key']] = $fragment; } continue; }
             $quantity = bcsub($order['filled_quantity'], $order['fee_currency'] === $market['base_currency'] ? $order['fee_amount'] : '0', self::SCALE);
             if (bccomp($quantity, '0', self::SCALE) <= 0) { continue; }
             $cost = bcadd($order['cost_amount'], $order['fee_currency'] === $market['quote_currency'] ? $order['fee_amount'] : '0', self::SCALE);
@@ -395,6 +399,8 @@ final class Ledger
                 'origin' => ['kind' => 'order', 'exchange_order_id' => $order['exchange_order_id'], 'order_id' => $order['id']], 'acquired_at' => $order['occurred_at']];
         }
         foreach ($this->rows('SELECT * FROM operations WHERE market_id=? AND kind=\'deposit\' ORDER BY occurred_at,id', [$marketId]) as $operation) {
+            $fragments = \Trademinator\Client\M3\Lots::acquisition($operation, $market);
+            if ($fragments !== null) { foreach ($fragments as $fragment) { $lots[$fragment['source_key']] = $fragment; } continue; }
             $quantity = bcsub($operation['amount'], $operation['fee_currency'] === $market['base_currency'] ? $operation['fee_amount'] : '0', self::SCALE);
             $lots['operation:' . $operation['id']] = ['id' => $operation['id'], 'source_key' => 'operation:' . $operation['id'], 'source_type' => 'operation',
                 'quantity' => self::trimDecimal($quantity), 'unit_cost' => $operation['price_basis'],
@@ -412,10 +418,16 @@ final class Ledger
         };
         foreach ($this->rows('SELECT * FROM buys_vs_sells WHERE market_id=?', [$marketId]) as $allocation) {
             $key = $allocation['buy_order_id'] !== null ? 'order:' . $allocation['buy_order_id'] : ($allocation['buy_operation_id'] !== null ? 'operation:' . $allocation['buy_operation_id'] : 'baseline:' . $allocation['baseline_lot_id']);
-            $consume($key, $allocation['quantity']);
+            $consume($allocation['buy_lot_key'] ?? $key, $allocation['quantity']);
         }
         foreach ($this->rows('SELECT lot_consumptions_json FROM operations WHERE market_id=? AND kind=\'withdrawal\'', [$marketId]) as $withdrawal) {
             foreach (self::decode($withdrawal['lot_consumptions_json']) as $key => $quantity) { $consume($key, $quantity); }
+        }
+        // Third-currency fees are expenses and consume that currency's inventory separately.
+        foreach (['orders','operations'] as $table) {
+            foreach ($this->rows('SELECT metadata_json FROM '.$table.' WHERE account_id=?', [$market['account_id']]) as $row) {
+                foreach ((self::decode($row['metadata_json'])['m3']['inventory_debits'][$marketId] ?? []) as $key => $quantity) { $consume($key, $quantity); }
+            }
         }
         $lots = array_values(array_filter($lots, static fn ($lot) => bccomp($lot['quantity'], '0', self::SCALE) > 0));
         usort($lots, static fn ($a, $b) => [$a['acquired_at'], $a['source_key']] <=> [$b['acquired_at'], $b['source_key']]);
@@ -441,7 +453,7 @@ final class Ledger
         foreach ($lots as $lot) { $holdings = bcadd($holdings, $lot['quantity'], self::SCALE); $known = $known && $lot['unit_cost'] !== null; }
         $unmatched = '0';
         foreach ($this->rows('SELECT * FROM orders WHERE market_id=? AND side=\'SELL\'', [$marketId]) as $sell) {
-            $remaining = bcadd($sell['filled_quantity'], $sell['fee_currency'] === $market['base_currency'] ? $sell['fee_amount'] : '0', self::SCALE);
+            $remaining = bcadd($sell['filled_quantity'], \Trademinator\Client\M3\Lots::fee($sell, $market['base_currency']), self::SCALE);
             foreach ($this->rows('SELECT quantity FROM buys_vs_sells WHERE sell_order_id=?', [$sell['id']]) as $allocation) { $remaining = bcsub($remaining, $allocation['quantity'], self::SCALE); }
             if (bccomp($remaining, '0', self::SCALE) < 0) { throw new RuntimeException('SELL is overallocated.'); }
             $unmatched = bcadd($unmatched, $remaining, self::SCALE);

@@ -324,6 +324,11 @@ final class HardPoints
     private function ineligibleReasons(string $account, array $state): array
     {
         $reasons = [];
+        $m3 = $this->db->pdo()->prepare("SELECT COUNT(*) FROM orders WHERE account_id=? AND json_type(metadata_json,'$.m3') IS NOT NULL");
+        $m3->execute([$account]);
+        $operations = $this->db->pdo()->prepare("SELECT COUNT(*) FROM operations WHERE account_id=? AND json_type(metadata_json,'$.m3') IS NOT NULL");
+        $operations->execute([$account]);
+        if ((int)$m3->fetchColumn() > 0 || (int)$operations->fetchColumn() > 0 || ($this->active($account)['kind'] ?? '') === 'HardH0') { $reasons[] = 'm3_requires_candidate_h_and_full_h1_verification'; }
         if ($this->active($account) === null) {
             $reasons[] = 'hard_t0_missing';
         }
@@ -376,6 +381,7 @@ final class HardPoints
         if ($committed) {
             $hard = $this->verify($account, (string) $pending['target_id']);
             $this->publishActive($account, $hard, $pending['activation_nonce']);
+            if (($hard['kind'] ?? '') === 'HardH0' && is_file($parent.'/h-candidate.json')) { unlink($parent.'/h-candidate.json'); }
             if (is_file($parent . '/candidate.json')) {
                 unlink($parent . '/candidate.json');
             }

@@ -11,7 +11,7 @@ use Throwable;
 /** SQLite is the durable authority; all financial writers serialize with BEGIN IMMEDIATE. */
 final class Database
 {
-    public const SCHEMA_VERSION = 2;
+    public const SCHEMA_VERSION = 3;
 
     private PDO $connection;
     private int $depth = 0;
@@ -60,14 +60,18 @@ final class Database
         if ($tables === []) { return 0; }
         if (!in_array('schema_migrations', $tables, true)) { throw new RuntimeException('This is not an M1 database. Use a new M1 data directory; M0 data is not migrated implicitly.'); }
         $version = (int) $connection->query('SELECT COALESCE(MAX(version),0) FROM schema_migrations')->fetchColumn();
-        if ($version > self::SCHEMA_VERSION) { throw new RuntimeException('Database schema is newer than this M2 release.'); }
+        if ($version > self::SCHEMA_VERSION) { throw new RuntimeException('Database schema is newer than this M3 release.'); }
         $expected = ['buys_vs_sells','checkpoints','exchange_accounts','markets','operations','orders','schema_migrations','signal_decisions'];
         if (($version >= 1 && $tables !== $expected) || ($version === 0 && $tables !== ['schema_migrations'])) { throw new RuntimeException('Unrecognized or incomplete client database schema.'); }
-        if ($version === 2) {
+        if ($version >= 2) {
             $columns = array_column($connection->query('PRAGMA table_info(markets)')->fetchAll(PDO::FETCH_ASSOC), 'name');
             if (array_diff(['state', 'subscription_id', 'checks_per_candle'], $columns) !== []) {
                 throw new RuntimeException('Incomplete M2 market schema.');
             }
+        }
+        if ($version >= 3) {
+            $columns = array_column($connection->query('PRAGMA table_info(buys_vs_sells)')->fetchAll(PDO::FETCH_ASSOC), 'name');
+            if (!in_array('buy_lot_key', $columns, true)) { throw new RuntimeException('Incomplete M3 lot schema.'); }
         }
         return $version;
     }
@@ -111,7 +115,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 SQL);
             $version = (int) $this->connection->query('SELECT COALESCE(MAX(version),0) FROM schema_migrations')->fetchColumn();
-            if ($version > self::SCHEMA_VERSION) { throw new RuntimeException('Database schema is newer than this M2 release.'); }
+            if ($version > self::SCHEMA_VERSION) { throw new RuntimeException('Database schema is newer than this M3 release.'); }
             if ($version === self::SCHEMA_VERSION) { return; }
             if ($version === 0) {
             $this->connection->exec(<<<'SQL'
@@ -188,6 +192,7 @@ SQL);
             $statement = $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(1,?)');
             $statement->execute([gmdate('c')]);
             }
+            if ($version < 2) {
             // Additive migration only: no financial table is rebuilt and no M1 value is rewritten.
             $this->connection->exec(<<<'SQL'
 ALTER TABLE markets ADD COLUMN state TEXT NOT NULL DEFAULT 'STOPPED' CHECK(state IN ('ACTIVE','STOPPING','STOPPED'));
@@ -196,6 +201,9 @@ ALTER TABLE markets ADD COLUMN checks_per_candle INTEGER CHECK(checks_per_candle
 SQL);
             $statement = $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(2,?)');
             $statement->execute([gmdate('c')]);
+            }
+            $this->connection->exec('ALTER TABLE buys_vs_sells ADD COLUMN buy_lot_key TEXT');
+            $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(3,?)')->execute([gmdate('c')]);
             if (!$this->integrityCheck()['ok']) { throw new RuntimeException('M2 migration failed database integrity checks.'); }
         });
     }

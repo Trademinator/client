@@ -87,7 +87,7 @@ final class Daemon
             $exitCode = 1;
             $this->lastError = EventRecord::safeText($error->getMessage());
             $this->state = 'failed';
-            if ($this->eventSink === null) { fwrite(STDERR, json_encode(['ok' => false, 'milestone' => 'M2', 'error' => $this->lastError], JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE).PHP_EOL); }
+            if ($this->eventSink === null) { fwrite(STDERR, json_encode(['ok' => false, 'milestone' => 'M3', 'error' => $this->lastError], JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE).PHP_EOL); }
             try { $this->log('error', 'daemon_failed', ['error_type' => get_class($error), 'message' => $error->getMessage()], 'Client stopped because an operation failed.'); } catch (Throwable) { /* Preserve the original storage failure. */ }
         } finally {
             $this->stopping = true;
@@ -157,7 +157,7 @@ final class Daemon
 
     public function status(): array
     {
-        return ['milestone' => 'M2', 'mode' => $this->config->serverUrl === '' ? 'local_core' : 'server_intelligence', 'trading_enabled' => false, 'state' => $this->state,
+        return ['milestone' => 'M3', 'mode' => $this->config->serverUrl === '' ? 'local_core' : 'server_intelligence', 'trading_enabled' => false, 'state' => $this->state,
             'pid' => getmypid(), 'run_id' => $this->runId, 'uptime_seconds' => $this->started > 0 ? round(hrtime(true) / 1e9 - $this->started, 3) : 0,
             'updated_at' => gmdate('Y-m-d\TH:i:s\Z'), 'data_dir' => $this->paths->dataDir,
             'ipc_transport' => PHP_OS_FAMILY === 'Windows' ? 'windows_named_pipe' : 'unix_socket',
@@ -171,7 +171,7 @@ final class Daemon
         $snapshot = $this->status();
         // Server catalog, timers, warnings and intelligence are process-local.
         // Live IPC status can show them; restart never reloads them from disk.
-        unset($snapshot['ledger']['server']);
+        unset($snapshot['ledger']['server'], $snapshot['ledger']['exchange']);
         Paths::atomicJson($this->paths->statusFile, $snapshot);
     }
 

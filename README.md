@@ -1,14 +1,17 @@
-# Trademinator Client — M2
+# Trademinator Client — M3
 
-M2 adds authenticated Server intelligence, explicit market selection and
-candle-aligned scheduling to the M1 core. It consumes final BUY/SELL opportunities
-and their supporting data; it does not execute or size orders. Exchange state
-integration remains M3 and local trading decisions remain later milestones.
+M3 adds read-only CCXT exchange connectivity, account reconciliation, manual
+activity accounting, deposit cost estimates, LIFO withdrawals and linked transfers.
+It preserves M2 authenticated Server intelligence and scheduling. Live execution
+and local trading decisions remain later milestones.
+
+Read [M3 installation, configuration and acceptance](docs/M3-INSTALL.md) before
+upgrading. The implementation and validation limits are listed there.
 
 Read [M2 installation and validation](docs/M2-INSTALL.md) before upgrading.
 Read [console events and installation](docs/M2-CONSOLE.md) for the coloured
 two-line event stream, `--verbose`, colour controls and JSON-lines TUI input.
-Run `composer install` before starting this version. M2 requires **64-bit PHP
+Run `composer install` before starting this version. M3 requires **64-bit PHP
 8.3+**, **PDO SQLite**, **BCMath**, **curl**, **OpenSSL**, **GMP** and **mbstring**.
 Use the existing Server GET endpoint at commit `164a329` or a compatible later revision.
 Its `market.signal` supplies freshness, expiry and model provenance. The optional
@@ -30,9 +33,7 @@ Scheduling is UTC-aligned and obeys a shared request budget.
 ## Preserved M1 core
 
 M1 supplies the per-user local daemon, SQLite accounting storage, native local
-control, backups, reconstruction points and deterministic simulation. It does
-not connect to a private exchange account or execute live orders. Those belong
-to later milestones. The original M1 installation and accounting guidance
+control, backups, reconstruction points and deterministic simulation. M3 adds private exchange reads; live orders remain disabled. The original M1 installation and accounting guidance
 below remains applicable to the local core.
 
 ## Start and test
@@ -119,9 +120,9 @@ php tools/soak.php 60
 ```
 
 M0's `native/main.php` and its build experiments still target M0. The separate
-`project-m1.yml` now embeds the M1 core and M2 sources and requires curl/OpenSSL.
+`project-m1.yml` now embeds the M1 core, M2 and M3 sources and requires curl/OpenSSL.
 It must be rebuilt and validated on each target toolchain; existing M0/M1
-executables do not acquire M2 merely by applying the source patch.
+executables do not acquire M3 merely by applying the source patch.
 
 The archive contains source, not your private configuration, local state,
 credentials, existing local test evidence or old locally compiled executables.

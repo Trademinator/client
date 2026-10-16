@@ -22,6 +22,7 @@ $raw = static fn(string $path): PDO => new PDO('sqlite:' . $path, null, null, [
     PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
 ]);
 $withoutM2 = static function (array $snapshot): array {
+    foreach ($snapshot['buys_vs_sells'] as &$allocation) { unset($allocation['buy_lot_key']); } unset($allocation);
     foreach ($snapshot['markets'] as &$market) { unset($market['state'], $market['subscription_id'], $market['checks_per_candle']); }
     unset($market);
     return $snapshot;
@@ -31,7 +32,8 @@ $downgradeFixture = static function (PDO $pdo): void {
     $pdo->exec('ALTER TABLE markets DROP COLUMN state');
     $pdo->exec('ALTER TABLE markets DROP COLUMN subscription_id');
     $pdo->exec('ALTER TABLE markets DROP COLUMN checks_per_candle');
-    $pdo->exec('DELETE FROM schema_migrations WHERE version=2');
+    $pdo->exec('ALTER TABLE buys_vs_sells DROP COLUMN buy_lot_key');
+    $pdo->exec('DELETE FROM schema_migrations WHERE version>=2');
 };
 
 $root = sys_get_temp_dir() . '/trademinator-m2-storage-' . bin2hex(random_bytes(8));
@@ -74,7 +76,7 @@ try {
 
     $db = new Database($root . '/client.sqlite');
     $ledger = new Ledger($db);
-    $assert(Database::schemaVersion($db->pdo()) === 2, 'M1 did not migrate to schema 2.');
+    $assert(Database::schemaVersion($db->pdo()) === Database::SCHEMA_VERSION, 'M1 did not migrate to current schema.');
     $assert($withoutM2($ledger->accountSnapshot($account)) === $before, 'Migration changed financial records, decimal amounts, or historical JSON.');
     $assert($db->pdo()->query('SELECT applied_at FROM schema_migrations WHERE version=1')->fetchColumn() === $m1AppliedAt, 'Migration rewrote M1 migration history.');
     $state = $db->pdo()->query('SELECT state,subscription_id,checks_per_candle FROM markets')->fetch();

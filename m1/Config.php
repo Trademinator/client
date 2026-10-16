@@ -23,13 +23,14 @@ final class Config
     public readonly int $serverCatalogIntervalMs;
     public readonly int $serverRiskIntervalMs;
     public readonly int $serverMinRequestIntervalMs;
+    public readonly array $exchange;
     private readonly ?string $dataDirOverride;
 
     public function __construct(array $values = [], ?string $baseDir = null, ?string $sourceFile = null, ?string $dataDirOverride = null)
     {
         $allowed = ['data_dir', 'tick_ms', 'log_max_bytes', 'log_keep', 'log_level',
             'server_url', 'server_api_key_env', 'server_api_key_file', 'checks_per_candle',
-            'server_timeout_ms', 'server_catalog_interval_ms', 'server_risk_interval_ms', 'server_min_request_interval_ms'];
+            'server_timeout_ms', 'server_catalog_interval_ms', 'server_risk_interval_ms', 'server_min_request_interval_ms', 'exchange'];
         $unknown = array_diff(array_keys($values), $allowed);
         if ($unknown !== []) { throw new InvalidArgumentException('Unknown configuration field(s): '.implode(', ', $unknown)); }
         $path = $dataDirOverride ?? (array_key_exists('data_dir', $values) ? $values['data_dir'] : Paths::defaultDataDir());
@@ -37,6 +38,8 @@ final class Config
         $this->dataDir = Paths::absolute($path, $baseDir);
         $this->sourceFile = $sourceFile;
         $this->dataDirOverride = $dataDirOverride;
+        if (isset($values['exchange']) && !is_array($values['exchange'])) { throw new InvalidArgumentException('exchange must be an object.'); }
+        $this->exchange = \Trademinator\Client\M3\Settings::validate($values['exchange'] ?? [], $baseDir);
         foreach ([
             'tick_ms' => ['tickMs', 250, 50, 10000],
             'log_max_bytes' => ['logMaxBytes', 5242880, 4096, 1073741824],
@@ -106,7 +109,7 @@ final class Config
             'server_api_key_file' => $this->serverApiKeyFile, 'checks_per_candle' => $this->checksPerCandle,
             'server_timeout_ms' => $this->serverTimeoutMs, 'server_catalog_interval_ms' => $this->serverCatalogIntervalMs,
             'server_risk_interval_ms' => $this->serverRiskIntervalMs,
-            'server_min_request_interval_ms' => $this->serverMinRequestIntervalMs];
+            'server_min_request_interval_ms' => $this->serverMinRequestIntervalMs, 'exchange' => $this->exchange];
     }
 
     /** This includes the secret: pass only to Runtime, never to logging or status. */

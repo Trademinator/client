@@ -20,13 +20,13 @@ final class Application
                     $options['verbose'] = true;
                     continue;
                 }
-                if (!preg_match('/^--(config|data-dir|seconds|account|approve|point|exchange|label|subscription|market|checks|offset|limit|output|color)=(.+)$/D', $arg, $m) || isset($options[$m[1]])) {
+                if (!preg_match('/^--(config|data-dir|seconds|account|approve|point|exchange|label|subscription|market|checks|offset|limit|output|color|operation|price|reason|withdrawal|deposit|currency)=(.+)$/D', $arg, $m) || isset($options[$m[1]])) {
                     throw new RuntimeException('Unknown or duplicate option. See help.');
                 }
                 $options[$m[1]] = $m[2];
             }
             if ($command === 'help') { $this->help(); return 0; }
-            if ($command === 'version') { self::output(['milestone'=>'M2','version'=>'2.1.0-rc1']); return 0; }
+            if ($command === 'version') { self::output(['milestone'=>'M3','version'=>'3.0.0-rc1']); return 0; }
             if ($command === 'doctor') { return $this->doctor(); }
             if ($command === 'run') {
                 $autoload = dirname(__DIR__).'/vendor/autoload.php';
@@ -47,8 +47,8 @@ final class Application
             if (in_array($command, ['status','stop','reload'], true)) {
                 self::output(Control::request($config, $command)); return 0;
             }
-            if (in_array($command, ['subscriptions','markets','market-activate','market-stop','market-checks','server-refresh','accounts','account-add'], true)) {
-                $arguments = array_intersect_key($options, array_flip(['account','subscription','market','exchange','label']));
+            if (in_array($command, ['subscriptions','markets','market-activate','market-stop','market-checks','server-refresh','accounts','account-add','exchange-status','exchange-refresh','exchange-adjust','deposit-basis','transfer-link','hard-h-propose','hard-h-promote'], true)) {
+                $arguments = array_intersect_key($options, array_flip(['account','subscription','market','exchange','label','operation','price','reason','withdrawal','deposit','approve','currency']));
                 foreach (['offset'=>1000000, 'limit'=>100] as $field=>$max) {
                     if (!isset($options[$field])) { continue; }
                     if (!ctype_digit($options[$field]) || strlen($options[$field]) > 7 || (int) $options[$field] > $max
@@ -68,8 +68,8 @@ final class Application
                 if (!ctype_digit($seconds) || strlen($seconds)>7 || (int)$seconds>604800) {
                     throw new RuntimeException('seconds must be an integer from 0 to 604800.');
                 }
-                $db = null; $backup = null; $hard = null; $runtime = null; $nextMaintenance = 0.0; $hardCandidates = [];
-                $tick = function (Daemon $daemon, Config $config) use (&$db, &$backup, &$hard, &$runtime, &$nextMaintenance, &$hardCandidates): void {
+                $db = null; $backup = null; $hard = null; $runtime = null; $exchange = null; $nextMaintenance = 0.0; $hardCandidates = [];
+                $tick = function (Daemon $daemon, Config $config) use (&$db, &$backup, &$hard, &$runtime, &$exchange, &$nextMaintenance, &$hardCandidates): void {
                     if ($db === null) {
                         $db = new Database($config->dataDir.'/client.sqlite');
                         $backup = new Backup($db, $config->dataDir);
@@ -80,9 +80,13 @@ final class Application
                         EventRecord::hideSecret($settings['token']);
                         $runtime = new \Trademinator\Client\M2\Runtime($db, $settings, null, null,
                             fn(string $level, string $event, array $context, string $message) => $daemon->log($level, $event, $context, $message));
+                        $exchange = new \Trademinator\Client\M3\Runtime($db, $config->exchange, null,
+                            fn(string $level, string $event, array $context, string $message) => $daemon->log($level, $event, $context, $message),
+                            new \Trademinator\Client\M3\HardPoints($db, $config->dataDir), $config->dataDir);
                         $daemon->log('info', 'storage_ready', ['schema_version'=>Database::SCHEMA_VERSION, 'live_order_execution'=>false], 'Local storage verified; live trading is disabled.');
                         if (!$settings['enabled']) { $daemon->log('info', 'server_disabled', [], 'Server integration is disabled; local core is running.'); }
                     }
+                    $exchange->tick();
                     $runtime->tick();
                     $now = hrtime(true) / 1e9;
                     if ($now < $nextMaintenance) { return; }
@@ -90,6 +94,7 @@ final class Application
                         $daemon->log('info', 'backup_created', ['reason'=>$reason, 'backup_id'=>$snapshot['id'] ?? null], 'Local database backup created.');
                     }
                     foreach ($db->pdo()->query('SELECT id FROM exchange_accounts')->fetchAll(\PDO::FETCH_COLUMN) as $id) {
+                        if (in_array($id, array_column($config->exchange['accounts'], 'account_id'), true)) { continue; }
                         $candidate = $hard->proposeT1($id);
                         $candidateId = $candidate['token'] ?? null;
                         if ($candidateId !== null && ($hardCandidates[$id] ?? null) !== $candidateId) {
@@ -99,18 +104,22 @@ final class Application
                     }
                     $nextMaintenance = $now + 60;
                 };
-                $status = function () use (&$db, &$runtime): array {
-                    return ['ready'=>$db!==null,'live_order_execution'=>false,'exchange_connected'=>false,
-                        'accounts'=>$db ? (int)$db->pdo()->query('SELECT COUNT(*) FROM exchange_accounts')->fetchColumn() : 0,
+                $status = function () use (&$db, &$runtime, &$exchange): array {
+                    return ['ready'=>$db!==null,'live_order_execution'=>false,'exchange_connected'=>!empty($exchange?->status()['accounts']),
+                        'exchange'=>$exchange?->status(), 'accounts'=>$db ? (int)$db->pdo()->query('SELECT COUNT(*) FROM exchange_accounts')->fetchColumn() : 0,
                         'server'=>$runtime?->status()];
                 };
-                $reload = function (Config $candidate) use (&$runtime): void {
+                $reload = function (Config $candidate) use (&$runtime, &$exchange, &$db, &$daemon): void {
                     $settings = $candidate->serverSettings();
                     EventRecord::hideSecret($settings['token']);
+                    $nextExchange = new \Trademinator\Client\M3\Runtime($db, $candidate->exchange, null,
+                        fn(string $level, string $event, array $context, string $message) => $daemon->log($level, $event, $context, $message),
+                        new \Trademinator\Client\M3\HardPoints($db, $candidate->dataDir), $candidate->dataDir);
                     $runtime?->reconfigure($settings);
+                    $exchange?->close(); $exchange = $nextExchange;
                 };
                 $daemon = new Daemon($config, $tick, $status, $reload, [$console, 'write']);
-                $daemon->setHandler(function (string $command, array $arguments) use (&$runtime, &$db, $daemon): array {
+                $daemon->setHandler(function (string $command, array $arguments) use (&$runtime, &$db, &$exchange, $daemon): array {
                     if ($db === null || $runtime === null) { throw new RuntimeException('Local storage is not ready.'); }
                     if ($command === 'accounts') {
                         return ['accounts'=>$db->pdo()->query('SELECT id,exchange,label FROM exchange_accounts ORDER BY created_at,id')->fetchAll()];
@@ -125,9 +134,10 @@ final class Application
                         catch (Throwable) { $result['warning'] = 'account_created_reporting_failed'; }
                         return $result;
                     }
+                    if (in_array($command, ['exchange-status','exchange-refresh','exchange-adjust','deposit-basis','transfer-link','hard-h-propose','hard-h-promote'], true)) { return $exchange->command($command, $arguments); }
                     return $runtime->command($command, $arguments);
                 });
-                return $daemon->run((int)$seconds);
+                try { return $daemon->run((int)$seconds); } finally { $exchange?->close(); }
             }
             if (!in_array($command,['init','check','backup','hard-t0','hard-t1-propose','hard-t1-promote','hard-restore','recover'],true)) {
                 throw new RuntimeException('Unknown command. See help.');
@@ -196,7 +206,7 @@ final class Application
     private function help(): void
     {
         echo <<<'HELP'
-Trademinator Client M2 — authenticated intelligence (no live order execution)
+Trademinator Client M3 — exchange reconciliation (no live order execution)
   php bin/client.php doctor
   php bin/client.php init [--config=PATH] [--data-dir=PATH]
   php bin/client.php run [--config=PATH] [--data-dir=PATH] [--seconds=60]
@@ -214,6 +224,14 @@ Trademinator Client M2 — authenticated intelligence (no live order execution)
   php bin/client.php hard-t1-propose --account=UUID [--data-dir=PATH]
   php bin/client.php hard-t1-promote --account=UUID --approve=TOKEN [--data-dir=PATH]
   php bin/client.php hard-restore --account=UUID --point=UNIX_MS --approve=yes [--data-dir=PATH]
+
+M3 account commands (daemon running):
+  php bin/client.php exchange-status [--config=PATH]
+  php bin/client.php exchange-refresh --account=UUID [--config=PATH]
+  php bin/client.php deposit-basis --operation=UUID --price=DECIMAL --reason=TEXT [--config=PATH]
+  php bin/client.php transfer-link --withdrawal=UUID --deposit=UUID --approve=yes [--config=PATH]
+  php bin/client.php hard-h-propose --account=UUID [--config=PATH]
+  php bin/client.php hard-h-promote --account=UUID --approve=TOKEN [--config=PATH]
 
 Offline database/hard-point commands require the daemon stopped.
 Hard T1 promotion uses the exact reviewed candidate token. A stale token is rejected.

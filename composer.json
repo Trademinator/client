@@ -1,7 +1,7 @@
 {
     "$schema": "https://getcomposer.org/schema.json",
     "name": "trademinator/client",
-    "description": "Trademinator Client M2 authenticated Server intelligence and local core.",
+    "description": "Trademinator Client M3 read-only exchange connectivity and authoritative accounting.",
     "type": "project",
     "license": "MIT",
     "require": {
@@ -26,7 +26,8 @@
         "psr-4": {
             "Trademinator\\Client\\M0\\": "src/",
             "Trademinator\\Client\\M1\\": "m1/",
-            "Trademinator\\Client\\M2\\": "m2/"
+            "Trademinator\\Client\\M2\\": "m2/",
+            "Trademinator\\Client\\M3\\": "m3/"
         },
         "files": [
             "compat/typephp-polyfills.php"
@@ -36,14 +37,22 @@
         "test": [
             "@php tests/run.php",
             "@php tests/m1.php",
-            "@php tests/m2.php"
+            "@php tests/m2.php",
+            "@php tests/m3.php",
+            "@php tests/m3-runtime.php",
+            "@php tests/m3-transport.php"
         ],
         "lint": "@php tools/lint.php",
         "doctor": "@php bin/client.php doctor",
         "test:m0": "@php tests/run.php",
         "test:m1": "@php tests/m1.php",
         "doctor:m0": "@php bin/m0.php doctor",
-        "test:m2": "@php tests/m2.php"
+        "test:m2": "@php tests/m2.php",
+        "test:m3": [
+            "@php tests/m3.php",
+            "@php tests/m3-runtime.php",
+            "@php tests/m3-transport.php"
+        ]
     },
     "config": {
         "sort-packages": true,

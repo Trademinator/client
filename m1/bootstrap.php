@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 // The local core and M2 use PHP extensions directly. M0 retains its lockfile.
 spl_autoload_register(static function (string $class): void {
-    foreach (['M1' => __DIR__, 'M2' => dirname(__DIR__).'/m2'] as $namespace => $directory) {
+    foreach (['M1' => __DIR__, 'M2' => dirname(__DIR__).'/m2', 'M3' => dirname(__DIR__).'/m3'] as $namespace => $directory) {
         $prefix = 'Trademinator\\Client\\'.$namespace.'\\';
         if (!str_starts_with($class, $prefix)) { continue; }
         $name = substr($class, strlen($prefix));
