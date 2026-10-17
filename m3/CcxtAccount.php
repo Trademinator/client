@@ -85,6 +85,7 @@ final class CcxtAccount
             $orders = [];
             $open = [];
             $operations = [];
+            $transferLabels = [];
             $since = $context['since_ms'];
             $accountWide = $this->rest instanceof BitsoReadClient;
             $historySymbols = $accountWide ? [null] : $symbols;
@@ -180,6 +181,8 @@ final class CcxtAccount
                     $op = Normalize::operation($row, $direction === 'in' ? 'deposit' : 'withdrawal');
                     if ($op !== null) {
                         $operations[$op['id']] = $op;
+                        $label = TransferLabels::suggest($this->exchange, $row, $op['kind']);
+                        if ($label !== null) { $transferLabels[$op['id']] = $label; }
                     }
                 }
             } else {
@@ -191,6 +194,12 @@ final class CcxtAccount
                         $op = Normalize::operation($row, $kind);
                         if ($op !== null) {
                             $operations[$op['id']] = $op;
+                            // Bitso has already classified before scrubbing native metadata.
+                            // A null result must not become a guess from the redacted row.
+                            $label = $this->rest instanceof BitsoReadClient
+                                ? ($row['m3_transfer_label'] ?? null)
+                                : TransferLabels::suggest($this->exchange, $row, $kind);
+                            if ($label !== null) { $transferLabels[$op['id']] = $label; }
                         }
                     }
                 }
@@ -210,7 +219,8 @@ final class CcxtAccount
             }
             $at = (int)floor(microtime(true) * 1000);
             return ['at_ms' => $at,'started_at_ms' => $started,'since_ms' => $since,'balances' => $balance,'orders' => array_values($orders),'trades' => array_values($trades),
-                'operations' => array_values($operations),'markets' => $loaded,'quotes' => $quotes,'complete' => true,'prices' => [],'history_only_orders' => $historyOnlyCount];
+                'operations' => array_values($operations),'transfer_labels' => $transferLabels,
+                'markets' => $loaded,'quotes' => $quotes,'complete' => true,'prices' => [],'history_only_orders' => $historyOnlyCount];
         })()->then(null, function (\Throwable $error): never {
             $this->failureContexts ??= new \WeakMap();
             $this->failureContexts[$error] = array_merge($this->requestContext,

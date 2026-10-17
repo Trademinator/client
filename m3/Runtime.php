@@ -27,6 +27,7 @@ final class Runtime
     private array $generation = [];
     private Reconciler $reconciler;
     private Accounting $accounting;
+    private TransferReviews $transferReviews;
     private ?\Closure $sink;
     private \Closure $factory;
     private bool $closed = false;
@@ -37,6 +38,7 @@ final class Runtime
         $this->sink = $sink === null ? null : \Closure::fromCallable($sink);
         $this->reconciler = new Reconciler($db);
         $this->accounting = new Accounting($db);
+        $this->transferReviews = new TransferReviews($db);
         $this->factory = $factory === null ? static fn ($exchange, $settings, $account) => new CcxtAccount($exchange, $settings, $account) : \Closure::fromCallable($factory);
         foreach ($settings['accounts'] as $account) {
             $id = $account['account_id'];
@@ -171,6 +173,15 @@ final class Runtime
                 }
                 $this->syncs[$id]['stage'] = 'rest_snapshot';
                 $batch = await($this->clients[$id]->snapshot($context));
+                $previousReviews = $this->transferReviews->pending($id, 1)['count'];
+                $this->transferReviews->observe($id, $batch);
+                $pendingReviews = $this->transferReviews->pending($id, 1)['count'];
+                if ($pendingReviews > $previousReviews) {
+                    $this->emit('info', 'exchange_transfer_review_pending', ['account_id' => $id,
+                        'new_labels' => $pendingReviews - $previousReviews, 'pending_labels' => $pendingReviews,
+                        'status' => 'pending_confirmation'],
+                        'Possible user transfers were soft-labeled; confirmation or an explanation is pending for the future UI.');
+                }
                 if ($this->clients[$id] instanceof CcxtAccount) {
                     $this->syncs[$id]['stage'] = 'inventory_validation';
                     $this->reconciler->validateInventory($id, $batch, $account);
@@ -397,6 +408,7 @@ final class Runtime
         foreach ($accounts as $id => &$state) {
             unset($state['due']);
             $state['sync'] = $this->progressFor($id);
+            $state['transfer_review'] = $this->transferReviews->pending($id);
             if ($state['discrepancies'] !== []) {
                 $state['adjustment_token'] = $this->adjustmentToken($id, $state);
             }$state['transport'] = count(array_filter($state['ws'], static fn ($s) => $s['state'] === 'connected')) > 0 ? 'websocket_with_rest' : 'rest';

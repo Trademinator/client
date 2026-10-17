@@ -48,6 +48,7 @@ try {
     $pdo->exec(<<<'SQL'
 PRAGMA foreign_keys=OFF;
 BEGIN IMMEDIATE;
+DROP TABLE transfer_labels;
 CREATE TABLE buys_vs_sells_v4 (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL, market_id TEXT NOT NULL,
  allocation_key TEXT NOT NULL, buy_order_id TEXT, buy_operation_id TEXT, baseline_lot_id TEXT,
@@ -68,7 +69,7 @@ CREATE INDEX allocations_baseline ON buys_vs_sells(baseline_lot_id);
 CREATE INDEX allocations_sell ON buys_vs_sells(sell_order_id);
 DROP INDEX orders_account_identity;
 DROP INDEX operations_account_identity;
-DELETE FROM schema_migrations WHERE version=5;
+DELETE FROM schema_migrations WHERE version>=5;
 COMMIT;
 PRAGMA foreign_keys=ON;
 SQL);
@@ -84,7 +85,7 @@ SQL);
 
     $db = new Database($root.'/client.sqlite');
     $ledger = new Ledger($db);
-    check(Database::schemaVersion($db->pdo()) === 5, 'schema 4 upgrades to schema 5');
+    check(Database::schemaVersion($db->pdo()) === Database::SCHEMA_VERSION, 'schema 4 upgrades through schema 5 to the current schema');
     check($ledger->accountSnapshot($account) === $before, 'migration preserves financial rows and assigns their original inventory owner');
     check($db->integrityCheck()['ok'] && (int)$db->pdo()->query('PRAGMA foreign_keys')->fetchColumn() === 1, 'schema-5 migration verifies and re-enables foreign keys');
     $backups = (new Backup($db, $root))->list('pre-migration');
@@ -150,7 +151,7 @@ SQL);
     check(count(glob($root.'/fault/backups/pre-migration/*/manifest.json') ?: []) === 1, 'failed schema-5 migration retains its recovery backup');
     unset($ledger, $db);
     $db = new Database($root.'/client.sqlite');
-    check(count((new Backup($db, $root))->list('pre-migration')) === 1, 'reopening schema 5 does not repeat migration or create another backup');
+    check(count((new Backup($db, $root))->list('pre-migration')) === 1, 'reopening the current schema does not repeat migration or create another backup');
 } finally {
     unset($pdo, $db, $ledger, $restored, $restoredLedger);
     Backup::removeTree($root);

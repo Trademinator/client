@@ -408,7 +408,12 @@ foreach (['mxn' => '25', 'brl' => '12.34', 'btc' => '0.00012345', 'atom' => '1.2
     $internal->transport->calls = [];
     $internal->transport->withdrawals = [array_replace($btRaw, ['wid' => 'internal-'.$currency, 'currency' => $currency, 'amount' => $amount])];
     $config = settings(); $config['accounts'][0]['account_id'] = 'unrelated-'.$currency;
-    $op = snapshot($internal, $config)['operations'][0];
+    $internalSnapshot = snapshot($internal, $config);
+    $op = $internalSnapshot['operations'][0];
+    $label = $internalSnapshot['transfer_labels'][$op['id']] ?? null;
+    check(($label['label'] ?? null) === 'user_withdrawal' && $label['status'] === 'pending_confirmation'
+        && $label['reason'] === 'bitso_user_transfer_route',
+        'real Bitso adapter retains the pending user-withdrawal label after redacting raw metadata');
     check($op['currency'] === strtoupper($currency) && $op['amount'] === $amount && $op['fees'] === []
         && $op['network'] === 'BT' && $op['fee_evidence']['source'] === 'bitso_transfer_contract'
         && $op['fee_evidence']['currency'] === $op['currency'],
@@ -491,6 +496,57 @@ refuses(fn() => $internalReconciler->apply($internalId, snapshot($internal), $in
 check($internalLedger->expectedBalances($internalId)['MXN'] === '75' && $internalDb->revision($internalId) === $internalRevision,
     'conflicting later fee evidence rolls back without changing balances or revision');
 $internal->close();
+
+// Exercise classification through the actual Bitso parser/redaction boundary.
+$labelClient = new TransferClient();
+$incoming = $btRaw; unset($incoming['wid']); $incoming['fid'] = 'synthetic-peer-funding';
+$labelClient->transport->fundings = [$incoming];
+$labelClient->transport->withdrawals = [$btRaw];
+$labelRows = await($labelClient->fetch_withdrawals());
+check(!isset($labelRows[0]['info']) && !str_contains(json_encode($labelRows), 'PRIVATE_')
+    && ($labelRows[0]['m3_transfer_label']['label'] ?? null) === 'user_withdrawal',
+    'Bitso transports only a safe label descriptor after removing private raw fields');
+$labelBatch = snapshot($labelClient);
+check(($labelBatch['transfer_labels']['deposit:synthetic-peer-funding']['label'] ?? null) === 'user_deposit'
+    && count($labelBatch['transfer_labels']) === 2,
+    'real Bitso funding and withdrawal records receive their respective directional labels');
+check(!str_contains(json_encode($labelBatch), 'PRIVATE_')
+    && !isset($labelBatch['operations'][1]['m3_transfer_label'])
+    && $labelBatch['operations'][1] === Normalize::operation($labelRows[0], 'withdrawal'),
+    'Bitso labels remain outside financial operations and retain no private response data');
+$labelClient->transport->fundings = [];
+foreach ([
+    ['details' => ['fee' => '0', 'tx_hash' => 'external-chain-hash']],
+    ['method' => 'spei', 'network' => 'spei', 'protocol' => 'clabe', 'integration' => 'praxis', 'details' => ['fee' => '0']],
+    ['method' => null, 'network' => null, 'protocol' => null, 'integration' => null,
+        'type' => 'conversion', 'details' => ['fee' => '0']],
+    ['method' => null, 'network' => null, 'protocol' => 'unknown_route', 'integration' => null, 'details' => ['fee' => '0']],
+    ['method' => null, 'network' => null, 'protocol' => null, 'integration' => null,
+        'details' => ['fee' => '0', 'bank_account' => 'PRIVATE_BANK_ACCOUNT']],
+] as $change) {
+    $labelClient->transport->withdrawals = [array_replace($btRaw, $change)];
+    check(snapshot($labelClient)['transfer_labels'] === [],
+        'classification rejected before Bitso redaction cannot become a fallback user-transfer label');
+}
+$labelClient->transport->withdrawals = [array_replace($btRaw, ['currency' => 'usd', 'amount' => '185'])];
+$labelDb = new Database(':memory:'); $labelLedger = new Ledger($labelDb);
+$labelAccount = $labelLedger->createAccount('bitso', 'Missing acquisition with real Bitso transport');
+$labelLedger->registerMarket($labelAccount, 'USD/EUR', 'USD', 'EUR');
+$labelSettings = settings(); $labelSettings['accounts'][0]['account_id'] = $labelAccount;
+$labelAdapter = new CcxtAccount('bitso', $labelSettings, $labelSettings['accounts'][0], $labelClient);
+$labelRuntime = new Runtime($labelDb, $labelSettings, fn () => $labelAdapter);
+try {
+    $labelRuntime->tick((int)floor(microtime(true) * 1000));
+    $labelState = $labelRuntime->status()['accounts'][$labelAccount];
+    check($labelState['state'] === 'RECOVERING' && !$labelState['rest_ok']
+        && ($labelState['last_error']['reason'] ?? null) === 'inventory_shortfall'
+        && $labelState['transfer_review']['count'] === 1
+        && $labelState['transfer_review']['items'][0]['label'] === 'user_withdrawal'
+        && $labelState['transfer_review']['items'][0]['amount'] === '185',
+        'actual Bitso withdrawal keeps its pending review when early inventory validation fails');
+    check($labelLedger->accountSnapshot($labelAccount)['operations'] === [],
+        'a missing acquisition never creates an invented user deposit or bypasses inventory validation');
+} finally { $labelRuntime->close(); }
 
 $invoices = json_decode(file_get_contents(__DIR__.'/fixtures/m3-lightning.json'), true, 32, JSON_THROW_ON_ERROR);
 // Static synthetic fixtures were signed independently with Python cryptography.

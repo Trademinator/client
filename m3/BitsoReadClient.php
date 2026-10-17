@@ -230,6 +230,9 @@ class BitsoReadClient extends \ccxt\async\bitso
                     $row['amount'] = $net;
                     $row['fee'] = ['currency' => Normalize::currency($row['currency']), 'cost' => $fee];
                 }
+                // Classify while native routing and external evidence are still present.
+                // Carry only the safe descriptor; raw personal details are removed below.
+                $row['m3_transfer_label'] = TransferLabels::suggest('bitso', $row, $kind);
                 // Preserve server order for the marker, including equal timestamps.
                 // Pending/failed entries remain in the page for correct pagination.
                 // An invoice contains a payment secret, not a reusable wallet address.

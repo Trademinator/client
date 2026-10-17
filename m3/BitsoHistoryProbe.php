@@ -19,6 +19,14 @@ class BitsoHistoryProbe extends BitsoReadClient
         'withdrawals' => ['path' => 'withdrawals/', 'id' => 'wid', 'kind' => 'withdrawal'],
         'rfq_conversions' => ['path' => 'conversions', 'id' => 'id', 'kind' => 'conversion'],
     ];
+    private const CONVERSION_SOURCES = [
+        'rfq_conversions' => self::SOURCES['rfq_conversions'],
+        'rfq_conversions_unfiltered' => ['path' => 'conversions', 'id' => 'id', 'kind' => 'conversion', 'unfiltered' => true],
+        // Declared by the pinned CCXT adapter. Availability and coverage of old
+        // app conversions are unverified; never use these as automatic fallbacks.
+        'ledger' => ['path' => 'ledger', 'id' => 'eid', 'kind' => 'ledger'],
+        'ledger_trades' => ['path' => 'ledger/trades', 'id' => 'eid', 'kind' => 'ledger'],
+    ];
     private const ERRORS = [
         'invalid_window' => 'Supply valid ISO 8601 timestamps with explicit UTC offsets; from must precede to.',
         'invalid_page' => 'The endpoint did not return a valid bounded history page.',
@@ -76,11 +84,13 @@ class BitsoHistoryProbe extends BitsoReadClient
     }
 
     /** A checked API window is not proof that Bitso exposes every historical app conversion. */
-    public function inspect(int $from, int $to, int $configuredSince, int $maxPages = 1000, int $limit = 100, ?callable $progress = null): array
+    public function inspect(int $from, int $to, int $configuredSince, int $maxPages = 1000, int $limit = 100,
+        ?callable $progress = null, bool $conversionSources = false): array
     {
         if ($from < 0 || $from >= $to || $configuredSince < 0) { throw new RuntimeException('invalid_window'); }
         if ($maxPages < 1 || $maxPages > 10000 || $limit < 1 || $limit > 100) { throw new RuntimeException('invalid_page'); }
         $report = ['tool' => 'm3-bitso-history-check', 'read_only' => true, 'status' => 'window_checked',
+            'scope' => $conversionSources ? 'conversion_sources' : 'history_window', 'history_completeness_verified' => false,
             'window' => ['from_inclusive' => Numbers::iso($from), 'to_exclusive' => Numbers::iso($to)],
             'configured_history_since_ms' => $configuredSince,
             'window_starts_before_configured_history' => $from < $configuredSince,
@@ -92,9 +102,16 @@ class BitsoHistoryProbe extends BitsoReadClient
                 'Currency codes are reported separately. No USD/USDC/USDT alias, fee inference or balance adjustment is applied.',
                 'This tool does not verify order lifecycle, resolve transfer fees, read Hard H0 or replay the ledger.',
             ]];
-        foreach (self::SOURCES as $source => $definition) {
+        if ($conversionSources) {
+            $report['notes'][] = 'Filtered and unfiltered RFQ scans are independent views of the same endpoint; never add their events together.';
+            $report['notes'][] = 'The unfiltered RFQ scan sends no date or status filter and follows tokens to exhaustion or the page budget; only in-window events are shown.';
+            $report['notes'][] = 'Legacy ledger routes are declared by CCXT but may be unavailable. Their raw balance_updates are diagnostic evidence, not imported transactions.';
+        }
+        foreach ($conversionSources ? self::CONVERSION_SOURCES : self::SOURCES as $source => $definition) {
             $summary = ['coverage' => 'partial', 'pages_read' => 0, 'records_scanned' => 0, 'duplicates' => 0,
-                'events_in_window' => 0, 'earliest_seen_at' => null, 'latest_seen_at' => null];
+                'events_in_window' => 0, 'earliest_seen_at' => null, 'latest_seen_at' => null,
+                'api_family' => $definition['kind'] === 'conversion' ? 'rfq_v1' : 'v3', 'endpoint' => $definition['path'],
+                'time_filter' => $definition['kind'] === 'conversion' && empty($definition['unfiltered']) ? 'server_and_local' : 'local_only'];
             try {
                 $this->scan($source, $definition, $from, $to, $configuredSince, $maxPages, $limit, $summary, $report['timeline'], $progress);
             } catch (Throwable $error) {
@@ -111,9 +128,11 @@ class BitsoHistoryProbe extends BitsoReadClient
     private function scan(string $source, array $definition, int $from, int $to, int $configuredSince, int $maxPages,
         int $limit, array &$summary, array &$timeline, ?callable $progress): void
     {
-        $rfq = $source === 'rfq_conversions';
-        $params = $rfq ? ['page_size' => $limit, 'created_at_gte' => Numbers::iso($from), 'created_at_lt' => Numbers::iso($to)]
-            : ['limit' => $limit] + ($source === 'user_trades' ? ['sort' => 'desc'] : []);
+        $rfq = $definition['kind'] === 'conversion';
+        $serverFilter = $rfq && empty($definition['unfiltered']);
+        $params = $rfq ? ['page_size' => $limit]
+            : ['limit' => $limit] + ($source === 'user_trades' || $definition['kind'] === 'ledger' ? ['sort' => 'desc'] : []);
+        if ($serverFilter) { $params += ['created_at_gte' => Numbers::iso($from), 'created_at_lt' => Numbers::iso($to)]; }
         $cursor = null; $cursors = []; $seen = []; $oldest = PHP_INT_MAX;
         for ($page = 1; $page <= $maxPages; ++$page) {
             if ($progress !== null) { $progress($source, $page, $summary['records_scanned']); }
@@ -145,7 +164,7 @@ class BitsoHistoryProbe extends BitsoReadClient
                     continue;
                 }
                 $seen[$id] = $fingerprint; ++$new;
-                if ($rfq && ($at < $from || $at >= $to)) { throw new RuntimeException('unexpected_filter_result'); }
+                if ($serverFilter && ($at < $from || $at >= $to)) { throw new RuntimeException('unexpected_filter_result'); }
                 if ($at < $from || $at >= $to) { continue; }
                 if ($summary['events_in_window'] >= 1000) { throw new RuntimeException('event_limit_reached'); }
                 $event['before_configured_history'] = $at < $configuredSince;
@@ -159,7 +178,9 @@ class BitsoHistoryProbe extends BitsoReadClient
                 $completion = 'endpoint_exhausted';
             } else {
                 // Read past an equal-time boundary, including a full page of ties.
-                $done = count($rows) < $limit || $oldest < $from;
+                // Legacy ledger routes may apply their own page cap: a short
+                // page alone is not evidence of exhaustion for those routes.
+                $done = ($definition['kind'] === 'ledger' ? $rows === [] : count($rows) < $limit) || $oldest < $from;
                 $completion = $oldest < $from ? 'lower_bound_crossed' : 'endpoint_exhausted';
                 $next = $edge;
             }
@@ -198,6 +219,25 @@ class BitsoHistoryProbe extends BitsoReadClient
                 unset($trade['id'], $trade['order'], $trade['timestamp']);
                 $event['normalized_trade'] = $this->clean($trade);
             } catch (Throwable $error) { $event['normalization_error'] = self::diagnostic($error); }
+        } elseif ($kind === 'ledger') {
+            $updates = $raw['balance_updates'] ?? null;
+            if (!is_array($updates) || !array_is_list($updates) || $updates === [] || count($updates) > 32) {
+                throw new RuntimeException('invalid_record');
+            }
+            $event['raw'] = ['operation' => $this->choice($raw['operation'] ?? null,
+                ['trade', 'fee', 'funding', 'withdrawal', 'conversion', 'transfer']), 'balance_updates' => []];
+            foreach ($updates as $update) {
+                if (!is_array($update) || !isset($update['currency'], $update['amount'])) { throw new RuntimeException('invalid_record'); }
+                // CCXT's unified ledger entry keeps only the first balance update.
+                // Keep every raw leg here, including signed debits and fee rows.
+                $event['raw']['balance_updates'][] = ['currency' => $this->code($update['currency']),
+                    'amount' => $this->money($update['amount'], true)];
+            }
+            $details = is_array($raw['details'] ?? null) ? $raw['details'] : [];
+            foreach (['tid' => 'trade_ref', 'oid' => 'order_ref'] as $key => $label) {
+                if (isset($details[$key])) { $event[$label] = substr(hash('sha256', Normalize::id($details[$key])), 0, 16); }
+            }
+            $event['imported_by_current_m3'] = false;
         } elseif ($kind === 'conversion') {
             $event['raw'] = ['source' => $this->code($raw['source'] ?? null), 'target' => $this->code($raw['target'] ?? null),
                 'source_amount' => $this->money($raw['source_amount'] ?? null), 'target_amount' => $this->money($raw['target_amount'] ?? null),

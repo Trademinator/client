@@ -8,14 +8,15 @@ require_once dirname(__DIR__).'/m1/bootstrap.php';
 use Trademinator\Client\M1\Config;
 use Trademinator\Client\M3\{BitsoHistoryProbe, CredentialError, Settings};
 
-$options = getopt('', ['config:', 'account:', 'from:', 'to:', 'max-pages:', 'help']);
+$options = getopt('', ['config:', 'account:', 'from:', 'to:', 'max-pages:', 'conversion-sources', 'help']);
 $valid = true;
 foreach (['config', 'account', 'from', 'to'] as $key) { $valid = $valid && is_string($options[$key] ?? null); }
 if (isset($options['help']) || !$valid) {
     fwrite(isset($options['help']) ? STDOUT : STDERR,
-        "Usage: php tools/m3-bitso-history-check.php --config=FILE --account=BITSO_ACCOUNT_ID --from=ISO8601 --to=ISO8601 [--max-pages=N]\n"
+        "Usage: php tools/m3-bitso-history-check.php --config=FILE --account=BITSO_ACCOUNT_ID --from=ISO8601 --to=ISO8601 [--max-pages=N] [--conversion-sources]\n"
         ."Use explicit timezones, e.g. --from=2022-01-01T00:00:00Z --to=2022-01-02T00:00:00Z.\n"
         ."Read only: inspects trades, deposits, withdrawals and RFQ conversions within [from,to).\n"
+        ."With --conversion-sources: instead compares filtered/unfiltered RFQ, ledger and ledger/trades (default at most 10 pages per source).\n"
         ."Outputs a sanitized JSON timeline; progress goes to stderr. Does not open or change the local database.\n");
     exit(isset($options['help']) ? 0 : 2);
 }
@@ -33,7 +34,8 @@ try {
         static fn(array $account): bool => $account['account_id'] === $options['account']));
     if (count($accounts) !== 1) { throw new RuntimeException('Account not found.'); }
     $account = $accounts[0];
-    $maxPages = $config->exchange['history_max_pages'];
+    $conversionSources = isset($options['conversion-sources']);
+    $maxPages = $conversionSources ? min(10, $config->exchange['history_max_pages']) : $config->exchange['history_max_pages'];
     if (isset($options['max-pages'])) {
         if (!is_string($options['max-pages']) || !preg_match('/^[1-9][0-9]{0,4}$/D', $options['max-pages'])
             || (int)$options['max-pages'] > 10000) { throw new RuntimeException('Invalid page budget.'); }
@@ -52,7 +54,7 @@ try {
             $lastSource = $source; $lastProgress = $now;
         }
     };
-    $report += $client->inspect($from, $to, $account['history_since_ms'], $maxPages, 100, $progress);
+    $report += $client->inspect($from, $to, $account['history_since_ms'], $maxPages, 100, $progress, $conversionSources);
     $exit = $report['status'] === 'window_checked' ? 0 : 1;
 } catch (Throwable $error) {
     $report += ['status' => 'needs_review', 'stage' => $stage, 'error' => $error instanceof CredentialError ? $error->diagnostic

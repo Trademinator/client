@@ -602,11 +602,15 @@ final class Ledger
         });
     }
 
-    public function accountSnapshot(string $accountId): array
+    public function accountSnapshot(string $accountId, bool $includeTransferLabels = false): array
     {
-        return $this->database->transaction(function () use ($accountId): array {
+        return $this->database->transaction(function () use ($accountId, $includeTransferLabels): array {
             $snapshot = ['account' => $this->account($accountId)];
             foreach (self::TABLES as $table) { $snapshot[$table] = $this->rows('SELECT * FROM ' . $table . ' WHERE account_id=? ORDER BY id', [$accountId]); }
+            // Review annotations are optional archive material, never financial evidence.
+            if ($includeTransferLabels) {
+                $snapshot['transfer_labels'] = $this->rows('SELECT * FROM transfer_labels WHERE account_id=? ORDER BY id', [$accountId]);
+            }
             return $snapshot;
         });
     }
@@ -621,16 +625,59 @@ final class Ledger
                 if (!isset($snapshot[$table]) || !is_array($snapshot[$table])) { throw new InvalidArgumentException('Incomplete account snapshot: ' . $table); }
                 foreach ($snapshot[$table] as $row) { if (($row['account_id'] ?? null) !== $id) { throw new RuntimeException('Snapshot contains another account.'); } }
             }
+            // Account replacement cascades to annotations. Preserve current reviews,
+            // and recover archived reviews when restoring into a fresh database.
+            $labels = $this->transferLabelsForRestore($id, $snapshot['transfer_labels'] ?? []);
             $this->execute('DELETE FROM exchange_accounts WHERE id=?', [$id]);
             $this->insert('exchange_accounts', $account);
             foreach (self::TABLES as $table) { foreach ($snapshot[$table] as $row) {
                 if ($table === 'buys_vs_sells') { $row['inventory_market_id'] ??= $row['market_id']; }
                 $this->insert($table, $row);
             } }
+            foreach ($labels as $row) { $this->insert('transfer_labels', $row); }
             if (!$this->database->integrityCheck()['ok']) { throw new RuntimeException('Restored snapshot failed database integrity checks.'); }
             // Validate arithmetic/lot links; unknown acquisition cost is deliberately retained.
             $this->accountState($id);
         });
+    }
+
+    private function transferLabelsForRestore(string $accountId, mixed $archived): array
+    {
+        if (!is_array($archived) || !array_is_list($archived)) {
+            throw new InvalidArgumentException('Invalid transfer label snapshot.');
+        }
+        $labels = [];
+        foreach ($archived as $row) {
+            if (!is_array($row) || ($row['account_id'] ?? null) !== $accountId) {
+                throw new RuntimeException('Transfer label snapshot contains another account.');
+            }
+            $identity = $row['exchange_operation_id'] ?? null;
+            if (!is_string($identity) || $identity === '' || isset($labels[$identity])) {
+                throw new RuntimeException('Transfer label snapshot has an invalid or duplicate identity.');
+            }
+            $labels[$identity] = $row;
+        }
+        foreach ($this->rows('SELECT * FROM transfer_labels WHERE account_id=? ORDER BY id', [$accountId]) as $current) {
+            $identity = $current['exchange_operation_id'];
+            $previous = $labels[$identity] ?? null;
+            if ($previous !== null) {
+                foreach (['kind','currency','amount','occurred_at','financial_fingerprint'] as $field) {
+                    if (($previous[$field] ?? null) !== $current[$field]) {
+                        throw new RuntimeException('Transfer label snapshot conflicts with observed financial identity.');
+                    }
+                }
+                $currentDecided = in_array($current['status'], ['confirmed','explained'], true);
+                $archiveDecided = in_array($previous['status'] ?? null, ['confirmed','explained'], true);
+                if (!$currentDecided && $archiveDecided) {
+                    // A known review decision outranks an observation, while an
+                    // existing review always outranks the older archived copy.
+                    $labels[$identity] = array_replace($previous, ['id' => $current['id']]);
+                    continue;
+                }
+            }
+            $labels[$identity] = $current;
+        }
+        return array_values($labels);
     }
 
     public function installHardT0(string $accountId, array $baseline, bool $archiveRebase = false): void

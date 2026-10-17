@@ -72,10 +72,10 @@ function conversion(string $id = 'PRIVATE_CONVERSION', string $at = '2022-01-01T
     return ['id' => $id, 'created_at' => $at, 'updated_at' => $at, 'source' => 'XRP', 'target' => 'USDC',
         'source_amount' => '8', 'target_amount' => '20.25', 'status' => $status, 'quote_id' => 'PRIVATE_QUOTE'];
 }
-function report(ProbeClient $client, int $pages = 1000, int $limit = 100, ?callable $progress = null): array
+function report(ProbeClient $client, int $pages = 1000, int $limit = 100, ?callable $progress = null, bool $conversionSources = false): array
 {
     return $client->inspect(BitsoHistoryProbe::time('2022-01-01T10:00:00Z'), BitsoHistoryProbe::time('2022-01-01T10:10:00Z'),
-        BitsoHistoryProbe::time('2022-01-01T10:00:33Z'), $pages, $limit, $progress);
+        BitsoHistoryProbe::time('2022-01-01T10:00:33Z'), $pages, $limit, $progress, $conversionSources);
 }
 
 $client = new ProbeClient();
@@ -206,6 +206,86 @@ refuses(fn() => $client->sign('other', 'diagnostic_rfq'), 'RFQ signer is restric
 check($client->transport->calls === [], 'write and malformed requests never reach the transport');
 $client->close();
 
+// Conversion source investigation: no private CSVs, ledger writes or account assumptions.
+function ledgerEntry(string $id = 'PRIVATE_LEDGER', string $at = '2022-01-01T10:00:32Z'): array
+{
+    return ['eid' => $id, 'created_at' => $at, 'operation' => 'trade',
+        'balance_updates' => [['currency' => 'xrp', 'amount' => '-8', 'address' => 'PRIVATE_ADDRESS'],
+            ['currency' => 'usd', 'amount' => '20.250000000000000000000001']],
+        'details' => ['tid' => 'PRIVATE_TRADE', 'oid' => 'PRIVATE_ORDER', 'email' => 'PRIVATE_EMAIL', 'invoice' => 'PRIVATE_INVOICE']];
+}
+$client = new ProbeClient();
+$client->transport->pages['/rfq/v1/conversions'] = [
+    ['conversions' => []], // The server-filtered query missed the conversion.
+    ['conversions' => [conversion('after', '2022-01-02T10:00:00Z'), conversion('before', '2021-01-01T10:00:00Z')], 'next_page_token' => 'PRIVATE_A'],
+    ['conversions' => [conversion(), conversion('upper-bound', '2022-01-01T10:10:00Z')], 'next_page_token' => 'PRIVATE_B'],
+    ['conversions' => [], 'next_page_token' => 'PRIVATE_C'],
+    ['conversions' => [conversion(), conversion('second', '2022-01-01T10:01:00Z')]],
+];
+$client->transport->pages['/api/v3/ledger'] = [['__http' => 404, '__body' => ['message' => 'PRIVATE_FIXTURE_SECRET PRIVATE_BODY']]];
+$client->transport->pages['/api/v3/ledger/trades'] = [page([ledgerEntry()]), page([])];
+$r = report($client, 4, 2, conversionSources: true);
+check($r['scope'] === 'conversion_sources' && !$r['history_completeness_verified']
+    && array_keys($r['sources']) === ['rfq_conversions', 'rfq_conversions_unfiltered', 'ledger', 'ledger_trades'],
+    'conversion mode checks only four explicit sources without claiming account history is complete');
+check($r['sources']['rfq_conversions']['events_in_window'] === 0 && $r['sources']['rfq_conversions_unfiltered']['events_in_window'] === 2,
+    'unfiltered RFQ can reveal in-window evidence omitted by the server-filtered response');
+check($r['sources']['rfq_conversions_unfiltered']['records_scanned'] === 6
+    && $r['sources']['rfq_conversions_unfiltered']['duplicates'] === 1
+    && $r['sources']['rfq_conversions_unfiltered']['pages_read'] === 4,
+    'unfiltered RFQ follows all tokens across empty unordered and out-of-window pages and deduplicates IDs');
+$calls = array_values(array_filter($client->transport->calls, static fn($c) => $c['path'] === '/rfq/v1/conversions'));
+check(isset($calls[0]['params']['created_at_gte'], $calls[0]['params']['created_at_lt']) && $calls[1]['params'] === ['page_size' => '2']
+    && $calls[2]['params'] === ['page_size' => '2', 'page_token' => 'PRIVATE_A']
+    && $calls[4]['params'] === ['page_size' => '2', 'page_token' => 'PRIVATE_C'],
+    'unfiltered scan starts a fresh signed query and never inherits date status or cursor filters');
+check($r['sources']['rfq_conversions']['time_filter'] === 'server_and_local'
+    && $r['sources']['rfq_conversions_unfiltered']['time_filter'] === 'local_only', 'report distinguishes server filtering from local window filtering');
+check($r['status'] === 'partial' && $r['sources']['ledger']['error']['http_status'] === 404
+    && $r['sources']['ledger_trades']['coverage'] === 'window_covered', 'ledger root 404 does not skip ledger/trades or masquerade as empty data');
+$leg = array_values(array_filter($r['timeline'], static fn($e) => $e['source'] === 'ledger_trades'))[0];
+check($leg['raw']['balance_updates'] === [['currency' => 'xrp', 'amount' => '-8'], ['currency' => 'usd', 'amount' => '20.250000000000000000000001']],
+    'raw ledger diagnostics retain both signed currency legs with full decimal precision');
+check($leg['trade_ref'] === substr(hash('sha256', 'PRIVATE_TRADE'), 0, 16)
+    && $leg['order_ref'] === substr(hash('sha256', 'PRIVATE_ORDER'), 0, 16) && $leg['imported_by_current_m3'] === false,
+    'ledger evidence exposes consistent hashed trade and order references without importing it');
+$ledgerCalls = array_values(array_filter($client->transport->calls, static fn($c) => $c['path'] === '/api/v3/ledger/trades'));
+check(count($ledgerCalls) === 2 && $ledgerCalls[0]['params'] === ['limit' => '2', 'sort' => 'desc']
+    && $ledgerCalls[1]['params']['marker'] === 'PRIVATE_LEDGER', 'short legacy ledger page is followed until an empty page or lower boundary');
+check(!str_contains(Numbers::json($r), 'PRIVATE_') && !isset($r['balances']), 'conversion source report omits credentials cursors raw identities and private details without balancing entries');
+$client->close();
+
+$client = new ProbeClient();
+$client->transport->pages['/rfq/v1/conversions'] = [['conversions' => []],
+    ['conversions' => [conversion('old', '2021-01-01T00:00:00Z')], 'next_page_token' => 'PRIVATE_NEXT']];
+$r = report($client, 1, conversionSources: true);
+check($r['sources']['rfq_conversions_unfiltered']['coverage'] === 'partial'
+    && $r['sources']['rfq_conversions_unfiltered']['error']['reason'] === 'page_budget_exhausted',
+    'unfiltered RFQ does not infer exhaustion from a short old page when a token remains');
+$client->close();
+
+foreach (['conflict', 'forward', 'malformed', 'repeat', 'fee'] as $case) {
+    $client = new ProbeClient();
+    $row = ledgerEntry();
+    $pages = [page([$row])];
+    if ($case === 'conflict') { $changed = $row; $changed['balance_updates'][1]['amount'] = '21'; $pages[] = page([$changed]); }
+    if ($case === 'forward') { $pages[] = page([ledgerEntry('later', '2022-01-01T10:01:00Z')]); }
+    if ($case === 'malformed') { $row['balance_updates'][1] = ['currency' => 'usd']; $pages = [page([$row])]; }
+    if ($case === 'fee') { $row['operation'] = 'fee'; $row['balance_updates'] = [['currency' => 'usd', 'amount' => '-0.25']]; $pages = [page([$row]), page([])]; }
+    $client->transport->pages['/api/v3/ledger/trades'] = $pages;
+    $r = report($client, 3, conversionSources: true);
+    if ($case === 'fee') {
+        check($r['timeline'][0]['raw']['operation'] === 'fee' && $r['timeline'][0]['raw']['balance_updates'][0]['amount'] === '-0.25',
+            'ledger fee remains a separate signed expense in diagnostic output');
+    } else {
+        $reason = ['conflict' => 'conflicting_identity', 'forward' => 'non_chronological_page',
+            'malformed' => 'invalid_record', 'repeat' => 'non_progressing_cursor'][$case];
+        check($r['sources']['ledger_trades']['coverage'] === 'partial' && $r['sources']['ledger_trades']['error']['reason'] === $reason,
+            'legacy ledger '.$case.' cannot claim complete window coverage');
+    }
+    $client->close();
+}
+
 // Financial regression: normalized evidence supplied in every arrival order.
 // These synthetic fills test replay, not whether a real app conversion reaches this API.
 function replay(array $sequence, string $credit, string $debit, bool $early = false, bool $missing = false): array
@@ -278,6 +358,7 @@ try {
     check($cli['exit'] === 1 && json_decode($cli['out'], true)['stage'] === 'configuration', 'CLI rejects an invalid page budget before HTTP');
     $cli = $run(['--help']);
     check($cli['exit'] === 0 && str_contains($cli['out'], 'Read only:'), 'CLI help documents the read-only scope and explicit timezone');
+    check(str_contains($cli['out'], '--conversion-sources') && str_contains($cli['out'], '10 pages per source'), 'CLI help documents bounded conversion source mode');
 } finally { unlink($config); rmdir($temp); }
 
 echo json_encode(['suite' => 'm3-bitso-history-probe', 'status' => 'passed', 'checks' => $checks,

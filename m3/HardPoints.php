@@ -75,7 +75,7 @@ final class HardPoints
                     $reasons[] = 'unresolved_inventory';
                 }
             }
-            $snapshot = $this->ledger->accountSnapshot($account);
+            $snapshot = $this->ledger->accountSnapshot($account, true);
             $baseline = Numbers::decode($snapshot['account']['hard_t0_json']);
             if (($baseline['kind'] ?? '') === 'HardH0' && $snapshot['orders'] === [] && $snapshot['operations'] === []) {
                 $reasons[] = 'no_new_financial_activity';

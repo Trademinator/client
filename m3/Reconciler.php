@@ -53,6 +53,8 @@ final class Reconciler
         if (($batch['complete'] ?? false) !== true) {
             throw new RuntimeException('Incomplete exchange snapshot.');
         }
+        // An observation is useful to review even if financial ingestion below rolls back.
+        (new TransferReviews($this->db))->observe($account, $batch);
         $result = $this->db->transaction(function () use ($account, $batch, $settings): array {
             $this->accounting->ingest($account, $batch, $settings);
             foreach ($this->accounting->rows('SELECT * FROM markets WHERE account_id=?', [$account]) as $market) {

@@ -40,6 +40,7 @@
             "@php tests/m2.php",
             "@php tests/m3.php",
             "@php tests/m3-runtime.php",
+            "@php tests/m3-transfer-labels.php",
             "@php tests/m3-transport.php",
             "@php tests/m3-sync-diagnostics.php",
             "@php tests/m3-historical-orders.php",
@@ -63,6 +64,7 @@
         "test:m3": [
             "@php tests/m3.php",
             "@php tests/m3-runtime.php",
+            "@php tests/m3-transfer-labels.php",
             "@php tests/m3-transport.php",
             "@php tests/m3-sync-diagnostics.php",
             "@php tests/m3-historical-orders.php",

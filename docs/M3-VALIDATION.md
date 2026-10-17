@@ -570,3 +570,29 @@ Validation on Linux/PHP 8.3.6 with the pinned dependency lockfile:
 This diagnostic establishes what each API returns, not whether the complete
 account can reconcile. An empty RFQ result does not disprove a historical app
 conversion; the tool never treats absence as a zero balance or an adjustment.
+
+## Provisional user-transfer review labels (schema 6)
+
+Validated against GitHub `ca2e3e76f7372d0640148fcbff2d622c28ec4154` with PHP
+8.3.6 and the unchanged Composer lockfile. All 16 M3 suites pass: 775 checks,
+including 76 checks in `tests/m3-transfer-labels.php`. The existing M1 ledger
+(31), M1 hard-point (44), and M2 storage (33) checks also pass. PHP lint,
+Composer validation, whitespace, and clean-base patch application are checked.
+The fixtures make no live exchange requests and submit no orders.
+
+The new suite covers provisional Bitso/NDAX/Coinbase classifications, exclusion
+of known external routes and other activities, redacted evidence, idempotent
+observations, account isolation, and retention through failed inventory
+validation, financial rollback and restart. It verifies that labels cannot
+change balances, confirmed fees, financial revisions or missing-inventory
+failures. Schema-5 migration publishes a recovery backup; an injected failure
+rolls back schema 6 without modifying the financial snapshot.
+
+Hard H1 still compares the original financial evidence. Hard H0 promotion keeps
+pending reviews live, new archives include optional review annotations, and
+restoring an older financial-only snapshot preserves existing local reviews.
+Archived pending proposals cannot undo an existing confirmation. Reobserving
+archived movements leaves immutable archive hashes unchanged.
+
+Confirmation and explanation screens remain part of the future UIs; no review
+action or additional exchange capability is enabled by this patch.

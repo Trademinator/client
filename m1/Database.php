@@ -11,7 +11,7 @@ use Throwable;
 /** SQLite is the durable authority; all financial writers serialize with BEGIN IMMEDIATE. */
 final class Database
 {
-    public const SCHEMA_VERSION = 5;
+    public const SCHEMA_VERSION = 6;
 
     private PDO $connection;
     private int $depth = 0;
@@ -62,6 +62,7 @@ final class Database
         $version = (int) $connection->query('SELECT COALESCE(MAX(version),0) FROM schema_migrations')->fetchColumn();
         if ($version > self::SCHEMA_VERSION) { throw new RuntimeException('Database schema is newer than this M3 release.'); }
         $expected = ['buys_vs_sells','checkpoints','exchange_accounts','markets','operations','orders','schema_migrations','signal_decisions'];
+        if ($version >= 6) { $expected[] = 'transfer_labels'; }
         if (($version >= 1 && $tables !== $expected) || ($version === 0 && $tables !== ['schema_migrations'])) { throw new RuntimeException('Unrecognized or incomplete client database schema.'); }
         if ($version >= 2) {
             $columns = array_column($connection->query('PRAGMA table_info(markets)')->fetchAll(PDO::FETCH_ASSOC), 'name');
@@ -83,6 +84,12 @@ final class Database
             $columns = array_column($connection->query('PRAGMA table_info(buys_vs_sells)')->fetchAll(PDO::FETCH_ASSOC), null, 'name');
             if (($columns['inventory_market_id']['notnull'] ?? 0) !== 1) {
                 throw new RuntimeException('Incomplete M3 currency-inventory schema.');
+            }
+        }
+        if ($version >= 6) {
+            $columns = array_column($connection->query('PRAGMA table_info(transfer_labels)')->fetchAll(PDO::FETCH_ASSOC), 'name');
+            if (array_diff(['account_id','exchange_operation_id','financial_fingerprint','label','status','evidence_json'], $columns) !== []) {
+                throw new RuntimeException('Incomplete M3 transfer-review schema.');
             }
         }
         return $version;
@@ -273,6 +280,27 @@ CREATE INDEX allocations_sell ON buys_vs_sells(sell_order_id);
 CREATE INDEX allocations_inventory_market ON buys_vs_sells(inventory_market_id);
 SQL);
                 $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(5,?)')->execute([gmdate('c')]);
+            }
+            if ($version < 6) {
+                // Review annotations survive rolled-back ingestion and financial archival.
+                // They never participate in wallet arithmetic or acquisition lot evidence.
+                $this->connection->exec(<<<'SQL'
+CREATE TABLE transfer_labels (
+ id TEXT PRIMARY KEY,
+ account_id TEXT NOT NULL REFERENCES exchange_accounts(id) ON DELETE CASCADE,
+ exchange_operation_id TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('deposit','withdrawal')),
+ currency TEXT NOT NULL, amount TEXT NOT NULL, occurred_at TEXT NOT NULL,
+ financial_fingerprint TEXT NOT NULL,
+ label TEXT NOT NULL CHECK(label IN ('user_deposit','user_withdrawal')),
+ status TEXT NOT NULL CHECK(status IN ('pending_confirmation','confirmed','explained','superseded')),
+ reason TEXT NOT NULL, evidence_json TEXT NOT NULL,
+ first_observed_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(account_id,exchange_operation_id)
+);
+CREATE INDEX transfer_labels_pending ON transfer_labels(account_id,status,occurred_at,id);
+SQL);
+                $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(6,?)')->execute([gmdate('c')]);
             }
             if (!$this->integrityCheck()['ok']) { throw new RuntimeException('M3 migration failed database integrity checks.'); }
         });

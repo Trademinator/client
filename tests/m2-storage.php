@@ -22,17 +22,39 @@ $raw = static fn(string $path): PDO => new PDO('sqlite:' . $path, null, null, [
     PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
 ]);
 $withoutM2 = static function (array $snapshot): array {
-    foreach ($snapshot['buys_vs_sells'] as &$allocation) { unset($allocation['buy_lot_key']); } unset($allocation);
+    foreach ($snapshot['buys_vs_sells'] as &$allocation) { unset($allocation['buy_lot_key'], $allocation['inventory_market_id']); } unset($allocation);
     foreach ($snapshot['markets'] as &$market) { unset($market['state'], $market['subscription_id'], $market['checks_per_candle']); }
     unset($market);
     return $snapshot;
 };
 $downgradeFixture = static function (PDO $pdo): void {
-    // Derive the exact M1 schema from the additive migration, retaining every financial row.
+    // Restore M1 allocation ownership before dropping the later additive columns.
+    $pdo->exec('DROP TABLE transfer_labels');
+    $pdo->exec(<<<'SQL'
+CREATE TABLE buys_vs_sells_v1 (
+ id TEXT PRIMARY KEY, account_id TEXT NOT NULL, market_id TEXT NOT NULL,
+ allocation_key TEXT NOT NULL, buy_order_id TEXT, buy_operation_id TEXT, baseline_lot_id TEXT,
+ sell_order_id TEXT NOT NULL, quantity TEXT NOT NULL, created_at TEXT NOT NULL,
+ CHECK((buy_order_id IS NOT NULL)+(buy_operation_id IS NOT NULL)+(baseline_lot_id IS NOT NULL)=1),
+ UNIQUE(account_id,allocation_key),
+ FOREIGN KEY(market_id,account_id) REFERENCES markets(id,account_id) ON DELETE CASCADE,
+ FOREIGN KEY(buy_order_id,account_id,market_id) REFERENCES orders(id,account_id,market_id),
+ FOREIGN KEY(buy_operation_id,account_id,market_id) REFERENCES operations(id,account_id,market_id),
+ FOREIGN KEY(sell_order_id,account_id,market_id) REFERENCES orders(id,account_id,market_id)
+);
+INSERT INTO buys_vs_sells_v1 SELECT id,account_id,market_id,allocation_key,buy_order_id,buy_operation_id,baseline_lot_id,sell_order_id,quantity,created_at FROM buys_vs_sells;
+DROP TABLE buys_vs_sells;
+ALTER TABLE buys_vs_sells_v1 RENAME TO buys_vs_sells;
+CREATE INDEX allocations_buy_order ON buys_vs_sells(buy_order_id);
+CREATE INDEX allocations_buy_operation ON buys_vs_sells(buy_operation_id);
+CREATE INDEX allocations_baseline ON buys_vs_sells(baseline_lot_id);
+CREATE INDEX allocations_sell ON buys_vs_sells(sell_order_id);
+DROP INDEX orders_account_identity;
+DROP INDEX operations_account_identity;
+SQL);
     $pdo->exec('ALTER TABLE markets DROP COLUMN state');
     $pdo->exec('ALTER TABLE markets DROP COLUMN subscription_id');
     $pdo->exec('ALTER TABLE markets DROP COLUMN checks_per_candle');
-    $pdo->exec('ALTER TABLE buys_vs_sells DROP COLUMN buy_lot_key');
     $pdo->exec('DELETE FROM schema_migrations WHERE version>=2');
 };
 

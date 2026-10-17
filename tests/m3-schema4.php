@@ -38,6 +38,7 @@ try {
     $pdo->exec(<<<'SQL'
 PRAGMA foreign_keys=OFF;
 BEGIN IMMEDIATE;
+DROP TABLE transfer_labels;
 CREATE TABLE buys_vs_sells_v3 (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL, market_id TEXT NOT NULL,
  allocation_key TEXT NOT NULL, buy_order_id TEXT, buy_operation_id TEXT, baseline_lot_id TEXT,
@@ -89,7 +90,7 @@ SQL);
 
     $db = new Database($root.'/client.sqlite');
     $ledger = new Ledger($db);
-    check(Database::schemaVersion($db->pdo()) === 5, 'existing schema 3 upgrades through schema 4 to schema 5');
+    check(Database::schemaVersion($db->pdo()) === Database::SCHEMA_VERSION, 'existing schema 3 upgrades through schema 4 to the current schema');
     check($ledger->accountSnapshot($id) === $before, 'migration preserves every financial row, ID and observation');
     check($db->integrityCheck()['ok'] && (int)$db->pdo()->query('PRAGMA foreign_keys')->fetchColumn() === 1, 'migration validates and re-enables foreign keys');
     $backups = (new Backup($db, $root))->list('pre-migration');

@@ -61,7 +61,7 @@ try {
     $ledger = new Ledger($db);
     $accounting = new Accounting($db);
     $reconciler = new Reconciler($db);
-    check(Database::SCHEMA_VERSION === 5 && $db->integrityCheck()['ok'], 'schema 5 supports inventory source ownership');
+    check(Database::schemaVersion($db->pdo()) === Database::SCHEMA_VERSION && $db->integrityCheck()['ok'], 'current schema supports inventory source ownership');
 
     // One currency can be bought in several quotes and later spent as quote.
     // These are actual exchange fills; no synthetic SELL is inserted for a BUY payment.

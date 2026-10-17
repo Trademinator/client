@@ -549,6 +549,52 @@ prefix invalidate approval. The existing manifest/activation-nonce recovery
 protocol completes or rolls back interrupted promotion after restart. Permanent
 archives remain under `hard-points/<account>/<unix-ms>/`.
 
+## Provisional user-transfer labels
+
+M3 adds a soft label to completed deposit/withdrawal records that may represent
+a transfer to or from another Bitso, NDAX or retail Coinbase user. Exchange
+support is a recognition hint, not confirmation. The classifier checks native
+transaction metadata and excludes identifiable trades, conversions, rewards,
+own-account movements and bank/blockchain routes. Where supported-exchange
+records omit routing evidence, the proposed label remains an assumption.
+Unknown nonempty route identifiers remain unclassified until documented.
+
+Each proposal is `user_deposit` or `user_withdrawal`, with
+`status: pending_confirmation`. The future UIs must let the user confirm that
+classification or explain the source/destination and correct it with an audit
+trail. This patch adds no confirmation command or UI.
+
+```bash
+php bin/client.php exchange-status --config=config.m3.local.json
+```
+
+Read `accounts.<account_id>.transfer_review`: `count`, `items`, and `truncated`.
+The status includes the oldest 100 pending items per account, with stable local
+references, exact observed amounts/currencies/times, a reason and safe evidence
+flags. It excludes raw transaction IDs, recipients, email addresses and raw API
+responses. New proposals emit `EXCHANGE_TRANSFER_REVIEW_PENDING` once when first
+recorded; repeated history does not duplicate them.
+
+The labels are durable annotations in schema 6, separate from financial
+operations. They survive restarts, an inventory-validation failure after a
+complete snapshot, and financial archival. Existing pending items are retained
+when later history omits them; richer observations never overwrite a future
+human decision. Full database backups and new hard-point archives retain the
+annotations. Older archives cannot restore annotations that were never captured,
+but restoring their financial snapshot preserves already-present local reviews.
+
+Applying this patch requires restarting the daemon. Its first database open
+performs the additive migration and creates the existing pre-migration backup.
+There are no new dependencies or account-specific settings.
+
+A soft label changes no amounts, fees, acquisition costs, lot allocations or
+readiness checks. It cannot create a missing conversion, balance adjustment,
+withdrawal, or deposit. An incomplete REST snapshot or failed withdrawal fee
+validation still fails normally; only successfully normalized, completed
+movements in a complete snapshot can receive these labels. A financially
+reconciled account may retain pending labels, while unresolved financial
+evidence continues to block new orders.
+
 ## Acceptance on your machines
 
 Local synthetic tests cannot establish the 24-hour exchange or native-toolchain
