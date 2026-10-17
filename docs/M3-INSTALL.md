@@ -95,6 +95,56 @@ same-time funding dependencies remain blocked with
 
 ## Transport and history
 
+### Inspect a missing Bitso conversion
+
+When a Bitso receipt shows a deposit, conversion or transfer that does not appear
+to fund the chronological replay, use the read-only window diagnostic:
+
+```bash
+php -d memory_limit=512M tools/m3-bitso-history-check.php \
+  --config=config.m3.local.json --account=BITSO_ACCOUNT_ID \
+  --from=2022-01-01T00:00:00Z --to=2022-01-02T00:00:00Z
+```
+
+Choose a window around the receipt's time. Both times must include an explicit
+UTC offset; the lower bound is inclusive and upper bound exclusive. The report
+uses UTC. The tool scans account-wide `/user_trades`, `/fundings` and
+`/withdrawals/` backward using exact string markers, and separately reads the
+documented [RFQ conversion history](https://docs.bitso.com/bitso-api/docs/get-rfq-conversion-history)
+using its creation-date filters and opaque page tokens. It does not require the
+historical book to remain in today's market catalog. The RFQ signer uses that
+endpoint's exact `/rfq/v1/conversions` path with the existing CCXT HMAC, HTTP and
+rate-limiting machinery; the daemon's transport is unchanged.
+
+The JSON timeline includes original currency/asset/book codes, exact decimal
+amounts, statuses and the pinned CCXT trade-parser preview. It keeps `USD`,
+`USDC` and `USDT` distinct. Trade and conversion records may describe the same
+underlying activity, so the tool never adds them together or imports them.
+It prints no raw IDs, recipient details, addresses, transaction hashes, invoices,
+signed URLs or credentials. References are short hashes. Progress goes to stderr,
+so redirecting stdout produces a JSON report suitable for sharing.
+
+Each source reports its scanned date range, page/record counts and window
+coverage. `status: partial` (exit 1) means at least one scan failed, repeated a
+cursor, exhausted its budget or exceeded 1000 matching events; useful evidence
+from other sources is retained. Request a narrower window for the output limit.
+`--max-pages=N` overrides the configured `history_max_pages` per source, with a
+maximum of 10000. Long v3 histories still require paging through newer records.
+`status: window_checked` (exit 0) only confirms coverage of the API responses:
+it does not certify complete historical exchange data or account reconciliation.
+An empty or unavailable RFQ endpoint does not establish that a legacy app
+conversion never occurred.
+
+The probe reports `history_since_ms` and flags events before that configured
+boundary, but deliberately reads the requested window regardless of the cutoff.
+It does not open the local database, inspect Hard H0, fetch public deposit prices,
+verify order lifecycle, resolve missing transfer fees or change wallet balances.
+Missing fees stay unknown. To avoid competing with daemon requests on the same
+API key, run the check with the daemon stopped. No credential or account-specific
+conversion mapping is required.
+
+### Reconciliation transport
+
 CCXT Pro is preferred independently for balances, orders, fills and ticker updates
 where supported. Private updates invalidate the prior reconciliation and trigger
 REST confirmation. REST snapshots capture free/used/total balances, order states,

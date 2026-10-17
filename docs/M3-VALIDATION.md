@@ -533,3 +533,40 @@ account's particular withdrawal. Restart and reconcile to determine whether the
 additional records supply that acquisition. If the shortfall remains, inspect
 the earlier exchange deposit/trade/conversion evidence before deciding on any
 opening inventory. No schema, dependency or account-specific mapping is added.
+
+## Bitso conversion-history diagnostic
+
+Base: GitHub `Trademinator/client` commit
+`b1974113f91a6b57d759b56e2970919dbad53ae2` (`more bitso work`). The repository's
+152 source files matched the preceding delivered patches before this update.
+
+The new `tools/m3-bitso-history-check.php` is a read-only diagnostic. It collects
+a requested time window from trades, fundings, withdrawals and RFQ conversions,
+retaining raw currency/asset distinctions and showing CCXT timestamps beside
+source timestamps. It does not change daemon reconciliation or create financial
+records. API retention and the coverage of legacy app conversions remain to be
+verified using the live report.
+
+Validation on Linux/PHP 8.3.6 with the pinned dependency lockfile:
+
+* All 15 M3 suites pass: 699 checks, including 57 new diagnostic/replay checks.
+* The real CCXT request/signing/parser path runs through an intercepted HTTP
+  transport. No exchange credentials, network requests or submitted orders.
+* Tests verify exact decimal amounts, raw USD/USDC distinctions, timezone
+  normalization, omitted private fields, source-specific errors, API cutoffs,
+  overlapping pages, equal-time boundaries and markers above PHP integer range.
+* RFQ tests verify its exact signed path/query, persistent date filters, short
+  and empty pages with continuation tokens, arbitrary response ordering, cycles,
+  unavailable endpoints and pending statuses without inventory creation.
+* Both USD and USDC deposit/trade/withdrawal fixtures reconcile in all six input
+  permutations. Future proceeds, missing conversions and currency mismatches
+  still reject the withdrawal. Successful preflight leaves the live data intact.
+* CLI checks validate timezone/page-budget errors, safe missing-credential
+  reporting and no creation of the configured local data directory.
+* The 10,000-event financial suite passes in 13.775 seconds with a 98,566,144-byte
+  peak. PHP lint, Composer validation, whitespace and clean-base patch application
+  pass.
+
+This diagnostic establishes what each API returns, not whether the complete
+account can reconcile. An empty RFQ result does not disprove a historical app
+conversion; the tool never treats absence as a zero balance or an adjustment.

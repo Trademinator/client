@@ -51,7 +51,8 @@
             "@php tests/m3-inventory-diagnostics.php",
             "@php tests/m3-pricing-progress.php",
             "@php tests/m3-bitso-transfers.php",
-            "@php tests/m3-bitso-account-history.php"
+            "@php tests/m3-bitso-account-history.php",
+            "@php tests/m3-bitso-history-probe.php"
         ],
         "lint": "@php tools/lint.php",
         "doctor": "@php bin/client.php doctor",
@@ -73,7 +74,8 @@
             "@php tests/m3-inventory-diagnostics.php",
             "@php tests/m3-pricing-progress.php",
             "@php tests/m3-bitso-transfers.php",
-            "@php tests/m3-bitso-account-history.php"
+            "@php tests/m3-bitso-account-history.php",
+            "@php tests/m3-bitso-history-probe.php"
         ]
     },
     "config": {
