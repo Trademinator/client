@@ -14,3 +14,6 @@
 /*.key
 
 /config.m3.local.json
+
+/config.m4.local.json
+/config.local.json
