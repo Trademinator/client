@@ -10,6 +10,7 @@ final class Application
     public function run(array $argv): int
     {
         $command = $argv[1] ?? 'help';
+        if (str_starts_with($command, 'paper-')) { return (new \Trademinator\Client\M4\Application())->run($argv); }
         $console = null;
         $daemon = null;
         try {

@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 $root = dirname(__DIR__);
 $failed = false;
-foreach (['src', 'm1', 'm2', 'm3', 'bin', 'native', 'tests', 'tools', 'compat'] as $directory) {
+foreach (['src', 'm1', 'm2', 'm3', 'm4', 'bin', 'native', 'tests', 'tools', 'compat'] as $directory) {
     foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root.'/'.$directory)) as $file) {
         if ($file->isFile() && $file->getExtension() === 'php') {
             $process = proc_open([PHP_BINARY, '-l', $file->getPathname()], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);

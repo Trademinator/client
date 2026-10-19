@@ -1,0 +1,29 @@
+{
+    "account": "paper-bitso",
+    "source_exchange": "bitso",
+    "execution_exchange": "bitso",
+    "reporting_currency": "USD",
+    "balances": {"USD": "1000", "ATOM": "0"},
+    "opening_lots": [],
+    "policy": "two_order",
+    "submission_delay_ms": 250,
+    "cancellation_delay_ms": 250,
+    "stale_ms": 30000,
+    "fx_max_age_ms": 86400000,
+    "markets": {
+        "ATOM/USD": {
+            "period_ms": 900000,
+            "evaluation_ms": 300000,
+            "tick_size": "0.001",
+            "amount_step": "0.000001",
+            "minimum_amount": "0.000001",
+            "minimum_cost": "1",
+            "maker_fee": "0.005",
+            "taker_fee": "0.0065",
+            "fee_asset": "quote",
+            "risk_factor": "0.25",
+            "minimum_profit": "0",
+            "volume_participation": "0.01"
+        }
+    }
+}
