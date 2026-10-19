@@ -23,7 +23,8 @@ final class TransferReviews
         if (($batch['complete'] ?? false) !== true || empty($batch['transfer_labels'])) { return; }
         $q = $this->db->pdo()->prepare('SELECT exchange FROM exchange_accounts WHERE id=?');
         $q->execute([$account]);
-        if (!in_array($q->fetchColumn(), ['bitso','ndax','coinbase'], true)) { return; }
+        $exchange = $q->fetchColumn();
+        if (!is_string($exchange) || !MovementClassifier::supportsUserTransfers($exchange)) { return; }
         $this->db->transaction(function () use ($account, $batch): void {
             foreach ($batch['operations'] ?? [] as $op) {
                 $proposal = $batch['transfer_labels'][$op['id']] ?? null;

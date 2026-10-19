@@ -11,7 +11,7 @@ use Throwable;
 /** SQLite is the durable authority; all financial writers serialize with BEGIN IMMEDIATE. */
 final class Database
 {
-    public const SCHEMA_VERSION = 6;
+    public const SCHEMA_VERSION = 7;
 
     private PDO $connection;
     private int $depth = 0;
@@ -63,6 +63,7 @@ final class Database
         if ($version > self::SCHEMA_VERSION) { throw new RuntimeException('Database schema is newer than this M3 release.'); }
         $expected = ['buys_vs_sells','checkpoints','exchange_accounts','markets','operations','orders','schema_migrations','signal_decisions'];
         if ($version >= 6) { $expected[] = 'transfer_labels'; }
+        if ($version >= 7) { $expected[] = 'movement_reviews'; sort($expected); }
         if (($version >= 1 && $tables !== $expected) || ($version === 0 && $tables !== ['schema_migrations'])) { throw new RuntimeException('Unrecognized or incomplete client database schema.'); }
         if ($version >= 2) {
             $columns = array_column($connection->query('PRAGMA table_info(markets)')->fetchAll(PDO::FETCH_ASSOC), 'name');
@@ -90,6 +91,13 @@ final class Database
             $columns = array_column($connection->query('PRAGMA table_info(transfer_labels)')->fetchAll(PDO::FETCH_ASSOC), 'name');
             if (array_diff(['account_id','exchange_operation_id','financial_fingerprint','label','status','evidence_json'], $columns) !== []) {
                 throw new RuntimeException('Incomplete M3 transfer-review schema.');
+            }
+        }
+        if ($version >= 7) {
+            $columns = array_column($connection->query('PRAGMA table_info(movement_reviews)')->fetchAll(PDO::FETCH_ASSOC), 'name');
+            if (array_diff(['account_id','source_kind','source_ref','currency','amount','at','movement_kind','direction',
+                'decision','label','status','reason','evidence_json'], $columns) !== []) {
+                throw new RuntimeException('Incomplete M3 unresolved-movement review schema.');
             }
         }
         return $version;
@@ -301,6 +309,27 @@ CREATE TABLE transfer_labels (
 CREATE INDEX transfer_labels_pending ON transfer_labels(account_id,status,occurred_at,id);
 SQL);
                 $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(6,?)')->execute([gmdate('c')]);
+            }
+            if ($version < 7) {
+                // Unexplained funding is review evidence, never an invented deposit.
+                $this->connection->exec(<<<'SQL'
+CREATE TABLE movement_reviews (
+ id TEXT PRIMARY KEY,
+ account_id TEXT NOT NULL REFERENCES exchange_accounts(id) ON DELETE CASCADE,
+ source_kind TEXT NOT NULL CHECK(source_kind IN ('inventory_shortfall','ledger_movement')), source_ref TEXT NOT NULL,
+ currency TEXT NOT NULL, amount TEXT NOT NULL, at TEXT NOT NULL,
+ movement_kind TEXT, direction TEXT CHECK(direction IN ('in','out')),
+ decision TEXT NOT NULL CHECK(decision IN ('soft_label','reject')),
+ label TEXT CHECK(label='user_deposit'),
+ status TEXT NOT NULL CHECK(status IN ('pending_confirmation','rejected','confirmed','explained','superseded')),
+ reason TEXT NOT NULL, evidence_json TEXT NOT NULL,
+ first_observed_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ CHECK((decision='soft_label' AND label IS NOT NULL AND label='user_deposit') OR (decision='reject' AND label IS NULL)),
+ UNIQUE(account_id,source_kind,source_ref,currency)
+);
+CREATE INDEX movement_reviews_pending ON movement_reviews(account_id,status,at,id);
+SQL);
+                $this->connection->prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(7,?)')->execute([gmdate('c')]);
             }
             if (!$this->integrityCheck()['ok']) { throw new RuntimeException('M3 migration failed database integrity checks.'); }
         });

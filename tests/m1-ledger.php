@@ -13,7 +13,7 @@ function runM1LedgerTests(): array
     $db = new Database(':memory:');
     $ledger = new Ledger($db);
     $assert($db->pdo()->query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")->fetchAll(PDO::FETCH_COLUMN)
-        === ['buys_vs_sells','checkpoints','exchange_accounts','markets','operations','orders','schema_migrations','signal_decisions','transfer_labels'],
+        === ['buys_vs_sells','checkpoints','exchange_accounts','markets','movement_reviews','operations','orders','schema_migrations','signal_decisions','transfer_labels'],
         'Expected financial and review tables exist.');
     $account = $ledger->createAccount('fixture', 'main', null, ['USD'=>'1000','ATOM'=>'0']);
     $market = $ledger->registerMarket($account, 'ATOM/USD', 'ATOM', 'USD', null, ['min_quantity'=>'0.01','min_notional'=>'1','reference_price'=>'10']);

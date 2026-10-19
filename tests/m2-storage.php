@@ -29,6 +29,7 @@ $withoutM2 = static function (array $snapshot): array {
 };
 $downgradeFixture = static function (PDO $pdo): void {
     // Restore M1 allocation ownership before dropping the later additive columns.
+    $pdo->exec('DROP TABLE movement_reviews');
     $pdo->exec('DROP TABLE transfer_labels');
     $pdo->exec(<<<'SQL'
 CREATE TABLE buys_vs_sells_v1 (

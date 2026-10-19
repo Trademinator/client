@@ -10,7 +10,6 @@ namespace Trademinator\Client\M3;
  */
 final class TransferLabels
 {
-    private const EXCHANGES = ['bitso', 'ndax', 'coinbase'];
     private const EXTERNAL_FIELDS = [
         'txid', 'tx_hash', 'payment_hash', 'transaction_hash', 'hash', 'TXId', 'TxId',
         'address', 'addressFrom', 'addressTo', 'tag', 'tagFrom', 'tagTo',
@@ -27,7 +26,7 @@ final class TransferLabels
     public static function suggest(string $exchange, array $row, string $kind): ?array
     {
         $exchange = strtolower($exchange);
-        if (!in_array($exchange, self::EXCHANGES, true)
+        if (!MovementClassifier::supportsUserTransfers($exchange)
             || !in_array($kind, ['deposit', 'withdrawal'], true) || ($row['status'] ?? null) !== 'ok') {
             return null;
         }

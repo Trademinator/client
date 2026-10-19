@@ -610,6 +610,7 @@ final class Ledger
             // Review annotations are optional archive material, never financial evidence.
             if ($includeTransferLabels) {
                 $snapshot['transfer_labels'] = $this->rows('SELECT * FROM transfer_labels WHERE account_id=? ORDER BY id', [$accountId]);
+                $snapshot['movement_reviews'] = $this->rows('SELECT * FROM movement_reviews WHERE account_id=? ORDER BY id', [$accountId]);
             }
             return $snapshot;
         });
@@ -628,6 +629,7 @@ final class Ledger
             // Account replacement cascades to annotations. Preserve current reviews,
             // and recover archived reviews when restoring into a fresh database.
             $labels = $this->transferLabelsForRestore($id, $snapshot['transfer_labels'] ?? []);
+            $movementReviews = $this->movementReviewsForRestore($id, $snapshot['movement_reviews'] ?? []);
             $this->execute('DELETE FROM exchange_accounts WHERE id=?', [$id]);
             $this->insert('exchange_accounts', $account);
             foreach (self::TABLES as $table) { foreach ($snapshot[$table] as $row) {
@@ -635,6 +637,7 @@ final class Ledger
                 $this->insert($table, $row);
             } }
             foreach ($labels as $row) { $this->insert('transfer_labels', $row); }
+            foreach ($movementReviews as $row) { $this->insert('movement_reviews', $row); }
             if (!$this->database->integrityCheck()['ok']) { throw new RuntimeException('Restored snapshot failed database integrity checks.'); }
             // Validate arithmetic/lot links; unknown acquisition cost is deliberately retained.
             $this->accountState($id);
@@ -678,6 +681,48 @@ final class Ledger
             $labels[$identity] = $current;
         }
         return array_values($labels);
+    }
+
+    private function movementReviewsForRestore(string $accountId, mixed $archived): array
+    {
+        if (!is_array($archived) || !array_is_list($archived)) {
+            throw new InvalidArgumentException('Invalid unresolved-movement review snapshot.');
+        }
+        $reviews = [];
+        foreach ($archived as $row) {
+            if (!is_array($row) || ($row['account_id'] ?? null) !== $accountId) {
+                throw new RuntimeException('Movement review snapshot contains another account.');
+            }
+            $sourceKind = $row['source_kind'] ?? null;
+            $sourceRef = $row['source_ref'] ?? null;
+            $currency = $row['currency'] ?? null;
+            if (!in_array($sourceKind, ['inventory_shortfall','ledger_movement'], true) || !is_string($sourceRef)
+                || !preg_match($sourceKind === 'inventory_shortfall' ? '/^[a-f0-9]{16}$/D' : '/^[a-f0-9]{64}$/D', $sourceRef)
+                || !is_string($currency)) {
+                throw new RuntimeException('Movement review snapshot has an invalid identity.');
+            }
+            self::currency($currency);
+            $identity = hash('sha256', self::json([$accountId, $sourceKind, $sourceRef, $currency]));
+            if (($row['id'] ?? null) !== $identity || isset($reviews[$identity])) {
+                throw new RuntimeException('Movement review snapshot has an invalid or duplicate identity.');
+            }
+            self::decimal($row['amount'] ?? null, true);
+            $reviews[$identity] = $row;
+        }
+        foreach ($this->rows('SELECT * FROM movement_reviews WHERE account_id=? ORDER BY id', [$accountId]) as $current) {
+            $archived = $reviews[$current['id']] ?? null;
+            if ($archived !== null && $current['source_kind'] === 'ledger_movement') {
+                foreach (['currency','amount','at','direction'] as $field) {
+                    if (($archived[$field] ?? null) !== $current[$field]) {
+                        throw new RuntimeException('Movement review snapshot conflicts with observed financial identity.');
+                    }
+                }
+            }
+            // Gap amounts and review outcomes can change with new history. Live
+            // evidence wins over old archive proposals; fresh restores use the archive.
+            $reviews[$current['id']] = $current;
+        }
+        return array_values($reviews);
     }
 
     public function installHardT0(string $accountId, array $baseline, bool $archiveRebase = false): void

@@ -228,8 +228,13 @@ try {
     try {
         $runtime->tick((int)floor(microtime(true)*1000));
         $status = $runtime->status()['accounts'][$runtimeAccount];
-        check($status['state'] === 'RECOVERING' && !$status['rest_ok'] && $status['transfer_review']['count'] === 1,
-            'runtime exposes pending review even when early inventory validation fails');
+        check($status['state'] === 'REVIEW_REQUIRED' && !$status['rest_ok']
+            && $status['warning'] === 'user_deposit_confirmation_required'
+            && ($status['last_review']['label'] ?? null) === 'user_deposit'
+            && ($status['last_review']['status'] ?? null) === 'pending_confirmation'
+            && !isset($status['last_error']) && $status['transfer_review']['count'] === 1
+            && ($status['unclassified_review']['count'] ?? 0) === 1,
+            'runtime retains the withdrawal review and soft-labels its unattributed incoming funds for confirmation');
         check($ledger->accountSnapshot($runtimeAccount)['operations'] === [],
             'runtime review capture does not bypass inventory validation or create balancing deposits');
     } finally { $runtime->close(); }
@@ -292,6 +297,7 @@ try {
     $migrationBefore = $migrationLedger->accountSnapshot($migrationAccount);
     unset($migrationLedger,$migration);
     $pdo = rawDatabase($migrationDir.'/client.sqlite');
+    $pdo->exec('DROP TABLE movement_reviews');
     $pdo->exec('DROP TABLE transfer_labels'); $pdo->exec('DELETE FROM schema_migrations WHERE version>=6');
     check(Database::schemaVersion($pdo) === 5,'migration regression starts from an exact schema-5 table set');
     $pdo->exec('PRAGMA wal_checkpoint(TRUNCATE)'); $pdo = null;
@@ -309,7 +315,7 @@ try {
     refuses(fn () => new Database($migrationDir.'/fault/client.sqlite'),'injected schema-6 migration failure aborts the upgrade');
     $pdo = rawDatabase($migrationDir.'/fault/client.sqlite');
     check(Database::schemaVersion($pdo) === 5
-        && $pdo->query("SELECT name FROM sqlite_master WHERE name='transfer_labels'")->fetchColumn() === false,
+        && $pdo->query("SELECT name FROM sqlite_master WHERE name IN ('transfer_labels','movement_reviews')")->fetchColumn() === false,
         'failed schema-6 migration rolls back its review table and migration version');
 } finally {
     unset($pdo,$migration,$restoredLedger,$restored,$reviews,$ledger,$db,$runtime,$hard,$reconciler);

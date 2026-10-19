@@ -38,6 +38,7 @@ try {
     $pdo->exec(<<<'SQL'
 PRAGMA foreign_keys=OFF;
 BEGIN IMMEDIATE;
+DROP TABLE movement_reviews;
 DROP TABLE transfer_labels;
 CREATE TABLE buys_vs_sells_v3 (
  id TEXT PRIMARY KEY, account_id TEXT NOT NULL, market_id TEXT NOT NULL,

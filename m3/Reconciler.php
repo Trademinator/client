@@ -41,11 +41,19 @@ final class Reconciler
     public function validateInventory(string $account, array $batch, array $settings): void
     {
         if (($batch['complete'] ?? false) !== true) { throw new RuntimeException('Incomplete exchange snapshot.'); }
+        $this->reviewUnclassifiedMovements($account, $batch);
         $copy = new Database(':memory:');
         (new Ledger($copy))->restoreAccountSnapshot($this->ledger->accountSnapshot($account));
         $accounting = new Accounting($copy);
-        $accounting->ingest($account, $batch, $settings);
-        $accounting->rebuild($account);
+        try {
+            $accounting->ingest($account, $batch, $settings);
+            $accounting->rebuild($account);
+        } catch (InventoryEvidenceError $error) {
+            // Keep the unresolved source for review outside the disposable ledger.
+            (new MovementReviews($this->db))->observeInventoryGap($account, $error);
+            throw $error;
+        }
+        (new MovementReviews($this->db))->resolveInventoryGaps($account);
     }
     public function apply(string $account, array $batch, array $settings): array
     {
@@ -55,57 +63,73 @@ final class Reconciler
         }
         // An observation is useful to review even if financial ingestion below rolls back.
         (new TransferReviews($this->db))->observe($account, $batch);
-        $result = $this->db->transaction(function () use ($account, $batch, $settings): array {
-            $this->accounting->ingest($account, $batch, $settings);
-            foreach ($this->accounting->rows('SELECT * FROM markets WHERE account_id=?', [$account]) as $market) {
-                $definition = $batch['markets'][$market['symbol']] ?? null;
-                if (is_array($definition)) {
-                    $quantity = Numbers::decimal($definition['limits']['amount']['min'] ?? '0');
-                    $notional = Numbers::decimal($definition['limits']['cost']['min'] ?? '0');
-                    if ($quantity !== $market['min_quantity'] || $notional !== $market['min_notional']) {
-                        $this->accounting->execute('UPDATE markets SET min_quantity=?,min_notional=? WHERE id=?', [$quantity,$notional,$market['id']]);
-                        $this->accounting->touch($account, $market['id']);
+        $this->reviewUnclassifiedMovements($account, $batch);
+        try {
+            $result = $this->db->transaction(function () use ($account, $batch, $settings): array {
+                $this->accounting->ingest($account, $batch, $settings);
+                foreach ($this->accounting->rows('SELECT * FROM markets WHERE account_id=?', [$account]) as $market) {
+                    $definition = $batch['markets'][$market['symbol']] ?? null;
+                    if (is_array($definition)) {
+                        $quantity = Numbers::decimal($definition['limits']['amount']['min'] ?? '0');
+                        $notional = Numbers::decimal($definition['limits']['cost']['min'] ?? '0');
+                        if ($quantity !== $market['min_quantity'] || $notional !== $market['min_notional']) {
+                            $this->accounting->execute('UPDATE markets SET min_quantity=?,min_notional=? WHERE id=?', [$quantity,$notional,$market['id']]);
+                            $this->accounting->touch($account, $market['id']);
+                        }
                     }
                 }
-            }
-            $this->accounting->rebuild($account);
-            // Resolve only a unique explicit clientOrderId match. Silence is never evidence of rejection.
-            foreach ($this->accounting->rows('SELECT * FROM orders WHERE account_id=?', [$account]) as $intent) {
-                $meta = Numbers::decode($intent['metadata_json']);
-                if (($meta['m3']['submission'] ?? '') !== 'uncertain') {
-                    continue;
+                $this->accounting->rebuild($account);
+                // Resolve only a unique explicit clientOrderId match. Silence is never evidence of rejection.
+                foreach ($this->accounting->rows('SELECT * FROM orders WHERE account_id=?', [$account]) as $intent) {
+                    $meta = Numbers::decode($intent['metadata_json']);
+                    if (($meta['m3']['submission'] ?? '') !== 'uncertain') {
+                        continue;
+                    }
+                    $matches = array_filter($batch['orders'], static fn ($o) => $o['client_order_id'] !== null && $o['client_order_id'] === ($meta['m3']['client_order_id'] ?? null));
+                    if (count($matches) === 1) {
+                        $confirmed = array_values($matches)[0];
+                        $meta['m3']['submission'] = 'resolved';
+                        $meta['m3']['resolved_exchange_order_id'] = $confirmed['id'];
+                        $this->accounting->execute("UPDATE orders SET status='cancelled',metadata_json=? WHERE id=?", [Numbers::json($meta),$intent['id']]);
+                        $this->accounting->touch($account, $intent['market_id']);
+                    }
                 }
-                $matches = array_filter($batch['orders'], static fn ($o) => $o['client_order_id'] !== null && $o['client_order_id'] === ($meta['m3']['client_order_id'] ?? null));
-                if (count($matches) === 1) {
-                    $confirmed = array_values($matches)[0];
-                    $meta['m3']['submission'] = 'resolved';
-                    $meta['m3']['resolved_exchange_order_id'] = $confirmed['id'];
-                    $this->accounting->execute("UPDATE orders SET status='cancelled',metadata_json=? WHERE id=?", [Numbers::json($meta),$intent['id']]);
-                    $this->accounting->touch($account, $intent['market_id']);
+                $totals = array_map(static fn ($b) => $b['total'], $batch['balances']);
+                $expected = $this->ledger->expectedBalances($account);
+                $actual = Ledger::normalizeBalances($totals);
+                $discrepancies = [];
+                foreach (array_unique(array_merge(array_keys($expected), array_keys($actual))) as $currency) {
+                    if (bccomp($expected[$currency] ?? '0', $actual[$currency] ?? '0', 24) !== 0) {
+                        $discrepancies[$currency] = ['expected' => $expected[$currency] ?? '0','actual' => $actual[$currency] ?? '0'];
+                    }
                 }
-            }
-            $totals = array_map(static fn ($b) => $b['total'], $batch['balances']);
-            $expected = $this->ledger->expectedBalances($account);
-            $actual = Ledger::normalizeBalances($totals);
-            $discrepancies = [];
-            foreach (array_unique(array_merge(array_keys($expected), array_keys($actual))) as $currency) {
-                if (bccomp($expected[$currency] ?? '0', $actual[$currency] ?? '0', 24) !== 0) {
-                    $discrepancies[$currency] = ['expected' => $expected[$currency] ?? '0','actual' => $actual[$currency] ?? '0'];
+                if ($discrepancies !== []) {
+                    return ['reconciled' => false,'discrepancies' => $discrepancies];
                 }
-            }
-            if ($discrepancies !== []) {
-                return ['reconciled' => false,'discrepancies' => $discrepancies];
-            }
-            $this->ledger->reconcileAccount($account, $totals);
-            foreach ($this->accounting->rows('SELECT id FROM markets WHERE account_id=?', [$account]) as $market) {
-                $state = $this->ledger->marketState($market['id']);
-                if ($state['open_orders'] === 0 && !$state['dust'] && $state['acquisition_cost_known'] && bccomp($state['unmatched_sell_quantity'], '0', 24) === 0) {
-                    $this->ledger->createCheckpoint($market['id']);
+                $this->ledger->reconcileAccount($account, $totals);
+                foreach ($this->accounting->rows('SELECT id FROM markets WHERE account_id=?', [$account]) as $market) {
+                    $state = $this->ledger->marketState($market['id']);
+                    if ($state['open_orders'] === 0 && !$state['dust'] && $state['acquisition_cost_known'] && bccomp($state['unmatched_sell_quantity'], '0', 24) === 0) {
+                        $this->ledger->createCheckpoint($market['id']);
+                    }
                 }
-            }
-            return ['reconciled' => true,'discrepancies' => []];
-        });
+                return ['reconciled' => true,'discrepancies' => []];
+            });
+        } catch (InventoryEvidenceError $error) {
+            // Financial ingestion has rolled back; the review must survive it.
+            (new MovementReviews($this->db))->observeInventoryGap($account, $error);
+            throw $error;
+        }
+        (new MovementReviews($this->db))->resolveInventoryGaps($account);
         return $result + ['at_ms' => $batch['at_ms'],'balances' => $batch['balances']];
+    }
+    private function reviewUnclassifiedMovements(string $account, array $batch): void
+    {
+        foreach ((new MovementReviews($this->db))->observeLedgerMovements($account, $batch) as $review) {
+            if ($review['decision'] === 'reject' && $review['status'] === 'rejected') {
+                throw new UnclassifiedMovementError($review);
+            }
+        }
     }
     /** Future execution must persist this BEFORE submitting; M3 itself never submits. */
     public function uncertain(array $intent): string

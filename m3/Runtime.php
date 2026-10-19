@@ -28,6 +28,7 @@ final class Runtime
     private Reconciler $reconciler;
     private Accounting $accounting;
     private TransferReviews $transferReviews;
+    private MovementReviews $movementReviews;
     private ?\Closure $sink;
     private \Closure $factory;
     private bool $closed = false;
@@ -39,6 +40,7 @@ final class Runtime
         $this->reconciler = new Reconciler($db);
         $this->accounting = new Accounting($db);
         $this->transferReviews = new TransferReviews($db);
+        $this->movementReviews = new MovementReviews($db);
         $this->factory = $factory === null ? static fn ($exchange, $settings, $account) => new CcxtAccount($exchange, $settings, $account) : \Closure::fromCallable($factory);
         foreach ($settings['accounts'] as $account) {
             $id = $account['account_id'];
@@ -173,6 +175,18 @@ final class Runtime
                 }
                 $this->syncs[$id]['stage'] = 'rest_snapshot';
                 $batch = await($this->clients[$id]->snapshot($context));
+                foreach ($this->movementReviews->observeLedgerMovements($id, $batch) as $review) {
+                    $changed = $review['changed'];
+                    unset($review['changed']);
+                    if (!$changed) { continue; }
+                    $rejected = $review['decision'] === 'reject';
+                    $this->emit($rejected ? 'error' : 'warning',
+                        $rejected ? 'exchange_movement_rejected' : 'exchange_user_deposit_review_pending',
+                        ['account_id' => $id] + $review,
+                        $rejected
+                            ? 'Unclassified ledger movement was rejected and red-flagged: inter-user transfer support is not established for this exchange.'
+                            : 'Unclassified ledger movement was soft-labeled user_deposit; confirmation or an explanation is pending.');
+                }
                 $previousReviews = $this->transferReviews->pending($id, 1)['count'];
                 $this->transferReviews->observe($id, $batch);
                 $pendingReviews = $this->transferReviews->pending($id, 1)['count'];
@@ -280,7 +294,7 @@ final class Runtime
                             ['account_id' => $id, 'orders' => $batch['history_only_orders']],
                             'Verified historical executions retained. Original order details and final status are unavailable.');
                     }
-                    unset($this->states[$id]['last_error']);
+                    unset($this->states[$id]['last_error'], $this->states[$id]['last_review']);
                     $this->emit($result['reconciled'] ? 'info' : 'warning', 'exchange_sync_completed', ['account_id' => $id,'reconciled' => $result['reconciled'],'discrepancies' => $result['discrepancies']], 'Exchange account synchronization completed.');
                 } catch (Throwable $error) {
                     $this->failed($id, $error);
@@ -313,6 +327,33 @@ final class Runtime
         if (self::auth($error)) {
             $this->blockAuth($id, $error, $stage);
             return;
+        }
+        if ($error instanceof InventoryEvidenceError) {
+            $review = $this->movementReviews->observeInventoryGap($id, $error);
+            if ($review !== null) {
+                unset($review['changed']);
+                $changed = ($this->states[$id]['last_review'] ?? null) !== $review;
+                $this->states[$id]['last_review'] = $review;
+                if ($review['decision'] === 'soft_label' && $review['status'] === 'pending_confirmation') {
+                    // A durable review is not a transient transport failure. Keep
+                    // checking for new history at the normal synchronization cadence.
+                    $this->states[$id]['state'] = 'REVIEW_REQUIRED';
+                    $this->states[$id]['failures'] = 0;
+                    $this->states[$id]['warning'] = 'user_deposit_confirmation_required';
+                    $this->states[$id]['due'] = (int)floor(microtime(true) * 1000) + $this->settings['sync_interval_ms'];
+                    unset($this->states[$id]['last_error']);
+                    if ($changed) {
+                        $this->emit('warning', 'exchange_user_deposit_review_pending', ['account_id' => $id] + $review,
+                            'Unclassified funding of at least '.$review['minimum_unexplained_amount'].' '.$review['currency']
+                            .' needed by '.$review['required_by'].' was soft-labeled user_deposit. Confirmation or an explanation is pending; accounting remains unverified.');
+                    }
+                    return;
+                }
+                if ($changed && $review['decision'] === 'reject' && $review['status'] === 'rejected') {
+                    $this->emit('error', 'exchange_movement_rejected', ['account_id' => $id, 'red_flag' => true] + $review,
+                        'Unclassified funding was rejected and red-flagged: inter-user transfer support is not established for this exchange.');
+                }
+            }
         }
         $failures = ++$this->states[$id]['failures'];
         $delay = min($this->settings['retry_max_ms'], $this->settings['retry_base_ms'] * (2 ** min(16, $failures - 1)));
@@ -409,6 +450,7 @@ final class Runtime
             unset($state['due']);
             $state['sync'] = $this->progressFor($id);
             $state['transfer_review'] = $this->transferReviews->pending($id);
+            $state['unclassified_review'] = $this->movementReviews->pending($id);
             if ($state['discrepancies'] !== []) {
                 $state['adjustment_token'] = $this->adjustmentToken($id, $state);
             }$state['transport'] = count(array_filter($state['ws'], static fn ($s) => $s['state'] === 'connected')) > 0 ? 'websocket_with_rest' : 'rest';

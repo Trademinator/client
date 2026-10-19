@@ -595,6 +595,70 @@ movements in a complete snapshot can receive these labels. A financially
 reconciled account may retain pending labels, while unresolved financial
 evidence continues to block new orders.
 
+## Unclassified movements and missing funding sources
+
+The fallback decision path is:
+
+1. Keep an identified deposit/withdrawal in its existing financial category.
+2. Keep an identified BUY/SELL, including a conversion, in its trade category.
+3. For an unclassified movement/source, if the exchange supports inter-user
+   transfers, soft-label it `user_deposit` with `pending_confirmation`.
+4. Otherwise reject it and raise a red flag.
+
+The supported exchange registry currently includes Bitso, NDAX and retail
+Coinbase. It is independent of CCXT's wallet/subaccount `transfer` capability.
+
+Completed unclassified entries returned by the existing ledger-history fallback
+also follow this path. Their reviews retain the observed amount, time and
+direction; recognized trade entries and transaction deposits/withdrawals keep
+their existing paths. Raw native IDs, personal fields and unrecognized category
+strings are excluded from review metadata. This adds no exchange endpoint calls.
+
+An inventory shortfall can identify an unresolved incoming source even when
+the outgoing transaction is already known. For example, a withdrawal requiring
+185 USD with no attributable USD produces a separate pending `user_deposit`
+source review on Bitso. The known withdrawal keeps its original classification.
+The 185 USD is the **minimum unexplained funding**, and the withdrawal time is
+the **required-by time**; the actual incoming amount and time remain unconfirmed.
+
+`exchange-status` exposes these records at
+`accounts.<account_id>.unclassified_review`, with `count`, `items` and
+`truncated`. The existing `transfer_review` remains the list of labels attached
+to observed completed transfers. An unresolved-source item contains:
+
+```json
+{
+  "source_kind": "inventory_shortfall",
+  "currency": "USD",
+  "minimum_unexplained_amount": "185",
+  "required_by": "2022-07-14T14:53:51.000000Z",
+  "decision": "soft_label",
+  "label": "user_deposit",
+  "status": "pending_confirmation"
+}
+```
+
+An unresolved funding gap makes the account report `REVIEW_REQUIRED` and
+`user_deposit_confirmation_required`, with the review also available as
+`last_review`. New or changed proposals emit
+`EXCHANGE_USER_DEPOSIT_REVIEW_PENDING`. Repeated identical proposals are
+deduplicated and do not increment transport-failure retries. REST history is
+checked again at the normal synchronization interval; `exchange-refresh` can
+request an earlier check. Unsupported exchanges retain the reconciliation
+failure and emit `EXCHANGE_MOVEMENT_REJECTED` with `red_flag: true`.
+
+Schema 7 preserves these reviews across restart, rollback and financial
+snapshot restoration. The existing pre-migration backup runs automatically.
+New evidence can update the missing quantity under the same review reference;
+successful inventory validation supersedes an outstanding gap review. Human
+confirmations and explanations are reserved for the future UI and are never
+silently overwritten by synchronization.
+
+The review is provisional evidence for that UI. It creates no financial deposit,
+price basis or fee. Accounting remains unverified (`rest_ok: false`) while the
+source is unexplained. Known unresolved trade dependencies, incomplete API
+captures and invalid fee evidence retain their existing validation failures.
+
 ## Acceptance on your machines
 
 Local synthetic tests cannot establish the 24-hour exchange or native-toolchain

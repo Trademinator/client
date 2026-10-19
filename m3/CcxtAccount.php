@@ -86,6 +86,7 @@ final class CcxtAccount
             $open = [];
             $operations = [];
             $transferLabels = [];
+            $unclassifiedMovements = [];
             $since = $context['since_ms'];
             $accountWide = $this->rest instanceof BitsoReadClient;
             $historySymbols = $accountWide ? [null] : $symbols;
@@ -169,10 +170,35 @@ final class CcxtAccount
             }
             if ($ledgerFallback) {
                 foreach ($this->history('fetch_ledger', null, $since) as $row) {
-                    if (($row['type'] ?? '') !== 'transaction') {
+                    $kind = MovementClassifier::safeKind($row['type'] ?? null);
+                    if (!in_array($kind, ['transaction','deposit','withdrawal'], true)) {
+                        if (($row['status'] ?? null) === 'ok'
+                            && MovementClassifier::classify($this->exchange, $kind)['decision'] !== 'recognized') {
+                            $amount = $row['amount'] ?? null;
+                            if (is_float($amount) || is_int($amount)) { $amount = abs($amount); }
+                            elseif (is_string($amount) && str_starts_with($amount, '-')) { $amount = substr($amount, 1); }
+                            $amount = Numbers::decimal($amount);
+                            if (bccomp($amount, '0', 24) <= 0) { throw new RuntimeException('Unclassified movement amount must be positive.'); }
+                            $ref = hash('sha256', Normalize::id($row['id'] ?? null));
+                            $movement = ['source_ref' => $ref, 'kind' => $kind,
+                                'currency' => Normalize::currency($row['currency'] ?? null), 'amount' => $amount,
+                                'timestamp' => Normalize::timestamp($row),
+                                'direction' => in_array($row['direction'] ?? null, ['in','out'], true) ? $row['direction'] : null];
+                            if (isset($unclassifiedMovements[$ref]) && $unclassifiedMovements[$ref] !== $movement) {
+                                throw new RuntimeException('Conflicting unclassified movement financial evidence.');
+                            }
+                            $unclassifiedMovements[$ref] = $movement;
+                        }
                         continue;
                     }
                     $direction = $row['direction'] ?? null;
+                    if (in_array($kind, ['deposit','withdrawal'], true)) {
+                        $expectedDirection = $kind === 'deposit' ? 'in' : 'out';
+                        if ($direction !== null && $direction !== $expectedDirection) {
+                            throw new RuntimeException('Ledger transfer direction conflicts with its type.');
+                        }
+                        $direction = $expectedDirection;
+                    }
                     if (!in_array($direction, ['in','out'], true)) {
                         throw new RuntimeException('Ledger transfer direction is unknown.');
                     }
@@ -220,6 +246,7 @@ final class CcxtAccount
             $at = (int)floor(microtime(true) * 1000);
             return ['at_ms' => $at,'started_at_ms' => $started,'since_ms' => $since,'balances' => $balance,'orders' => array_values($orders),'trades' => array_values($trades),
                 'operations' => array_values($operations),'transfer_labels' => $transferLabels,
+                'unclassified_movements' => array_values($unclassifiedMovements),
                 'markets' => $loaded,'quotes' => $quotes,'complete' => true,'prices' => [],'history_only_orders' => $historyOnlyCount];
         })()->then(null, function (\Throwable $error): never {
             $this->failureContexts ??= new \WeakMap();

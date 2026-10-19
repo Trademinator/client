@@ -95,6 +95,9 @@ final class SyncDiagnostics
         'Historical executions require verified fill evidence and unknown original order details.',
 
         'Invalid history page.',
+        'Unclassified movement amount must be positive.',
+        'Conflicting unclassified movement financial evidence.',
+        'Ledger transfer direction conflicts with its type.',
         'History pagination made no progress.',
         'History timestamp boundary is full; configure cursor pagination.',
         'History page budget exhausted; history is incomplete.',
@@ -229,7 +232,7 @@ final class SyncDiagnostics
 
     private static function classify(Throwable $error, string $exchange): array
     {
-        if ($error instanceof InventoryEvidenceError) {
+        if ($error instanceof InventoryEvidenceError || $error instanceof UnclassifiedMovementError) {
             return ['detail' => $error->getMessage()] + $error->diagnostic;
         }
         if ($error instanceof LightningHashError) {

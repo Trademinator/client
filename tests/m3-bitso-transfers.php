@@ -538,12 +538,16 @@ $labelRuntime = new Runtime($labelDb, $labelSettings, fn () => $labelAdapter);
 try {
     $labelRuntime->tick((int)floor(microtime(true) * 1000));
     $labelState = $labelRuntime->status()['accounts'][$labelAccount];
-    check($labelState['state'] === 'RECOVERING' && !$labelState['rest_ok']
-        && ($labelState['last_error']['reason'] ?? null) === 'inventory_shortfall'
+    check($labelState['state'] === 'REVIEW_REQUIRED' && !$labelState['rest_ok']
+        && $labelState['warning'] === 'user_deposit_confirmation_required'
+        && ($labelState['last_review']['label'] ?? null) === 'user_deposit'
+        && ($labelState['last_review']['status'] ?? null) === 'pending_confirmation'
+        && !isset($labelState['last_error'])
+        && ($labelState['unclassified_review']['count'] ?? 0) === 1
         && $labelState['transfer_review']['count'] === 1
         && $labelState['transfer_review']['items'][0]['label'] === 'user_withdrawal'
         && $labelState['transfer_review']['items'][0]['amount'] === '185',
-        'actual Bitso withdrawal keeps its pending review when early inventory validation fails');
+        'actual Bitso withdrawal retains its review and its missing acquisition receives a pending user-deposit label');
     check($labelLedger->accountSnapshot($labelAccount)['operations'] === [],
         'a missing acquisition never creates an invented user deposit or bypasses inventory validation');
 } finally { $labelRuntime->close(); }

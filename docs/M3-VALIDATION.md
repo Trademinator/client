@@ -1,5 +1,35 @@
 # M3 patch validation
 
+## Unclassified-movement decision path (schema 7)
+
+Incremental base: GitHub `Trademinator/client` main
+`5bd889e1a60ef075c1b278fa41764e32a22821a7`.
+
+Validated with PHP 8.3.6 and the unchanged dependency lockfile:
+
+* All 903 M3 checks passed, including 84 unclassified-movement checks and 13
+  schema-7 checks. The accounting suite still processes 10,000 financial events.
+* M1 ledger, M1 hard-point and M2 storage regressions passed.
+* PHP syntax, strict Composer manifest validation and whitespace checks passed.
+* Schema-6 migration preserves 32 existing transfer labels, financial records,
+  revision counters and a verified recovery backup; injected migration failure
+  leaves schema 6 intact.
+* Missing funding on a supported exchange receives a durable pending
+  `user_deposit` source review. Runtime exposes `REVIEW_REQUIRED` without
+  converting the review into inventory or repeating a transient failure.
+* Completed unclassified records fetched through the existing ledger fallback
+  follow the same classifier. Known transfers and trades retain their categories;
+  unsupported-exchange movements are rejected with a red flag even when the
+  remaining recorded balances match.
+* Repeated observations, partial history improvements, restart, rollback,
+  financial-only restoration and immutable hard-point verification are covered.
+* No exchange network requests, orders, withdrawals or transfers were submitted.
+
+User confirmation/explanation remains a future UI operation. A source label
+does not certify an account whose financial history remains incomplete.
+
+## Original M3 validation
+
 Baseline: `Trademinator/client` GitHub `main`,
 `f37294bfd53c490f6d0f9f35550995cff38e5e10`.
 GitHub HEAD was checked again before patch generation and was unchanged.

@@ -308,7 +308,7 @@ final class HardPoints
             throw new RuntimeException('Account is absent from the captured SQLite archive.');
         }
         $snapshot = ['account' => $accountRow];
-        foreach (['markets', 'orders', 'buys_vs_sells', 'operations', 'checkpoints', 'signal_decisions', 'transfer_labels'] as $table) {
+        foreach (['markets', 'orders', 'buys_vs_sells', 'operations', 'checkpoints', 'signal_decisions', 'transfer_labels', 'movement_reviews'] as $table) {
             $q = $pdo->prepare('SELECT * FROM ' . $table . ' WHERE account_id=? ORDER BY id');
             $q->execute([$account]);
             $snapshot[$table] = $q->fetchAll(PDO::FETCH_ASSOC);
@@ -424,7 +424,7 @@ final class HardPoints
     private function snapshotDigest(array $snapshot): string
     {
         // Mutable review annotations do not change the frozen financial prefix.
-        unset($snapshot['transfer_labels']);
+        unset($snapshot['transfer_labels'], $snapshot['movement_reviews']);
         foreach ($snapshot as $table => &$rows) {
             if ($table === 'account') {
                 ksort($rows);
