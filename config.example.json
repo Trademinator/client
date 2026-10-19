@@ -1,13 +1,97 @@
 {
-    "mode": "fixture",
-    "data_dir": "var",
-    "exchange": "kraken",
-    "symbol": "XRP/CAD",
-    "server_url": "",
-    "ipc_port": 17840,
-    "interval_ms": 2000,
-    "request_timeout_seconds": 10,
-    "ws_retry_seconds": 30,
-    "server_poll_seconds": 60,
-    "retention": 1000
+    "tick_ms": 100,
+    "log_level": "info",
+    "server_url": "https://server.trademinator.com",
+    "server_api_key_env": "TRADEMINATOR_API_KEY",
+    "checks_per_candle": 3,
+    "exchange": {
+        "sync_interval_ms": 60000,
+        "timeout_ms": 15000,
+        "history_limit": 100,
+        "history_max_pages": 1000,
+        "accounts": [
+            {
+                "account_id": "REPLACE_WITH_LOCAL_ACCOUNT_UUID",
+                "api_key_env": "BITSO_API_KEY",
+                "secret_env": "BITSO_API_SECRET",
+                "history_since_ms": 0,
+                "valuation_quote": "USD",
+                "currency_markets": {
+                    "ATOM": "ATOM/USD"
+                },
+                "public_price_exchanges": [
+                    "kraken"
+                ],
+                "coingecko_ids": {
+                    "ATOM": "cosmos"
+                },
+                "history_params": {
+                    "fetch_my_trades": {
+                        "mode": "backward_id",
+                        "cursor_param": "marker",
+                        "params": {
+                            "sort": "desc"
+                        }
+                    },
+                    "fetch_open_orders": {
+                        "mode": "all"
+                    },
+                    "fetch_order_trades": {
+                        "mode": "all"
+                    },
+                    "fetch_deposits": {
+                        "mode": "backward_id",
+                        "cursor_param": "marker"
+                    },
+                    "fetch_withdrawals": {
+                        "mode": "backward_id",
+                        "cursor_param": "marker"
+                    }
+                }
+            }
+        ]
+    },
+    "paper_trading": {
+        "enabled": false,
+        "run_id": "trial-01",
+        "account": "paper-bitso",
+        "source_exchange": "bitso",
+        "execution_exchange": "bitso",
+        "reporting_currency": "USD",
+        "balances": {
+            "USD": "1000",
+            "ATOM": "0"
+        },
+        "opening_lots": [],
+        "policy": "two_order",
+        "submission_delay_ms": 250,
+        "cancellation_delay_ms": 250,
+        "stale_ms": 30000,
+        "fx_max_age_ms": 86400000,
+        "markets": {
+            "ATOM/USD": {
+                "period_ms": 900000,
+                "evaluation_ms": 300000,
+                "tick_size": "0.001",
+                "amount_step": "0.000001",
+                "minimum_amount": "0.000001",
+                "minimum_cost": "1",
+                "maker_fee": "0.005",
+                "taker_fee": "0.0065",
+                "fee_asset": "quote",
+                "risk_factor": "0.25",
+                "minimum_profit": "0",
+                "volume_participation": "0.01",
+                "intelligence": {
+                    "subscription": "REPLACE_WITH_SUBSCRIPTION_UUID",
+                    "period": "15m",
+                    "family": "production",
+                    "model_id": "REPLACE_WITH_MODEL_UUID",
+                    "model_exchange": "bitso",
+                    "source": "current",
+                    "warmup": 500
+                }
+            }
+        }
+    }
 }
