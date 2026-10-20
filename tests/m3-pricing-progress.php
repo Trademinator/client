@@ -103,11 +103,15 @@ $before=$ledger->accountSnapshot($id); $runtime->tick(); $state=$runtime->status
 check($state['state']==='RECOVERING' && $state['last_error']['stage']==='inventory_validation' && $state['last_error']['reason']==='inventory_shortfall', 'runtime reports the inventory failure before starting deposit pricing');
 check($rest->calls===[] && $state['last_error']['inventory_shortfall']==='1', 'an unfunded history makes zero public candle requests and reports its shortage');
 check($before===$ledger->accountSnapshot($id) && !$state['rest_ok'], 'failed preview changes no live financial rows or readiness');
+check($state['inventory_preview']['status']==='failed' && $state['inventory_preview']['stage']==='rebuild'
+    && str_ends_with($state['inventory_preview']['path'],'.sqlite') && $state['inventory_preview']['finished_at_ms']!==null,
+    'exchange status exposes the latest inventory preview path and failure stage');
 check(!str_contains(json_encode([$state,$events]),'PRIVATE_'), 'runtime outflow events and status redact raw operation identifiers and exchange details'); $runtime->close();
 
 $rest=new PriceRest(); $rest->pending=new Deferred(); $events=[]; [$db,$ledger,$runtime,$id]=runtimeFixture($rest,$events); $now=(int)floor(microtime(true)*1000);
 $runtime->tick($now); $state=$runtime->status()['accounts'][$id];
 check($state['sync']['stage']==='deposit_pricing' && $state['sync']['pricing']['deposits_total']===2 && $state['sync']['pricing']['deposits_finished']===0, 'status shows the total deposits and completed pricing work');
+check($state['inventory_preview']['status']==='passed' && !$state['rest_ok'], 'passing inventory preview does not imply successful REST reconciliation');
 check($state['sync']['request']['operation']==='fetch_ohlcv' && $state['sync']['request']['symbol']==='BTC/USD' && $state['sync']['request']['provider']==='fixture' && $state['sync']['request']['in_flight'], 'status names the current historical provider symbol and request');
 check($state['sync']['requests_started']===2 && $state['sync']['requests_finished']===1 && !$state['rest_ok'], 'pending pricing request is counted separately and does not imply reconciliation');
 $runtime->tick($now+30001); $progress=array_values(array_filter($events,static fn($e)=>$e['event']==='exchange_sync_progress'));

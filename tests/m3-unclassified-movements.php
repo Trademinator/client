@@ -204,19 +204,24 @@ try {
         $runtime->tick($now);
         $state = $runtime->status()['accounts'][$runtimeAccount];
         check($state['state'] === 'REVIEW_REQUIRED' && !$state['rest_ok']
-            && $state['warning'] === 'user_deposit_confirmation_required',
-            'supported unknown source enters REVIEW_REQUIRED with an explicit confirmation warning');
-        check(!isset($state['last_error']) && $state['last_review']['label'] === 'user_deposit'
-            && $state['unclassified_review']['count'] === 1,
-            'runtime exposes the pending user-deposit descriptor instead of repeating an inventory error');
-        check(in_array('exchange_user_deposit_review_pending',array_column($events,'event'),true)
+            && $state['warning'] === 'exchange_history_gap',
+            'supported unknown funding enters REVIEW_REQUIRED with a history-gap warning');
+        check(!isset($state['last_error']) && $state['last_review']['label'] === null
+            && $state['last_review']['status'] === 'needs_explanation'
+            && $state['unclassified_review']['count'] === 1
+            && $state['unclassified_review']['items'][0] === $state['last_review']
+            && !str_contains(json_encode([$state,$events]), 'user_deposit')
+            && !str_contains(json_encode([$state,$events]), 'pending_confirmation'),
+            'inventory gap display never asks to confirm an observed user deposit');
+        check(in_array('exchange_history_gap',array_column($events,'event'),true)
             && !in_array('exchange_sync_failed',array_column($events,'event'),true),
-            'supported unknown source emits a review event without the generic sync-failed event');
+            'supported unknown funding emits a history-gap event without a transient sync failure');
         check(!$runtime->ready($market)['ready'] && $ledger->accountSnapshot($runtimeAccount)['operations'] === [],
             'pending explanation never authorizes trading or fabricates financial history');
         $runtime->tick($now+120000);
-        check($runtime->status()['accounts'][$runtimeAccount]['unclassified_review']['count'] === 1,
-            'repeated runtime observations retain one review identity');
+        check($runtime->status()['accounts'][$runtimeAccount]['unclassified_review']['count'] === 1
+            && count(array_filter($events,static fn(array $event): bool => $event['event'] === 'exchange_history_gap')) === 1,
+            'repeated runtime observations retain one review identity and one history-gap event');
         $runtime->tick($now+240000);
         $recovered = $runtime->status()['accounts'][$runtimeAccount];
         check($recovered['state'] === 'READY' && $recovered['rest_ok']

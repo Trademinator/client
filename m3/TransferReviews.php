@@ -7,7 +7,7 @@ namespace Trademinator\Client\M3;
 use RuntimeException;
 use Trademinator\Client\M1\Database;
 
-/** Durable review proposals, independent of the confirmed financial ledger. */
+/** Durable transfer classifications and proposals, independent of the financial ledger. */
 final class TransferReviews
 {
     private const REASONS = ['bitso_user_transfer_route', 'ndax_transfer_reference', 'coinbase_off_blockchain',
@@ -25,13 +25,18 @@ final class TransferReviews
         $q->execute([$account]);
         $exchange = $q->fetchColumn();
         if (!is_string($exchange) || !MovementClassifier::supportsUserTransfers($exchange)) { return; }
-        $this->db->transaction(function () use ($account, $batch): void {
+        $this->db->transaction(function () use ($account, $batch, $exchange): void {
             foreach ($batch['operations'] ?? [] as $op) {
                 $proposal = $batch['transfer_labels'][$op['id']] ?? null;
                 if ($proposal === null) { continue; }
                 $kind = $op['kind'] ?? null;
                 if (!in_array($kind, ['deposit','withdrawal'], true)) { throw new RuntimeException('Invalid transfer label evidence.'); }
                 $label = self::safeLabel($proposal, $kind);
+                if ($label['status'] === 'confirmed'
+                    && (strtolower($exchange) !== 'bitso' || $label['reason'] !== 'bitso_user_transfer_route'
+                        || !$label['evidence']['peer_route'])) {
+                    throw new RuntimeException('Invalid transfer label evidence.');
+                }
                 // Normalize::operation prefixes an already validated exchange ID;
                 // its full length can exceed the 200-byte raw-ID limit.
                 $identity = $op['id'];
@@ -53,18 +58,20 @@ final class TransferReviews
                 }
                 $evidence = Numbers::json($label['evidence']);
                 if ($previous !== false) {
-                    // Neither repeated observations nor future enrichment can undo a human decision.
+                    // Fresh native evidence can confirm an old suggestion. Never downgrade
+                    // an established classification or overwrite a human explanation.
                     if ($previous['status'] === 'pending_confirmation'
-                        && ($previous['reason'] !== $label['reason'] || $previous['evidence_json'] !== $evidence)) {
-                        $this->db->pdo()->prepare('UPDATE transfer_labels SET reason=?,evidence_json=?,updated_at=? WHERE id=?')
-                            ->execute([$label['reason'], $evidence, gmdate('c'), $previous['id']]);
+                        && ($previous['status'] !== $label['status'] || $previous['reason'] !== $label['reason']
+                            || $previous['evidence_json'] !== $evidence)) {
+                        $this->db->pdo()->prepare('UPDATE transfer_labels SET status=?,reason=?,evidence_json=?,updated_at=? WHERE id=?')
+                            ->execute([$label['status'], $label['reason'], $evidence, gmdate('c'), $previous['id']]);
                     }
                     continue;
                 }
                 $now = gmdate('c');
                 $this->db->pdo()->prepare('INSERT INTO transfer_labels(id,account_id,exchange_operation_id,kind,currency,amount,occurred_at,financial_fingerprint,label,status,reason,evidence_json,first_observed_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
                     ->execute([hash('sha256', Numbers::json([$account, $identity])), $account, $identity, $kind, $currency,
-                        $amount, Numbers::iso($at), $fingerprint, $label['label'], 'pending_confirmation', $label['reason'], $evidence, $now, $now]);
+                        $amount, Numbers::iso($at), $fingerprint, $label['label'], $label['status'], $label['reason'], $evidence, $now, $now]);
             }
         });
     }
@@ -72,15 +79,25 @@ final class TransferReviews
     /** A bounded, redacted projection for today's CLI and the future user interfaces. */
     public function pending(string $account, int $limit = 100): array
     {
+        return $this->projection($account, 'pending_confirmation', $limit);
+    }
+
+    public function confirmed(string $account, int $limit = 100): array
+    {
+        return $this->projection($account, 'confirmed', $limit);
+    }
+
+    private function projection(string $account, string $status, int $limit): array
+    {
         $limit = max(1, min(1000, $limit));
-        $q = $this->db->pdo()->prepare("SELECT COUNT(*) FROM transfer_labels WHERE account_id=? AND status='pending_confirmation'");
-        $q->execute([$account]);
+        $q = $this->db->pdo()->prepare('SELECT COUNT(*) FROM transfer_labels WHERE account_id=? AND status=?');
+        $q->execute([$account, $status]);
         $count = (int) $q->fetchColumn();
-        $q = $this->db->pdo()->prepare("SELECT * FROM transfer_labels WHERE account_id=? AND status='pending_confirmation' ORDER BY occurred_at,id LIMIT ".$limit);
-        $q->execute([$account]);
+        $q = $this->db->pdo()->prepare('SELECT * FROM transfer_labels WHERE account_id=? AND status=? ORDER BY occurred_at,id LIMIT '.$limit);
+        $q->execute([$account, $status]);
         $items = [];
         foreach ($q->fetchAll() as $row) {
-            $safe = self::safeLabel(['label' => $row['label'], 'status' => 'pending_confirmation',
+            $safe = self::safeLabel(['label' => $row['label'], 'status' => $row['status'],
                 'reason' => $row['reason'], 'evidence' => Numbers::decode($row['evidence_json'])], $row['kind']);
             $items[] = ['ref' => $row['id'], 'kind' => $row['kind'], 'currency' => $row['currency'],
                 'amount' => $row['amount'], 'occurred_at' => $row['occurred_at']] + $safe;
@@ -90,7 +107,8 @@ final class TransferReviews
 
     private static function safeLabel(array $proposal, string $kind): array
     {
-        if (($proposal['label'] ?? null) !== 'user_'.$kind || ($proposal['status'] ?? null) !== 'pending_confirmation'
+        if (($proposal['label'] ?? null) !== 'user_'.$kind
+            || !in_array($proposal['status'] ?? null, ['pending_confirmation', 'confirmed'], true)
             || !in_array($proposal['reason'] ?? null, self::REASONS, true) || !is_array($proposal['evidence'] ?? null)) {
             throw new RuntimeException('Invalid transfer label evidence.');
         }
@@ -102,6 +120,6 @@ final class TransferReviews
         if (!$evidence['exchange_supports_user_transfers'] || $evidence['external_evidence_present']) {
             throw new RuntimeException('Invalid transfer label evidence.');
         }
-        return ['label' => 'user_'.$kind, 'status' => 'pending_confirmation', 'reason' => $proposal['reason'], 'evidence' => $evidence];
+        return ['label' => 'user_'.$kind, 'status' => $proposal['status'], 'reason' => $proposal['reason'], 'evidence' => $evidence];
     }
 }

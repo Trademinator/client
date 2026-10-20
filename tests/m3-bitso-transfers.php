@@ -403,17 +403,19 @@ $spei->close();
 $internal = new TransferClient();
 $btRaw = ['wid' => 'synthetic-bitso-transfer', 'status' => 'complete', 'created_at' => '2023-04-12T08:09:10Z',
     'currency' => 'mxn', 'amount' => '25', 'method' => 'bt', 'network' => 'bt', 'protocol' => 'bt', 'integration' => 'bt',
-    'details' => ['recipient_name' => 'PRIVATE_PERSON', 'email' => 'PRIVATE_EMAIL', 'message' => 'PRIVATE_MESSAGE']];
-foreach (['mxn' => '25', 'brl' => '12.34', 'btc' => '0.00012345', 'atom' => '1.23456789'] as $currency => $amount) {
+    'method_name' => 'Bitso Transfer',
+    'details' => ['beneficiary_name' => 'PRIVATE_PERSON', 'email' => 'PRIVATE_EMAIL', 'notes' => 'PRIVATE_MESSAGE',
+        'origin_id' => 'PRIVATE_ORIGIN', 'phone' => null, 'refcode' => 'PRIVATE_REF', 'recipient_ref' => 'PRIVATE_RECIPIENT', 'emoji' => '']];
+foreach (['mxn' => '25', 'usd' => '7.89', 'brl' => '12.34', 'btc' => '0.00012345', 'atom' => '1.23456789'] as $currency => $amount) {
     $internal->transport->calls = [];
     $internal->transport->withdrawals = [array_replace($btRaw, ['wid' => 'internal-'.$currency, 'currency' => $currency, 'amount' => $amount])];
     $config = settings(); $config['accounts'][0]['account_id'] = 'unrelated-'.$currency;
     $internalSnapshot = snapshot($internal, $config);
     $op = $internalSnapshot['operations'][0];
     $label = $internalSnapshot['transfer_labels'][$op['id']] ?? null;
-    check(($label['label'] ?? null) === 'user_withdrawal' && $label['status'] === 'pending_confirmation'
-        && $label['reason'] === 'bitso_user_transfer_route',
-        'real Bitso adapter retains the pending user-withdrawal label after redacting raw metadata');
+    check(($label['label'] ?? null) === 'user_withdrawal' && $label['status'] === 'confirmed'
+        && $label['reason'] === 'bitso_user_transfer_route' && $label['evidence']['counterparty_present'],
+        'real Bitso adapter retains confirmed user-withdrawal evidence after redacting raw metadata');
     check($op['currency'] === strtoupper($currency) && $op['amount'] === $amount && $op['fees'] === []
         && $op['network'] === 'BT' && $op['fee_evidence']['source'] === 'bitso_transfer_contract'
         && $op['fee_evidence']['currency'] === $op['currency'],
@@ -500,6 +502,7 @@ $internal->close();
 // Exercise classification through the actual Bitso parser/redaction boundary.
 $labelClient = new TransferClient();
 $incoming = $btRaw; unset($incoming['wid']); $incoming['fid'] = 'synthetic-peer-funding';
+$incoming['details'] = ['sender_name' => 'PRIVATE_SENDER', 'sender_ref' => 'PRIVATE_REF', 'notes' => '', 'emoji' => ''];
 $labelClient->transport->fundings = [$incoming];
 $labelClient->transport->withdrawals = [$btRaw];
 $labelRows = await($labelClient->fetch_withdrawals());
@@ -508,8 +511,11 @@ check(!isset($labelRows[0]['info']) && !str_contains(json_encode($labelRows), 'P
     'Bitso transports only a safe label descriptor after removing private raw fields');
 $labelBatch = snapshot($labelClient);
 check(($labelBatch['transfer_labels']['deposit:synthetic-peer-funding']['label'] ?? null) === 'user_deposit'
+    && $labelBatch['transfer_labels']['deposit:synthetic-peer-funding']['status'] === 'confirmed'
+    && $labelBatch['transfer_labels']['deposit:synthetic-peer-funding']['evidence']['counterparty_present']
+    && $labelBatch['transfer_labels']['withdrawal:synthetic-bitso-transfer']['status'] === 'confirmed'
     && count($labelBatch['transfer_labels']) === 2,
-    'real Bitso funding and withdrawal records receive their respective directional labels');
+    'documented Bitso funding and withdrawal payloads confirm their respective directional labels');
 check(!str_contains(json_encode($labelBatch), 'PRIVATE_')
     && !isset($labelBatch['operations'][1]['m3_transfer_label'])
     && $labelBatch['operations'][1] === Normalize::operation($labelRows[0], 'withdrawal'),
@@ -534,7 +540,9 @@ $labelAccount = $labelLedger->createAccount('bitso', 'Missing acquisition with r
 $labelLedger->registerMarket($labelAccount, 'USD/EUR', 'USD', 'EUR');
 $labelSettings = settings(); $labelSettings['accounts'][0]['account_id'] = $labelAccount;
 $labelAdapter = new CcxtAccount('bitso', $labelSettings, $labelSettings['accounts'][0], $labelClient);
-$labelRuntime = new Runtime($labelDb, $labelSettings, fn () => $labelAdapter);
+$labelEvents = [];
+$labelRuntime = new Runtime($labelDb, $labelSettings, fn () => $labelAdapter,
+    function ($level, $event, $data, $message) use (&$labelEvents): void { $labelEvents[] = $event; });
 try {
     $labelRuntime->tick((int)floor(microtime(true) * 1000));
     $labelState = $labelRuntime->status()['accounts'][$labelAccount];
@@ -544,10 +552,20 @@ try {
         && ($labelState['last_review']['status'] ?? null) === 'pending_confirmation'
         && !isset($labelState['last_error'])
         && ($labelState['unclassified_review']['count'] ?? 0) === 1
-        && $labelState['transfer_review']['count'] === 1
-        && $labelState['transfer_review']['items'][0]['label'] === 'user_withdrawal'
-        && $labelState['transfer_review']['items'][0]['amount'] === '185',
-        'actual Bitso withdrawal retains its review and its missing acquisition receives a pending user-deposit label');
+        && $labelState['transfer_review']['count'] === 0
+        && $labelState['confirmed_user_transfers']['count'] === 1
+        && $labelState['confirmed_user_transfers']['items'][0]['label'] === 'user_withdrawal'
+        && $labelState['confirmed_user_transfers']['items'][0]['status'] === 'confirmed'
+        && $labelState['confirmed_user_transfers']['items'][0]['amount'] === '185',
+        'explicit Bitso withdrawal is confirmed while its missing acquisition remains a separate source review');
+    check(count(array_filter($labelEvents, fn ($event) => $event === 'exchange_user_transfers_confirmed')) === 1
+        && !in_array('exchange_transfer_review_pending', $labelEvents, true),
+        'runtime announces confirmed Bitso transfers without emitting a soft-transfer review event');
+    $labelRuntime->command('exchange-refresh', ['account' => $labelAccount]);
+    $labelRuntime->tick((int)floor(microtime(true) * 1000));
+    check(count(array_filter($labelEvents, fn ($event) => $event === 'exchange_user_transfers_confirmed')) === 1
+        && $labelRuntime->status()['accounts'][$labelAccount]['confirmed_user_transfers']['count'] === 1,
+        'repeated REST confirmation neither duplicates transfers nor repeats the confirmation announcement');
     check($labelLedger->accountSnapshot($labelAccount)['operations'] === [],
         'a missing acquisition never creates an invented user deposit or bypasses inventory validation');
 } finally { $labelRuntime->close(); }

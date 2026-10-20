@@ -217,9 +217,36 @@ attempt, not time spent exclusively in the current stage. These fields describe
 activity; they do not imply that reconciliation succeeded.
 
 Before pricing, `inventory_validation` replays quantity attribution in an isolated
-in-memory copy. It changes no live financial rows. A failed inventory check
+SQLite file on disk. It changes no live financial rows. A failed inventory check
 therefore does not wait for public price lookups before explaining its shortfall.
 The actual snapshot still passes normal reconciliation before it is accepted.
+
+The latest inventory preview for each account is retained at
+`<data_dir>/reconciliation/inventory-<account_id>.sqlite`, including on failure.
+`exchange-status` exposes its path, status (`passed` or `failed`), stage and times
+under `accounts.<account_id>.inventory_preview` after a validation attempt in the
+current process. This describes quantity validation only, not overall readiness.
+If the workspace cannot be opened, its stage is `open` and its path is null.
+Stop the daemon before inspecting or copying it: the next validation replaces
+that account's preview. A per-account lock prevents concurrent writers, and
+retries do not accumulate SQLite files. Unix directories use 0700 and files 0600.
+
+```bash
+sqlite3 -readonly "$HOME/.local/share/trademinator/client/reconciliation/inventory-YOUR_ACCOUNT_UUID.sqlite"
+```
+
+Inspect `orders` and `orders.metadata_json` (`$.m3.fills`) for executions,
+`operations` for deposits/withdrawals, and `markets` for symbols. After a rebuild
+failure, fetched rows remain in this copy even though live ingestion never ran;
+an earlier copy/ingestion failure can leave an incomplete preview. The file is
+debugging material, not a validated checkpoint or a backup to restore.
+
+Only the disposable copy disables synchronous fsync, uses an 8 MiB SQLite page
+cache and requests file-backed temporary storage. The live database retains its
+existing durability settings. Exchange batches, account snapshot arrays and
+accounting calculations still use PHP memory; this is not a total RAM limit.
+In-memory live databases used by fixtures still validate on disk, but their
+private temporary directory is removed when validation finishes.
 
 An `inventory_shortfall` reports `outflow_at`, `outflow_kind`, `outflow_currency`,
 `outflow_required`, `inventory_available`, `inventory_shortfall`, and the market
@@ -549,9 +576,39 @@ prefix invalidate approval. The existing manifest/activation-nonce recovery
 protocol completes or rolls back interrupted promotion after restart. Permanent
 archives remain under `hard-points/<account>/<unix-ms>/`.
 
-## Provisional user-transfer labels
+## Confirmed and provisional user-transfer labels
 
-M3 adds a soft label to completed deposit/withdrawal records that may represent
+Bitso's completed funding/withdrawal records with the complete native
+`method=bt`, `network=bt`, `protocol=bt`, `integration=bt` route explicitly identify
+Bitso Transfers. M3 classifies them as `user_deposit` or `user_withdrawal` with
+`status: confirmed` and `reason: bitso_user_transfer_route`. These records need
+no user confirmation of their transfer type. A counterparty reference is retained
+only as a presence flag; names, references, email, notes and other personal details
+are removed. Neither a display name alone nor an incomplete/contradictory route
+can establish this classification.
+
+This uses the existing schema and requires no new credentials, dependencies or
+account-specific mappings. After restarting the daemon, the next complete REST
+snapshot upgrades matching pending labels automatically. Their stable references,
+first observation times and financial fingerprints are retained. Human explanations
+and existing decisions are preserved. Older records outside the fetched history
+are not reclassified merely because they were absent from a response.
+
+`exchange-status` exposes these records under
+`accounts.<account_id>.confirmed_user_transfers`, with `count`, `items`, and
+`truncated`. They no longer appear in `transfer_review`. Newly confirmed records
+emit `EXCHANGE_USER_TRANSFERS_CONFIRMED`; repeated history does not repeat that
+event. The confirmation is about the transfer type, not proof of counterparty
+ownership, acquisition cost, fees or complete account history. Incoming transfers
+continue through the existing deposit-basis rules, and missing acquisition evidence
+remains a separate `unclassified_review`.
+
+The native format and history endpoints are documented in
+[Payouts via Bitso Transfer](https://docs.bitso.com/bitso-payouts-funding/docs/payout-via-bitso-transfer),
+[Listing Fundings](https://docs.bitso.com/bitso-payouts-funding/docs/fundings), and
+[Listing Withdrawals](https://docs.bitso.com/bitso-payouts-funding/docs/list-your-withdrawals).
+
+For the remaining cases, M3 adds a soft label to completed deposit/withdrawal records that may represent
 a transfer to or from another Bitso, NDAX or retail Coinbase user. Exchange
 support is a recognition hint, not confirmation. The classifier checks native
 transaction metadata and excludes identifiable trades, conversions, rewards,
@@ -583,11 +640,11 @@ human decision. Full database backups and new hard-point archives retain the
 annotations. Older archives cannot restore annotations that were never captured,
 but restoring their financial snapshot preserves already-present local reviews.
 
-Applying this patch requires restarting the daemon. Its first database open
-performs the additive migration and creates the existing pre-migration backup.
-There are no new dependencies or account-specific settings.
+When upgrading a database older than schema 6, its first open performs the
+additive migration and creates the existing pre-migration backup. Confirmed
+Bitso classifications require no further schema change.
 
-A soft label changes no amounts, fees, acquisition costs, lot allocations or
+A transfer classification changes no amounts, fees, acquisition costs, lot allocations or
 readiness checks. It cannot create a missing conversion, balance adjustment,
 withdrawal, or deposit. An incomplete REST snapshot or failed withdrawal fee
 validation still fails normally; only successfully normalized, completed
@@ -616,8 +673,9 @@ strings are excluded from review metadata. This adds no exchange endpoint calls.
 
 An inventory shortfall can identify an unresolved incoming source even when
 the outgoing transaction is already known. For example, a withdrawal requiring
-185 USD with no attributable USD produces a separate pending `user_deposit`
-source review on Bitso. The known withdrawal keeps its original classification.
+185 USD with no attributable USD produces a separate history-gap review on
+Bitso. It is not an observed user deposit. The known withdrawal keeps its
+original classification.
 The 185 USD is the **minimum unexplained funding**, and the withdrawal time is
 the **required-by time**; the actual incoming amount and time remain unconfirmed.
 
@@ -632,20 +690,27 @@ to observed completed transfers. An unresolved-source item contains:
   "currency": "USD",
   "minimum_unexplained_amount": "185",
   "required_by": "2022-07-14T14:53:51.000000Z",
-  "decision": "soft_label",
-  "label": "user_deposit",
-  "status": "pending_confirmation"
+  "decision": "review",
+  "label": null,
+  "status": "needs_explanation",
+  "reason": "historical_funding_gap"
 }
 ```
 
 An unresolved funding gap makes the account report `REVIEW_REQUIRED` and
-`user_deposit_confirmation_required`, with the review also available as
-`last_review`. New or changed proposals emit
-`EXCHANGE_USER_DEPOSIT_REVIEW_PENDING`. Repeated identical proposals are
+`exchange_history_gap`, with the review also available as `last_review`.
+New or changed gaps emit `EXCHANGE_HISTORY_GAP`; the message points to missing
+trades, conversions or earlier funding without asserting which occurred.
+Repeated identical gaps are
 deduplicated and do not increment transport-failure retries. REST history is
 checked again at the normal synchronization interval; `exchange-refresh` can
 request an earlier check. Unsupported exchanges retain the reconciliation
 failure and emit `EXCHANGE_MOVEMENT_REJECTED` with `red_flag: true`.
+
+The neutral fields above are the CLI/event presentation of existing inventory
+gap reviews, including rows stored before this change. No stored review is
+approved, deleted or converted into a financial transaction. Observed transfer
+reviews and unsupported-exchange rejections keep their existing handling.
 
 Schema 7 preserves these reviews across restart, rollback and financial
 snapshot restoration. The existing pre-migration backup runs automatically.

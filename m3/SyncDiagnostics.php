@@ -54,6 +54,12 @@ final class SyncDiagnostics
     ];
 
     private const LOCAL = [
+        'Cannot create inventory validation directory.',
+        'Cannot create inventory validation database.',
+        'Cannot lock inventory validation database.',
+        'Inventory validation is already running for this account.',
+        'Cannot reset inventory validation database.',
+        'Cannot secure inventory validation database.',
         'Bitso trade history requires unfiltered backward marker pagination.',
         'Bitso trade history is not in backward chronological order.',
         'Bitso order trade verification requires the complete unfiltered order history.',
@@ -221,7 +227,7 @@ final class SyncDiagnostics
             'm3/BitsoSpei.php', 'm3/CcxtAccount.php', 'm3/HardPoints.php', 'm3/History.php',
             'm3/HistoricalOrder.php', 'm3/LightningInvoice.php', 'm3/Lots.php',
             'm3/Normalize.php', 'm3/Numbers.php', 'm3/Prices.php', 'm3/Reconciler.php',
-            'm3/Runtime.php', 'm3/Transfers.php', 'm3/InventoryEvidenceError.php',
+            'm3/Runtime.php', 'm3/Transfers.php', 'm3/InventoryEvidenceError.php', 'm3/InventoryPreview.php',
         ] as $relative) {
             if ($error->getFile() === realpath($root.'/'.$relative) && $error->getLine() > 0) {
                 return ['source_file' => $relative, 'source_line' => $error->getLine()];

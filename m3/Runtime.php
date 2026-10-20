@@ -190,8 +190,16 @@ final class Runtime
                             : 'Unclassified ledger movement was soft-labeled user_deposit; confirmation or an explanation is pending.');
                 }
                 $previousReviews = $this->transferReviews->pending($id, 1)['count'];
+                $previousConfirmed = $this->transferReviews->confirmed($id, 1)['count'];
                 $this->transferReviews->observe($id, $batch);
                 $pendingReviews = $this->transferReviews->pending($id, 1)['count'];
+                $confirmedTransfers = $this->transferReviews->confirmed($id, 1)['count'];
+                if ($confirmedTransfers > $previousConfirmed) {
+                    $this->emit('info', 'exchange_user_transfers_confirmed', ['account_id' => $id,
+                        'new_labels' => $confirmedTransfers - $previousConfirmed, 'confirmed_labels' => $confirmedTransfers,
+                        'status' => 'confirmed'],
+                        'Exchange history explicitly identifies user transfers; their labels are confirmed.');
+                }
                 if ($pendingReviews > $previousReviews) {
                     $this->emit('info', 'exchange_transfer_review_pending', ['account_id' => $id,
                         'new_labels' => $pendingReviews - $previousReviews, 'pending_labels' => $pendingReviews,
@@ -334,20 +342,22 @@ final class Runtime
             $review = $this->movementReviews->observeInventoryGap($id, $error);
             if ($review !== null) {
                 unset($review['changed']);
-                $changed = ($this->states[$id]['last_review'] ?? null) !== $review;
-                $this->states[$id]['last_review'] = $review;
+                $display = self::reviewForDisplay($review);
+                $changed = ($this->states[$id]['last_review'] ?? null) !== $display;
+                $this->states[$id]['last_review'] = $display;
                 if ($review['decision'] === 'soft_label' && $review['status'] === 'pending_confirmation') {
                     // A durable review is not a transient transport failure. Keep
                     // checking for new history at the normal synchronization cadence.
                     $this->states[$id]['state'] = 'REVIEW_REQUIRED';
                     $this->states[$id]['failures'] = 0;
-                    $this->states[$id]['warning'] = 'user_deposit_confirmation_required';
+                    $this->states[$id]['warning'] = 'exchange_history_gap';
                     $this->states[$id]['due'] = (int)floor(microtime(true) * 1000) + $this->settings['sync_interval_ms'];
                     unset($this->states[$id]['last_error']);
                     if ($changed) {
-                        $this->emit('warning', 'exchange_user_deposit_review_pending', ['account_id' => $id] + $review,
-                            'Unclassified funding of at least '.$review['minimum_unexplained_amount'].' '.$review['currency']
-                            .' needed by '.$review['required_by'].' was soft-labeled user_deposit. Confirmation or an explanation is pending; accounting remains unverified.');
+                        $this->emit('warning', 'exchange_history_gap', ['account_id' => $id] + $display,
+                            'Imported history cannot explain at least '.$review['minimum_unexplained_amount'].' '.$review['currency']
+                            .' needed by '.$review['required_by'].'. This is a funding gap, not an observed user deposit.'
+                            .' Missing trades, conversions or earlier funding may explain it. Accounting remains unverified; new orders are blocked.');
                     }
                     return;
                 }
@@ -445,14 +455,30 @@ final class Runtime
         }
         return $progress;
     }
+    /** Present missing history separately from an observed transfer awaiting confirmation. */
+    private static function reviewForDisplay(array $review): array
+    {
+        if (($review['source_kind'] ?? null) !== 'inventory_shortfall'
+            || ($review['decision'] ?? null) !== 'soft_label'
+            || ($review['status'] ?? null) !== 'pending_confirmation') {
+            return $review;
+        }
+        // Preserve the stored review and policy; these are presentation fields only.
+        unset($review['evidence']);
+        return array_replace($review, ['decision' => 'review', 'label' => null,
+            'status' => 'needs_explanation', 'reason' => 'historical_funding_gap']);
+    }
     public function status(): array
     {
         $accounts = $this->states;
         foreach ($accounts as $id => &$state) {
             unset($state['due']);
             $state['sync'] = $this->progressFor($id);
+            if (($preview = $this->reconciler->inventoryPreview($id)) !== null) { $state['inventory_preview'] = $preview; }
             $state['transfer_review'] = $this->transferReviews->pending($id);
+            $state['confirmed_user_transfers'] = $this->transferReviews->confirmed($id);
             $state['unclassified_review'] = $this->movementReviews->pending($id);
+            $state['unclassified_review']['items'] = array_map(self::reviewForDisplay(...), $state['unclassified_review']['items']);
             if ($state['discrepancies'] !== []) {
                 $state['adjustment_token'] = $this->adjustmentToken($id, $state);
             }$state['transport'] = count(array_filter($state['ws'], static fn ($s) => $s['state'] === 'connected')) > 0 ? 'websocket_with_rest' : 'rest';

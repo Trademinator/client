@@ -84,7 +84,13 @@ foreach (['pending','failed','canceled'] as $status) {
 $peer = rawTransfer(extra:['info'=>['method'=>'bt','network'=>'bt','protocol'=>'bt','integration'=>'bt',
     'recipient'=>'PRIVATE_RECIPIENT','email'=>'PRIVATE_EMAIL','details'=>['note'=>'PRIVATE_NOTE']]]);
 $peerLabel = TransferLabels::suggest('bitso',$peer,'withdrawal');
-check(($peerLabel['reason'] ?? null) === 'bitso_user_transfer_route','Bitso native user-transfer route remains a suggestion for user confirmation');
+check(($peerLabel['reason'] ?? null) === 'bitso_user_transfer_route' && $peerLabel['status'] === 'confirmed',
+    'complete Bitso native route confirms the user-transfer classification');
+foreach (['method','network','protocol','integration'] as $field) {
+    $incompletePeer = $peer; unset($incompletePeer['info'][$field]);
+    check(TransferLabels::suggest('bitso',$incompletePeer,'withdrawal') === null,
+        'partial Bitso route missing '.$field.' cannot confirm a transfer');
+}
 $ndax = rawTransfer(extra:['info'=>['ReferenceType'=>'Transfer','Counterparty'=>'PRIVATE_COUNTERPARTY']]);
 check((TransferLabels::suggest('ndax',$ndax,'deposit')['reason'] ?? null) === 'ndax_transfer_reference',
     'NDAX transfer reference does not silently assert counterparty ownership');
@@ -119,6 +125,11 @@ check(TransferLabels::suggest('ndax',array_replace($ndax,['info'=>['ReferenceTyp
 check(!str_contains(Numbers::json([$peerLabel,TransferLabels::suggest('ndax',$ndax,'deposit')]),'PRIVATE_'),
     'label evidence contains no recipient, note or counterparty values');
 
+$explicitPeer = $peer; $explicitPeerLabel = $peerLabel;
+// Retain the original fallback/review regressions for movements without a native route.
+$peer['info'] = ['details'=>['note'=>'PRIVATE_NOTE']];
+$peerLabel = TransferLabels::suggest('bitso',$peer,'withdrawal');
+
 $root = sys_get_temp_dir().'/trademinator-transfer-labels-'.bin2hex(random_bytes(6));
 Backup::ensureDirectory($root);
 try {
@@ -128,6 +139,89 @@ try {
     $other = $ledger->createAccount('bitso','Other account');
     $s = settings($account); $a = $s['accounts'][0];
     $reviews = new TransferReviews($db);
+
+    // Upgrade existing schema-6/7 annotations using a fresh complete snapshot,
+    // without touching the independently validated financial records.
+    $confirmedAccount = $ledger->createAccount('bitso','Explicit Bitso routes');
+    $confirmedOps = []; $confirmedLabels = [];
+    foreach (['deposit','withdrawal'] as $kind) {
+        $native = array_replace($explicitPeer,['id'=>'explicit-'.$kind]);
+        $native['info']['details'] = [$kind === 'deposit' ? 'sender_ref' : 'recipient_ref'=>'PRIVATE_PARTY'];
+        $nativeOp = Normalize::operation($native,$kind);
+        $confirmedOps[] = $nativeOp;
+        $confirmedLabels[$nativeOp['id']] = TransferLabels::suggest('bitso',$native,$kind);
+    }
+    $confirmedBatch = batch($confirmedOps,$confirmedLabels);
+    $legacyBatch = $confirmedBatch;
+    foreach ($legacyBatch['transfer_labels'] as &$legacyLabel) { $legacyLabel['status'] = 'pending_confirmation'; }
+    unset($legacyLabel);
+    $reviews->observe($confirmedAccount,$legacyBatch);
+    $legacyRows = $db->pdo()->query("SELECT * FROM transfer_labels WHERE account_id='$confirmedAccount' ORDER BY id")->fetchAll();
+    $oldPendingSnapshot = $ledger->accountSnapshot($confirmedAccount,true);
+    $confirmedFinancial = $ledger->accountSnapshot($confirmedAccount);
+    $confirmedRevision = $db->revision($confirmedAccount);
+    $incompleteBatch = $confirmedBatch; $incompleteBatch['complete'] = false;
+    $reviews->observe($confirmedAccount,$incompleteBatch);
+    check($reviews->pending($confirmedAccount)['count'] === 2 && $reviews->confirmed($confirmedAccount)['count'] === 0,
+        'incomplete history cannot upgrade previously pending Bitso classifications');
+    $conflictingBatch = $confirmedBatch; $conflictingBatch['operations'][0]['amount'] = '11';
+    refuses(fn () => $reviews->observe($confirmedAccount,$conflictingBatch),
+        'confirmation refuses a changed financial identity');
+    check($reviews->pending($confirmedAccount)['count'] === 2,
+        'a conflicting confirmation leaves the pending evidence untouched');
+    $reviews->observe($confirmedAccount,$confirmedBatch);
+    $confirmedProjection = $reviews->confirmed($confirmedAccount);
+    $confirmedKinds = array_column($confirmedProjection['items'],'label','kind'); ksort($confirmedKinds);
+    check($reviews->pending($confirmedAccount)['count'] === 0 && $confirmedProjection['count'] === 2
+        && array_unique(array_column($confirmedProjection['items'],'status')) === ['confirmed']
+        && $confirmedKinds === ['deposit'=>'user_deposit','withdrawal'=>'user_withdrawal'],
+        'fresh Bitso evidence upgrades both directions and removes them from the pending queue');
+    $confirmedRows = $db->pdo()->query("SELECT * FROM transfer_labels WHERE account_id='$confirmedAccount' ORDER BY id")->fetchAll();
+    foreach ($confirmedRows as $index=>$row) {
+        check(array_intersect_key($row,array_flip(['id','financial_fingerprint','first_observed_at','amount','currency','occurred_at']))
+            === array_intersect_key($legacyRows[$index],array_flip(['id','financial_fingerprint','first_observed_at','amount','currency','occurred_at'])),
+            'confirmation retains original review identity and financial evidence for '.$row['kind']);
+    }
+    check($ledger->accountSnapshot($confirmedAccount) === $confirmedFinancial && $db->revision($confirmedAccount) === $confirmedRevision,
+        'confirming a transfer classification creates no financial inventory or revision');
+    check(!str_contains(Numbers::json($confirmedProjection),'PRIVATE_')
+        && !str_contains(Numbers::json($confirmedProjection),'explicit-deposit')
+        && $confirmedProjection['items'][0]['evidence']['counterparty_present'],
+        'confirmed projection retains only a counterparty-presence flag and safe evidence');
+    $confirmedLimited = $reviews->confirmed($confirmedAccount,1);
+    check($confirmedLimited['count'] === 2 && count($confirmedLimited['items']) === 1 && $confirmedLimited['truncated'],
+        'confirmed transfers expose bounded status items and the complete count');
+    $reviews->observe($confirmedAccount,$confirmedBatch);
+    $reviews->observe($confirmedAccount,$legacyBatch);
+    check($db->pdo()->query("SELECT * FROM transfer_labels WHERE account_id='$confirmedAccount' ORDER BY id")->fetchAll() === $confirmedRows,
+        'replay and weaker subsequent evidence cannot downgrade or duplicate confirmed transfers');
+    $ledger->restoreAccountSnapshot($oldPendingSnapshot);
+    check($reviews->confirmed($confirmedAccount) === $confirmedProjection,
+        'restoring an older pending snapshot preserves exchange-confirmed classifications');
+    $confirmedRestore = new Database(':memory:');
+    (new Ledger($confirmedRestore))->restoreAccountSnapshot($ledger->accountSnapshot($confirmedAccount,true));
+    check((new TransferReviews($confirmedRestore))->confirmed($confirmedAccount) === $confirmedProjection,
+        'confirmed classifications survive a full snapshot restore');
+    $otherExchange = $ledger->createAccount('ndax','No implicit confirmation');
+    refuses(fn () => $reviews->observe($otherExchange,$confirmedBatch),
+        'Bitso confirmation evidence cannot confirm another exchange');
+    $invalidConfirmation = $confirmedBatch;
+    $invalidConfirmation['transfer_labels']['deposit:explicit-deposit']['evidence']['peer_route'] = false;
+    refuses(fn () => $reviews->observe($confirmedAccount,$invalidConfirmation),
+        'automatic confirmation requires explicit peer-route evidence');
+    $invalidConfirmation['transfer_labels']['deposit:explicit-deposit'] = array_replace($peerLabel,['label'=>'user_deposit','status'=>'confirmed']);
+    refuses(fn () => $reviews->observe($confirmedAccount,$invalidConfirmation),
+        'a missing-route guess cannot be persisted as an exchange confirmation');
+    foreach (['confirmed','explained','superseded'] as $humanStatus) {
+        $humanAccount = $ledger->createAccount('bitso','Prior human decision '.$humanStatus);
+        $reviews->observe($humanAccount,$legacyBatch);
+        $db->pdo()->prepare('UPDATE transfer_labels SET status=? WHERE account_id=?')->execute([$humanStatus,$humanAccount]);
+        $humanRows = $db->pdo()->query("SELECT * FROM transfer_labels WHERE account_id='$humanAccount' ORDER BY id")->fetchAll();
+        $reviews->observe($humanAccount,$confirmedBatch);
+        check($db->pdo()->query("SELECT * FROM transfer_labels WHERE account_id='$humanAccount' ORDER BY id")->fetchAll() === $humanRows,
+            'native confirmation preserves a prior '.$humanStatus.' decision');
+    }
+
     $op = Normalize::operation($peer,'withdrawal');
     $suggested = batch([$op],[$op['id']=>$peerLabel],['USD'=>'89.75']);
 
@@ -283,11 +377,19 @@ try {
     check(hash_file('sha256',$archivePath.'/hard.json') === $hardHash
         && hash_file('sha256',$archivePath.'/archive.sqlite') === $sqliteHash && $db->revision($account) === $revision,
         'reobserving an archived movement preserves Hard H0 files and financial revision');
+    $archivedConfirmation = $suggested;
+    $archivedConfirmation['transfer_labels'][$op['id']] = $explicitPeerLabel;
+    $reviews->observe($account,$archivedConfirmation);
+    check($reviews->pending($account)['count'] === 0 && $reviews->confirmed($account)['count'] === 1
+        && hash_file('sha256',$archivePath.'/hard.json') === $hardHash
+        && hash_file('sha256',$archivePath.'/archive.sqlite') === $sqliteHash && $db->revision($account) === $revision,
+        'confirming a reobserved archived transfer updates only the live annotation and preserves Hard H0 hashes');
     unset($runtime,$runtimeAdapter,$adapter,$ledgerAdapter,$hard,$reconciler,$reviews,$ledger,$db);
     $db = new Database($root.'/client.sqlite'); $reviews = new TransferReviews($db);
-    check($reviews->pending($account)['count'] === 1 && $reviews->pending($failed)['count'] === 1
+    check($reviews->confirmed($account)['count'] === 1 && $reviews->confirmed($confirmedAccount)['count'] === 2
+        && $reviews->pending($failed)['count'] === 1
         && $reviews->pending($runtimeAccount)['count'] === 1,
-        'archived and financially rejected reviews all survive daemon restart');
+        'confirmed transfers and financially rejected reviews all survive daemon restart');
     check($db->integrityCheck()['ok'],'review retention and financial archival preserve database integrity');
 
     // Upgrade exactly schema 5, with a verified backup and an injected rollback case.

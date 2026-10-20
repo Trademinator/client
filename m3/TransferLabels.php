@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace Trademinator\Client\M3;
 
 /**
- * Provisional presentation metadata only; never creates or changes a financial event.
- * Suggestions establish neither counterparty ownership, fees, cost basis nor history completeness.
+ * Transfer classification metadata only; never creates or changes a financial event.
+ * A confirmed route establishes neither ownership, fees, cost basis nor history completeness.
  */
 final class TransferLabels
 {
@@ -72,9 +72,10 @@ final class TransferLabels
         $coinbaseRoute = $exchange === 'coinbase'
             && in_array(self::category($raw['type'] ?? null), ['send', 'receive'], true)
             && self::category($network['status'] ?? null) === 'off_blockchain';
-        $counterparty = $exchange === 'ndax'
-            ? self::identityPresent($raw['Counterparty'] ?? null)
-            : ($exchange === 'coinbase' && self::coinbaseUser($raw));
+        $counterparty = $exchange === 'bitso'
+            ? self::identityPresent($raw['details'][$kind === 'deposit' ? 'sender_ref' : 'recipient_ref'] ?? null)
+            : ($exchange === 'ndax' ? self::identityPresent($raw['Counterparty'] ?? null)
+            : ($exchange === 'coinbase' && self::coinbaseUser($raw)));
         $ndaxRoute = $exchange === 'ndax'
             && self::category($raw['ReferenceType'] ?? null) === 'transfer' && $counterparty;
         if ($exchange === 'ndax' && self::category($raw['ReferenceType'] ?? null) === 'transfer'
@@ -136,7 +137,9 @@ final class TransferLabels
             : ($internal ? 'exchange_internal_flag' : 'supported_exchange_without_external_evidence')));
         return [
             'label' => $kind === 'deposit' ? 'user_deposit' : 'user_withdrawal',
-            'status' => 'pending_confirmation',
+            // The complete native bt route explicitly identifies a Bitso Transfer.
+            // Missing-route fallbacks and other exchanges retain their review policy.
+            'status' => $bitsoRoute ? 'confirmed' : 'pending_confirmation',
             'reason' => $reason,
             'evidence' => [
                 'exchange_supports_user_transfers' => true,

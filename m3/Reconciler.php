@@ -12,6 +12,7 @@ final class Reconciler
 {
     private Accounting $accounting;
     private Ledger $ledger;
+    private array $inventoryPreviews = [];
     public function __construct(private Database $db)
     {
         $this->accounting = new Accounting($db);
@@ -42,19 +43,38 @@ final class Reconciler
     {
         if (($batch['complete'] ?? false) !== true) { throw new RuntimeException('Incomplete exchange snapshot.'); }
         $this->reviewUnclassifiedMovements($account, $batch);
-        $copy = new Database(':memory:');
-        (new Ledger($copy))->restoreAccountSnapshot($this->ledger->accountSnapshot($account));
-        $accounting = new Accounting($copy);
+        $preview = null;
+        $this->inventoryPreviews[$account] = ['path' => null, 'status' => 'running',
+            'stage' => 'open', 'started_at_ms' => (int)floor(microtime(true) * 1000),
+            'finished_at_ms' => null];
+        $passed = false;
         try {
+            $preview = new InventoryPreview($this->db, $account);
+            $this->inventoryPreviews[$account]['path'] = $preview->path;
+            $this->inventoryPreviews[$account]['stage'] = 'copy_account';
+            $copy = $preview->database();
+            (new Ledger($copy))->restoreAccountSnapshot($this->ledger->accountSnapshot($account));
+            $accounting = new Accounting($copy);
+            $this->inventoryPreviews[$account]['stage'] = 'ingest';
             $accounting->ingest($account, $batch, $settings);
+            $this->inventoryPreviews[$account]['stage'] = 'rebuild';
             $accounting->rebuild($account);
+            $this->inventoryPreviews[$account]['stage'] = 'resolve_reviews';
+            (new MovementReviews($this->db))->resolveInventoryGaps($account);
+            $passed = true;
+            $this->inventoryPreviews[$account]['stage'] = 'complete';
         } catch (InventoryEvidenceError $error) {
             // Keep the unresolved source for review outside the disposable ledger.
             (new MovementReviews($this->db))->observeInventoryGap($account, $error);
             throw $error;
+        } finally {
+            $this->inventoryPreviews[$account]['status'] = $passed ? 'passed' : 'failed';
+            $this->inventoryPreviews[$account]['finished_at_ms'] = (int)floor(microtime(true) * 1000);
+            unset($accounting, $copy);
+            $preview?->close();
         }
-        (new MovementReviews($this->db))->resolveInventoryGaps($account);
     }
+    public function inventoryPreview(string $account): ?array { return $this->inventoryPreviews[$account] ?? null; }
     public function apply(string $account, array $batch, array $settings): array
     {
         $this->invalidate($account);

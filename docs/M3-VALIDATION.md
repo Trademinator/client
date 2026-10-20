@@ -1,5 +1,30 @@
 # M3 patch validation
 
+## Explicit Bitso user-transfer classifications
+
+Incremental base: GitHub `Trademinator/client` main
+`14cd2ac87fc48cc66ea90c84b17384ddebc19c72` (includes the current M4 work).
+
+Validated with PHP 8.3.6 and the unchanged dependency lockfile:
+
+* All 931 M3 checks and 131 M4 checks passed; the accounting suite includes
+  10,000 financial events. PHP syntax, strict Composer validation and whitespace
+  checks passed.
+* Native Bitso `fundings` and `withdrawals` payloads with the complete `bt` route
+  produce confirmed directional labels before private response fields are removed.
+  Tests use synthetic identities and counterparties, not personal payload data.
+* Old pending labels upgrade in place only after a complete matching observation.
+  Incomplete snapshots and conflicting financial identities cannot confirm them.
+  Confirmed labels survive restart, replay and restoration of an older snapshot.
+* Human decisions remain intact. Confirming a label does not alter financial
+  operations, balances, fees, revisions, or immutable Hard H0 archive hashes.
+* Runtime exposes `confirmed_user_transfers` separately from `transfer_review`
+  and announces new confirmations once. Missing acquisition evidence remains in
+  the independent source-review workflow and cannot fabricate an incoming deposit.
+* Partial/conflicting routes, external transfers and other exchanges retain their
+  existing behavior. No dependency or database schema change is required.
+* Tests made no exchange network requests and submitted no orders or transfers.
+
 ## Unclassified-movement decision path (schema 7)
 
 Incremental base: GitHub `Trademinator/client` main
