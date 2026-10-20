@@ -38,7 +38,7 @@ and transport counters before calling a validation successful.
 
 ## Public exchange and Server API probe
 
-Copy `config.example.json` to `config.local.json`. Set `mode` to `live`. The
+Copy `config.m0.example.json` to `config.local.json`. Set `mode` to `live`. The
 initial exchange/symbol is Kraken `XRP/CAD`; change it to a market supported by
 your installed CCXT version. No exchange API key is used.
 

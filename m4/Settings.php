@@ -18,7 +18,9 @@ final class Settings
         } unset($balance);
         foreach($v['markets'] as $symbol=>&$m) {
             if(!preg_match('/^[A-Z0-9]{1,16}\/[A-Z0-9]{1,16}$/D',$symbol)) { throw new InvalidArgumentException('Only exact spot base/quote pairs are supported.'); }
-            foreach(['tick_size','amount_step','minimum_amount','minimum_cost'] as $k) { $m[$k]=Decimal::value($m[$k]??null,true); }
+            foreach(['tick_size','amount_step','minimum_amount'] as $k) { $m[$k]=Decimal::value($m[$k]??null,true); }
+            $m['minimum_cost']=Decimal::value($m['minimum_cost']??null);
+            foreach(['maximum_amount','maximum_cost','minimum_price','maximum_price'] as $k) { if(isset($m[$k])) { $m[$k]=Decimal::value($m[$k],true); } }
             foreach(['maker_fee'=>'0.001','taker_fee'=>'0.002','risk_factor'=>'0.25','minimum_profit'=>'0','volume_participation'=>'0.01'] as $k=>$default) {
                 $m[$k]=Decimal::value($m[$k]??$default);
                 if(Decimal::cmp($m[$k],'1')>=0 && $k!=='risk_factor' || Decimal::cmp($m[$k],'1')>0) { throw new InvalidArgumentException('Invalid '.$k); }
@@ -26,7 +28,7 @@ final class Settings
             if(Decimal::cmp($m['risk_factor'],'0.01')<0 || Decimal::cmp($m['volume_participation'],'0')<=0) { throw new InvalidArgumentException('Invalid risk or participation.'); }
             if(Decimal::cmp($m['maker_fee'],$m['taker_fee'])>0) { throw new InvalidArgumentException('Maker fee cannot exceed conservative taker reservation.'); }
             $m['fee_asset']??='quote';
-            if(!in_array($m['fee_asset'],['base','quote'],true)) { throw new InvalidArgumentException('fee_asset must be base or quote.'); }
+            if(!in_array($m['fee_asset'],['base','quote','get','give'],true)) { throw new InvalidArgumentException('fee_asset must be base, quote, get or give.'); }
             foreach(['period_ms'=>60000,'evaluation_ms'=>20000] as $k=>$default) {
                 $m[$k]??=$default;
                 if(!is_int($m[$k]) || $m[$k]<1000 || $m[$k]>2592000000) { throw new InvalidArgumentException('Invalid '.$k); }

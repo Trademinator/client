@@ -74,7 +74,7 @@ php bin/client.php init "--config=$M1Config" "--data-dir=$M1Data"
 php bin/client.php run "--config=$M1Config" "--data-dir=$M1Data" --seconds=60
 ```
 
-Use `config.m1.example.json`, not M0's `config.example.json`. Backups have a fixed daily/every-1,000-completed-trades policy; do not add invented backup timing fields. Configuration controls daemon polling and logging. CLI `--data-dir` selects the explicit data directory for every command.
+Use the unified `config.example.json` for the current Client; `config.m1.example.json` remains a minimal local-core template. M0's probe template is `config.m0.example.json`. Backups have a fixed daily/every-1,000-completed-trades policy; do not add invented backup timing fields. Configuration controls daemon polling and logging. CLI `--data-dir` selects the explicit data directory for every command.
 
 The active database is `client.sqlite`; runtime control files are in `runtime/`, logs in `logs/`, backups in `backups/`, and complete hard-point archives in `hard-points/`. Keep the entire data directory when upgrading. Do not remove `runtime/daemon.lock` to bypass a running-process error.
 

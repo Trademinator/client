@@ -8,18 +8,32 @@ use Trademinator\Client\M1\EventRecord;
 
 final class Live
 {
-    public static function run(Store $store,string $run,Server $server,int $seconds,ConsoleEvents $console,?callable $feedFactory=null): array
+    public static function run(Store $store,string $run,Server $server,int $seconds,ConsoleEvents|callable $console,?callable $feedFactory=null,?callable $keepRunning=null): array
     {
-        $initial=$store->run($run);$c=$initial['config'];$feeds=[];$end=microtime(true)+$seconds;$next=[];$fxNext=[];$cursors=[];$seen=[];$gapped=[];
+        $initial=$store->run($run);$c=$initial['config'];PaperConfig::live($c);
+        $lock=$store->acquireLiveLock($run);$execution=null;$source=null;
+        $end=$seconds===0?INF:microtime(true)+$seconds;$next=[];$fxNext=[];$cursors=[];$seen=[];$gapped=[];
         $feedFactory??=static fn(string $exchange):object=>new LiveFeed($exchange);
-        $execution=$feedFactory($c['execution_exchange']);$source=$c['source_exchange']===$c['execution_exchange']?$execution:$feedFactory($c['source_exchange']);
-        foreach($c['markets'] as $s=>$m) { $execution->market($s);$source->market($s); }
-        $emit=static function(string $level,string $name,array $data)use($console,$run):void { $console->write(EventRecord::create($level,$name,$data,$run)); };
-        $apply=static function(array $event)use($store,$run):array { $event['id']??='live-'.bin2hex(random_bytes(12));return $store->apply($run,$event); };
+        $emit=static function(string $level,string $name,array $data)use($console,$run):void {
+            $record=EventRecord::create($level,$name,$data,$run);
+            if($console instanceof ConsoleEvents) { $console->write($record); } else { $console($record); }
+        };
+        $apply=static function(array $event)use($store,$run,$keepRunning):array {
+            if($keepRunning!==null && !$keepRunning()) { throw new RuntimeException('Paper session stopped.'); }
+            $event['id']??='live-'.bin2hex(random_bytes(12));return $store->apply($run,$event);
+        };
         try {
-            while(microtime(true)<$end) {
+            $c = $store->resolve($run, static function (array $settings) use ($server, $keepRunning): array {
+                $resolved = IntelligenceSetup::resolve($settings, $server);
+                if ($keepRunning !== null && !$keepRunning()) { throw new RuntimeException('Paper session stopped during intelligence discovery.'); }
+                return $resolved;
+            });
+            $execution=$feedFactory($c['execution_exchange']);$source=$c['source_exchange']===$c['execution_exchange']?$execution:$feedFactory($c['source_exchange']);
+            foreach($c['markets'] as $s=>$m) { $execution->market($s);$source->market($s); }
+            while(microtime(true)<$end && ($keepRunning===null || $keepRunning())) {
                 foreach($c['markets'] as $symbol=>$m) {
                     try {
+                        if($keepRunning!==null && !$keepRunning()) { break 2; }
                         $started=(int)floor(microtime(true)*1000);
                         if($started>=($next[$symbol]??0)) {
                             $apply(['type'=>'evaluate','time_ms'=>$started,'symbol'=>$symbol,'action'=>'hold','expires_at_ms'=>$started+$m['evaluation_ms'],'intelligence'=>['reason'=>'evaluation_cancel_before_refresh']]);
@@ -70,6 +84,7 @@ final class Live
                         }
                         $emit('info','paper_market_event',['symbol'=>$symbol,'transport'=>$book['transport'],...$result]);
                     } catch(\Throwable $error) {
+                        if($keepRunning!==null && !$keepRunning()) { break 2; }
                         $now=(int)floor(microtime(true)*1000);
                         if(!($gapped[$symbol]??false)) { $apply(['type'=>'gap','time_ms'=>$now,'symbol'=>$symbol,'from_ms'=>$store->run($run)['state']['books'][$symbol]['time_ms']??$now,'reason'=>'live_data_or_inference_unavailable']);$gapped[$symbol]=true; }
                         $emit('warning','paper_paused',['symbol'=>$symbol,'message'=>$error->getMessage()]);
@@ -77,7 +92,7 @@ final class Live
                 }
                 usleep(500000);
             }
-        } finally { $execution->close();if($source!==$execution) { $source->close(); } }
+        } finally { $execution?->close();if($source!==$execution) { $source?->close(); }flock($lock,LOCK_UN);fclose($lock); }
         return Report::build($store->run($run));
     }
 }

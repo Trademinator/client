@@ -1,67 +1,135 @@
-# M4 — paper execution and replay
+# M4 — automatic Client setup, paper execution and replay
 
-Client base: `f1d0c3ac57c9ecc52740da69d588942350bd4f25`.
-Server base: `ce5668d1902d7a1d3dc1758f22f22888fb891fb3`.
-
-Apply the corresponding patch from each repository root:
+This incremental follow-up targets the Client with the original M4 patch and
+`trademinator-client-m4-unified-config.patch` already applied. It also applies
+on top of Client commit `965ae393c024de5d4708021743a560898caf1b0c` with those
+unified daemon/configuration changes installed locally.
+Use it instead of `trademinator-client-auto-setup.patch` on this baseline;
+there is no need to reverse the earlier unified-config patch.
+The already-applied M4 Server API is sufficient; no new Server patch is needed.
 
 ```bash
-git apply --check /path/to/trademinator-client-m4.patch
-git apply /path/to/trademinator-client-m4.patch
+git apply --check /path/to/trademinator-client-auto-setup-incremental.patch
+git apply /path/to/trademinator-client-auto-setup-incremental.patch
 composer dump-autoload
 php -d memory_limit=512M tests/m4.php
-php -d memory_limit=512M bin/client.php paper-help
+php -d memory_limit=512M tests/m4-config.php
+php -d memory_limit=512M tests/m4-discovery.php
 ```
 
-On the Server:
+## Credentials are the required input
+
+`config.example.json` is the canonical minimal template:
+
+```json
+{
+    "server_api_key_env": "TRADEMINATOR_API_KEY",
+    "exchange": {
+        "accounts": [
+            {
+                "exchange": "bitso",
+                "api_key_env": "BITSO_API_KEY",
+                "secret_env": "BITSO_API_SECRET"
+            }
+        ]
+    },
+    "paper_trading": { "enabled": true }
+}
+```
+
+Copy it to `config.local.json`. Set the values of those environment variables to
+your keys; the JSON contains references, not secret values. Existing private
+`server_api_key_file`, `api_key_file` and `secret_file` references also work.
+The standard Server URL is automatic. Keep an existing custom `server_url` and
+`data_dir` override when migrating. The default data directory remains the same
+per-user Client directory used by M3. Bitso is the template's credential provider;
+for other exchanges, the credential entry uses that exchange's CCXT name.
+
+Run the normal daemon, with no separate paper-create step:
 
 ```bash
-git apply --check /path/to/trademinator-server-m4.patch
-git apply /path/to/trademinator-server-m4.patch
-php -d memory_limit=512M artisan optimize:clear
-php -d memory_limit=512M artisan test --compact tests/Feature/M4ReplayTest.php
+php -d memory_limit=512M bin/client.php run --config=config.local.json
+php bin/client.php status --config=config.local.json
+php -d memory_limit=512M bin/client.php paper-report --config=config.local.json
+php bin/client.php stop --config=config.local.json
 ```
 
-No new Server migration or dependency is required. The existing tournament/shadow
-migrations must already have run. Use the existing Client API key and enable the
-Client API as usual. Also run the complete Server suite before deploying.
+The Server API key must belong to your account. Your subscribed/active markets
+remain managed on the Server. Setting `exchange.accounts` to `[]` runs paper
+trading using public exchange data and only the Server key. Setting
+`paper_trading.enabled` to `false` keeps paper trading off.
 
-## Create, resume and reset
+## What the client determines
 
-Copy `config.m4.example.json` to a local paper configuration. Its fee rates,
-precision, minimums and balances are examples, not a claim about current exchange
-rules. Set these to the rules of the **simulated execution exchange**. Public live
-feeds check that the exact spot pair exists on both exchanges. No exchange private
-keys are read by M4 and no exchange order or withdrawal API is called.
+| Item | Automatic source |
+| --- | --- |
+| Local exchange account UUID | Reuse saved credential binding or sole existing ledger; otherwise create a local account |
+| Subscriptions and exact pairs | Authenticated Server active-subscription catalog |
+| Candle period | Server-selected period for each subscription |
+| Current model UUID | Server's unique current production model for that exchange, exact pair and period |
+| Risk factor | Server questionnaire/default risk endpoint |
+| Starting paper funds | Server's `paper_initial_quote`; one shared budget per quote currency per exchange |
+| Reporting currency | Most frequent quote in that paper account, with deterministic alphabetical ties |
+| Fees and fee currency | Public CCXT market metadata, including received/spent-asset fee rules |
+| Price/amount precision and available limits | CCXT market metadata |
+| Paper run ID | Stable hash of exchange, subscription identities and selected periods |
+| Remaining simulator parameters | Two Order Rule, three evaluations per candle, 250 ms submit/cancel delays, 30 s stale limit, 1% volume participation, 500 warmup candles |
 
-```bash
-php -d memory_limit=512M bin/client.php paper-create \
-  --config=config.m3.local.json --paper-config=config.m4.local.json --run=trial-01
-php -d memory_limit=512M bin/client.php paper-report \
-  --config=config.m3.local.json --run=trial-01
-```
+When different markets specify different starting amounts for the same quote
+currency, the shared paper account uses the largest amount once. It never adds a
+new budget for every pair. Starting crypto inventory is zero unless that currency
+also funds another subscribed pair; no acquisition cost is fabricated. Public fee
+metadata represents the published tier, not a claim about account-specific
+volume discounts or rebates. Unsupported precision, fee rules or missing model
+metadata produce a visible setup warning rather than guessed exchange rules.
 
-An account may share its balances across multiple configured markets. The run
-stores its starting funds, opening lots and all simulation parameters. Starting
-base inventory needs explicit opening lots with fee-inclusive unit costs before
-it can be sold. Unattributed inventory remains in the balance but is ineligible
-for profitable lot matching. Real M1/M3 accounting and Hard T/H points remain
-separate. Storage is `<data_dir>/paper/paper.sqlite`, using SQLite WAL and FULL
-synchronization; each event and its resulting state commit atomically.
+Private exchange history defaults to the beginning (`history_since_ms: 0`), with
+existing exchange-specific pagination. Registration does not approve checkpoints,
+resolve discrepancies, manufacture historical events, or place real orders.
+Existing explicit account IDs remain supported. If several legacy wallets exist
+for one exchange without a saved credential binding, preserve their existing
+account configuration; the client cannot safely guess which ledger owns a key.
 
-Restart `paper-live` with the same run to resume. `paper-create` refuses an existing
-ID. `paper-reset --run=trial-01 --new-run=trial-02` creates a new run with the same
-initial configuration; it preserves the original run.
+## Resume and discovery lifecycle
+
+Automatic discovery runs in a separate process so local control remains responsive.
+The daemon refreshes subscription discovery every minute, including retries for
+unavailable intelligence. Per-exchange workers drive the paper engine. `status`
+shows their run IDs and each market's state under `ledger.paper_trading`.
+`paper-report` returns all current automatic runs without requiring their IDs.
+
+The same subscription/period set resumes the same saved run, including balances,
+fees, risk settings and resolved model IDs. Model/rule changes on the Server do
+not reset that run or silently change its experiment. Changing the active market
+set or selected periods creates a distinct run with an explicit creation event;
+old runs remain available using `paper-report --run=ID`. No real ledger balances
+are used as paper starting capital. Storage is `<data_dir>/paper/paper.sqlite`.
+
+Stop closes all paper workers. Loss of the supervising daemon's heartbeat also
+stops paper writes. A live-session lock prevents concurrent workers advancing one
+run. Reload still handles ordinary logging settings; switching paper setup or
+rotating its Server credentials requires a restart.
+
+## Optional custom research configuration
+
+The complete M3 and M4 milestone templates and explicit options remain available
+for deliberate parameter experiments or cross-exchange replay. Custom paper
+settings can be placed under `paper_trading` with a `run_id` and `markets`.
+`intelligence.subscription` and `intelligence.model_id` may be omitted (or `auto`)
+for automatic lookup; resolved IDs are persisted separately with the run. The
+explicit `--paper-config` form remains backward compatible. Changed parameters
+need a new custom run ID. Examples below using `trial-01` refer to such a custom
+run, not an ID needed for ordinary automatic startup.
 
 ## Models and current intelligence
 
 ```bash
 php -d memory_limit=512M bin/client.php paper-models \
-  --config=config.m3.local.json --subscription=SUBSCRIPTION_UUID \
+  --config=config.local.json --subscription=SUBSCRIPTION_UUID \
   --model-exchange=bitso --period=15m
 ```
 
-Select and pin a `model_id`. `family=production` executes the existing production
+For an explicit research override, select and pin a `model_id`. Ordinary automatic startup performs this discovery for you. `family=production` executes the existing production
 Outcome/Action KNN, human fusion and decision matrix. `family=shadow` executes a
 published research KNN, tree, forest or neural network. The model's pair and period
 must match the subscription; its training exchange can differ from the data
@@ -80,24 +148,11 @@ these requests publish production signals or overwrite market features.
 
 ## Live paper
 
-Add this `intelligence` object inside each market in the paper configuration,
-using a model returned by `paper-models`, **before creating the run**:
-
-```json
-{
-  "subscription": "SUBSCRIPTION_UUID",
-  "period": "15m",
-  "family": "production",
-  "model_id": "MODEL_UUID",
-  "model_exchange": "bitso",
-  "source": "current",
-  "warmup": 500
-}
-```
+With automatic setup enabled, the ordinary command runs live paper trading:
 
 ```bash
-php -d memory_limit=512M bin/client.php paper-live \
-  --config=config.m3.local.json --run=trial-01 --seconds=86400
+php -d memory_limit=512M bin/client.php run \
+  --config=config.local.json --seconds=86400
 ```
 
 Public order books use CCXT WebSocket support when available, with REST fallback;
@@ -124,7 +179,7 @@ There is no profitability threshold for M4 acceptance.
 
 ```bash
 php -d memory_limit=512M bin/client.php paper-history \
-  --config=config.m3.local.json --subscription=SUBSCRIPTION_UUID \
+  --config=config.local.json --subscription=SUBSCRIPTION_UUID \
   --source-exchange=binance --period=15m \
   --from-ms=START_MS --to-ms=END_MS --output=history.json
 ```
@@ -135,7 +190,7 @@ must match the history export. Set `execution_exchange` independently, e.g. Bits
 
 ```bash
 php -d memory_limit=512M bin/client.php paper-backtest \
-  --config=config.m3.local.json --run=trial-01 --input=history.json \
+  --config=config.local.json --run=trial-01 --input=history.json \
   --symbol=ATOM/USD --intelligence=current --subscription=SUBSCRIPTION_UUID \
   --model-id=MODEL_UUID --family=production --model-exchange=bitso \
   --period=15m --path=low_first --warmup=500
@@ -156,11 +211,11 @@ For higher fidelity, use JSONL `book`/`trade` events from a complete source capt
 
 ```bash
 php -d memory_limit=512M bin/client.php paper-import \
-  --config=config.m3.local.json --run=trial-01 --input=events.jsonl
+  --config=config.local.json --run=trial-01 --input=events.jsonl
 php -d memory_limit=512M bin/client.php paper-export \
-  --config=config.m3.local.json --run=trial-01 --output=captured.jsonl
+  --config=config.local.json --run=trial-01 --output=captured.jsonl
 php -d memory_limit=512M bin/client.php paper-replay \
-  --config=config.m3.local.json --run=trial-01 --new-run=exact-replay
+  --config=config.local.json --run=trial-01 --new-run=exact-replay
 ```
 
 Exact replay checks the complete state hash. Order decisions and inference
@@ -226,7 +281,7 @@ Recover a provably complete interval into a separate run:
 
 ```bash
 php -d memory_limit=512M bin/client.php paper-recover \
-  --config=config.m3.local.json --run=trial-01 --new-run=recovered-01 \
+  --config=config.local.json --run=trial-01 --new-run=recovered-01 \
   --input=complete-capture.json
 ```
 
@@ -252,9 +307,9 @@ Create a JSON file containing 1–32 named override sets, for example:
 
 ```bash
 php -d memory_limit=512M bin/client.php paper-sweep \
-  --config=config.m3.local.json --run=trial-01 --sets=sets.json --prefix=compare
+  --config=config.local.json --run=trial-01 --sets=sets.json --prefix=compare
 php -d memory_limit=512M bin/client.php paper-report \
-  --config=config.m3.local.json --run=trial-01 --output=report.json
+  --config=config.local.json --run=trial-01 --output=report.json
 ```
 
 Each set receives the same initial funds and input tape in a separate run. Sweeps
@@ -310,3 +365,12 @@ integrity failures fail the request. Client failures never fabricate a BUY/SELL.
 * The real 24-hour paper acceptance and native TypePHP/AOT build remain to run on
   the target machine. M4's new dynamic CCXT/SQLite/CLI code is validated as PHP;
   this patch does not claim a new native compilation result.
+
+
+## Validation limits
+
+Automated fixtures exercise discovery, account reuse, multi-exchange workers,
+subscription/model matching, resume behavior, public market rule normalization
+and fee accounting. They make no external exchange requests. A real 24-hour
+paper session, target-machine native IPC and native/AOT packaging remain separate
+validation steps.

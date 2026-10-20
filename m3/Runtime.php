@@ -36,6 +36,8 @@ final class Runtime
     private array $transferBlocks = [];
     public function __construct(private Database $db, private array $settings, ?callable $factory = null, ?callable $sink = null, private ?HardPoints $hard = null, private ?string $dataDir = null)
     {
+        $settings = AccountSetup::resolve($db, $settings, $dataDir);
+        $this->settings = $settings;
         $this->sink = $sink === null ? null : \Closure::fromCallable($sink);
         $this->reconciler = new Reconciler($db);
         $this->accounting = new Accounting($db);
@@ -457,6 +459,7 @@ final class Runtime
         }unset($state);
         return ['enabled' => $accounts !== [],'live_execution_enabled' => false,'accounts' => $accounts,'transfer_candidates' => $this->transferCandidates, 'transfer_blocks' => $this->transferBlocks];
     }
+    public function configuredAccountIds(): array { return array_column($this->settings['accounts'], 'account_id'); }
     public function command(string $command, array $args): array
     {
         if ($command === 'exchange-status') {

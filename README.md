@@ -1,9 +1,39 @@
-# Trademinator Client — M3
+# Trademinator Client — M4
 
 M3 adds read-only CCXT exchange connectivity, account reconciliation, manual
 activity accounting, deposit cost estimates, LIFO withdrawals and linked transfers.
 It preserves M2 authenticated Server intelligence and scheduling. Live execution
-and local trading decisions remain later milestones.
+remains disabled; M4 adds paper trading and replay.
+
+## Credentials-only setup
+
+Copy `config.example.json` to `config.local.json`. Supply the Server API key and
+exchange API key/secret through the environment variables named in that file.
+The template includes Bitso credential labels; additional exchanges use their
+CCXT exchange name and their own key/secret references. These labels identify the
+credential provider; API key strings themselves cannot identify an exchange.
+No account, subscription or model UUID, market list, period, fee, precision, risk
+factor, paper balance or run ID needs to be entered.
+
+```bash
+php -d memory_limit=512M bin/client.php run --config=config.local.json
+php bin/client.php status --config=config.local.json
+php -d memory_limit=512M bin/client.php paper-report --config=config.local.json
+php bin/client.php stop --config=config.local.json
+```
+
+The daemon registers/reuses the local exchange account, discovers your active
+Server subscriptions and current production models, and creates/resumes one
+paper account per exchange. Server settings supply candle periods, risk and paper
+starting funds; CCXT market metadata supplies fees, limits and precision. Real
+exchange orders remain disabled. `exchange.accounts: []` supports public-data
+paper trading with only the Server key. `paper_trading.enabled: false` disables
+paper trading while keeping M3 reconciliation.
+
+Existing configurations and data directories remain supported. Preserve any
+explicit `data_dir` and custom `server_url` when switching templates so the daemon
+continues using your existing storage/server. See [M4 setup and operation](docs/M4-INSTALL.md)
+for automatic discovery, saved-run behavior and optional research overrides.
 
 Read [M3 installation, configuration and acceptance](docs/M3-INSTALL.md) before
 upgrading. The implementation and validation limits are listed there.
@@ -16,7 +46,7 @@ Run `composer install` before starting this version. M3 requires **64-bit PHP
 Use the existing Server GET endpoint at commit `164a329` or a compatible later revision.
 Its `market.signal` supplies freshness, expiry and model provenance. The optional
 Server M2 patch adds regression tests only; no Server API change is required.
-Use `config.m2.example.json` and `php tests/m2.php`. The API key is read from
+Use `config.example.json` and `php tests/m2.php`. The API key is read from
 `TRADEMINATOR_API_KEY` or a private key file; never put it in JSON configuration.
 
 Only explicitly activated markets poll intelligence. Market state is durable:

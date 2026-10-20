@@ -25,7 +25,7 @@ final class Config
         $allowed = ['mode', 'data_dir', 'exchange', 'symbol', 'server_url', 'ipc_port',
             'interval_ms', 'request_timeout_seconds', 'ws_retry_seconds', 'server_poll_seconds', 'retention'];
         if (array_diff(array_keys($values), $allowed) !== []) {
-            throw new InvalidArgumentException('Unknown configuration field. See config.example.json.');
+            throw new InvalidArgumentException('Unknown configuration field. See config.m0.example.json.');
         }
         foreach (['mode' => 'mode', 'exchange' => 'exchange', 'symbol' => 'symbol', 'server_url' => 'serverUrl'] as $key => $property) {
             if (isset($values[$key])) {

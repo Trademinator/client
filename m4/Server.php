@@ -14,15 +14,21 @@ final class Server
     {
         if($config->serverUrl==='') { throw new RuntimeException('Set server_url in the Client configuration.'); }
         $this->key=Credentials::read($config->serverApiKeyEnv,$config->serverApiKeyFile);
+        \Trademinator\Client\M1\EventRecord::hideSecret($this->key);
     }
     public function request(string $subscription,string $resource,?array $body=null,array $query=[]): array
     {
-        if(!preg_match('/^[a-f0-9-]{36}$/Di',$subscription) || !in_array($resource,['replay/history','replay/models','replay/infer'],true)) { throw new RuntimeException('Invalid replay endpoint.'); }
+        if ($subscription === '' && in_array($resource, ['markets', 'risk-factor'], true) && $body === null) {
+            $path = '/api/v1/client/'.$resource;
+        } elseif (preg_match('/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/Di',$subscription)
+            && in_array($resource,['market','replay/history','replay/models','replay/infer'],true)) {
+            $path = '/api/v1/client/markets/'.$subscription.($resource === 'market' ? '' : '/'.$resource);
+        } else { throw new RuntimeException('Invalid paper Server endpoint.'); }
         if($this->transport!==null) { return ($this->transport)($subscription,$resource,$body,$query); }
         $interval=$resource==='replay/infer'?2.1:0.6;
         $wait=$interval-(microtime(true)-$this->lastRequest);if($wait>0) { usleep((int)ceil($wait*1000000)); }
         $this->lastRequest=microtime(true);
-        $url=$this->config->serverUrl.'/api/v1/client/markets/'.$subscription.'/'.$resource;
+        $url=$this->config->serverUrl.$path;
         if($query) { $url.='?'.http_build_query($query); }
         $h=curl_init($url);$buffer='';
         curl_setopt_array($h,[CURLOPT_HTTPHEADER=>['Authorization: Bearer '.$this->key,'Accept: application/json','Content-Type: application/json'],

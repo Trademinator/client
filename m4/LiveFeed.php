@@ -27,6 +27,10 @@ final class LiveFeed
         if(($m['spot']??false)!==true || ($m['active']??true)===false) { throw new RuntimeException('Exact active spot pair unavailable on exchange.'); }
         return $m;
     }
+    public function rules(string $symbol): array
+    {
+        return MarketRules::from($this->market($symbol), $this->rest->precisionMode, $this->rest->fees['trading'] ?? []);
+    }
     public function book(string $symbol): array
     {
         if($this->ws!==null && ($this->ws->has['watchOrderBook']??false)) {

@@ -27,7 +27,7 @@ final class Application
                 $options[$m[1]] = $m[2];
             }
             if ($command === 'help') { $this->help(); return 0; }
-            if ($command === 'version') { self::output(['milestone'=>'M3','version'=>'3.0.0-rc1']); return 0; }
+            if ($command === 'version') { self::output(['milestone'=>'M4','version'=>'4.0.0-rc2']); return 0; }
             if ($command === 'doctor') { return $this->doctor(); }
             if ($command === 'run') {
                 $autoload = dirname(__DIR__).'/vendor/autoload.php';
@@ -69,8 +69,8 @@ final class Application
                 if (!ctype_digit($seconds) || strlen($seconds)>7 || (int)$seconds>604800) {
                     throw new RuntimeException('seconds must be an integer from 0 to 604800.');
                 }
-                $db = null; $backup = null; $hard = null; $runtime = null; $exchange = null; $nextMaintenance = 0.0; $hardCandidates = [];
-                $tick = function (Daemon $daemon, Config $config) use (&$db, &$backup, &$hard, &$runtime, &$exchange, &$nextMaintenance, &$hardCandidates): void {
+                $db = null; $backup = null; $hard = null; $runtime = null; $exchange = null; $paper = null; $nextMaintenance = 0.0; $hardCandidates = [];
+                $tick = function (Daemon $daemon, Config $config) use (&$db, &$backup, &$hard, &$runtime, &$exchange, &$paper, &$nextMaintenance, &$hardCandidates): void {
                     if ($db === null) {
                         $db = new Database($config->dataDir.'/client.sqlite');
                         $backup = new Backup($db, $config->dataDir);
@@ -84,18 +84,21 @@ final class Application
                         $exchange = new \Trademinator\Client\M3\Runtime($db, $config->exchange, null,
                             fn(string $level, string $event, array $context, string $message) => $daemon->log($level, $event, $context, $message),
                             new \Trademinator\Client\M3\HardPoints($db, $config->dataDir), $config->dataDir);
+                        $paper = new \Trademinator\Client\M4\Runtime($config,
+                            fn(string $level, string $event, array $context, string $message) => $daemon->log($level, $event, $context, $message));
                         $daemon->log('info', 'storage_ready', ['schema_version'=>Database::SCHEMA_VERSION, 'live_order_execution'=>false], 'Local storage verified; live trading is disabled.');
                         if (!$settings['enabled']) { $daemon->log('info', 'server_disabled', [], 'Server integration is disabled; local core is running.'); }
                     }
                     $exchange->tick();
                     $runtime->tick();
+                    $paper->tick();
                     $now = hrtime(true) / 1e9;
                     if ($now < $nextMaintenance) { return; }
                     foreach ($backup->tick() as $reason => $snapshot) {
                         $daemon->log('info', 'backup_created', ['reason'=>$reason, 'backup_id'=>$snapshot['id'] ?? null], 'Local database backup created.');
                     }
                     foreach ($db->pdo()->query('SELECT id FROM exchange_accounts')->fetchAll(\PDO::FETCH_COLUMN) as $id) {
-                        if (in_array($id, array_column($config->exchange['accounts'], 'account_id'), true)) { continue; }
+                        if (in_array($id, $exchange->configuredAccountIds(), true)) { continue; }
                         $candidate = $hard->proposeT1($id);
                         $candidateId = $candidate['token'] ?? null;
                         if ($candidateId !== null && ($hardCandidates[$id] ?? null) !== $candidateId) {
@@ -105,10 +108,10 @@ final class Application
                     }
                     $nextMaintenance = $now + 60;
                 };
-                $status = function () use (&$db, &$runtime, &$exchange): array {
+                $status = function () use (&$db, &$runtime, &$exchange, &$paper): array {
                     return ['ready'=>$db!==null,'live_order_execution'=>false,'exchange_connected'=>!empty($exchange?->status()['accounts']),
                         'exchange'=>$exchange?->status(), 'accounts'=>$db ? (int)$db->pdo()->query('SELECT COUNT(*) FROM exchange_accounts')->fetchColumn() : 0,
-                        'server'=>$runtime?->status()];
+                        'server'=>$runtime?->status(), 'paper_trading'=>$paper?->status()];
                 };
                 $reload = function (Config $candidate) use (&$runtime, &$exchange, &$db, &$daemon): void {
                     $settings = $candidate->serverSettings();
@@ -120,6 +123,7 @@ final class Application
                     $exchange?->close(); $exchange = $nextExchange;
                 };
                 $daemon = new Daemon($config, $tick, $status, $reload, [$console, 'write']);
+                $daemon->setShutdownHandler(function () use (&$paper, &$exchange): void { $paper?->close(); $exchange?->close(); });
                 $daemon->setHandler(function (string $command, array $arguments) use (&$runtime, &$db, &$exchange, $daemon): array {
                     if ($db === null || $runtime === null) { throw new RuntimeException('Local storage is not ready.'); }
                     if ($command === 'accounts') {
@@ -138,7 +142,7 @@ final class Application
                     if (in_array($command, ['exchange-status','exchange-refresh','exchange-adjust','deposit-basis','transfer-link','hard-h-propose','hard-h-promote'], true)) { return $exchange->command($command, $arguments); }
                     return $runtime->command($command, $arguments);
                 });
-                try { return $daemon->run((int)$seconds); } finally { $exchange?->close(); }
+                try { return $daemon->run((int)$seconds); } finally { $paper?->close(); $exchange?->close(); }
             }
             if (!in_array($command,['init','check','backup','hard-t0','hard-t1-propose','hard-t1-promote','hard-restore','recover'],true)) {
                 throw new RuntimeException('Unknown command. See help.');
@@ -207,7 +211,7 @@ final class Application
     private function help(): void
     {
         echo <<<'HELP'
-Trademinator Client M3 — exchange reconciliation (no live order execution)
+Trademinator Client M4 — exchange reconciliation and paper trading (no live order execution)
   php bin/client.php doctor
   php bin/client.php init [--config=PATH] [--data-dir=PATH]
   php bin/client.php run [--config=PATH] [--data-dir=PATH] [--seconds=60]
@@ -235,6 +239,10 @@ M3 account commands (daemon running):
   php bin/client.php hard-h-promote --account=UUID --approve=TOKEN [--config=PATH]
 
 Offline database/hard-point commands require the daemon stopped.
+Use config.example.json as the unified template. When paper_trading.enabled is true,
+run discovers subscriptions and models and creates or resumes paper accounts.
+status and stop include their workers; paper-report uses the same --config.
+Custom research configurations can still specify paper_trading.run_id.
 Hard T1 promotion uses the exact reviewed candidate token. A stale token is rejected.
 Hard restore is an explicit replacement of account state; inspect the archive first.
 Use a NEW isolated directory for simulation: php tools/m1-simulate.php --data-dir=PATH --orders=10000

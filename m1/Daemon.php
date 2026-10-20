@@ -17,6 +17,7 @@ final class Daemon
     private ?\Closure $onReload;
     private ?\Closure $eventSink;
     private ?\Closure $commandHandler = null;
+    private ?\Closure $shutdownHandler = null;
     private ?Control $control = null;
     private bool $stopping = false;
     private string $state = 'created';
@@ -38,6 +39,7 @@ final class Daemon
     }
 
     public function setHandler(callable $handler): void { $this->commandHandler = \Closure::fromCallable($handler); }
+    public function setShutdownHandler(callable $handler): void { $this->shutdownHandler = \Closure::fromCallable($handler); }
     public function config(): Config { return $this->config; }
 
     public function run(int $seconds = 0): int
@@ -92,6 +94,10 @@ final class Daemon
         } finally {
             $this->stopping = true;
             if ($this->state !== 'failed') { $this->state = 'stopped'; }
+            try {
+                if ($this->shutdownHandler !== null) { ($this->shutdownHandler)(); }
+                if ($this->statusProvider !== null) { $this->componentStatus = ($this->statusProvider)(); }
+            } catch (Throwable $error) { $exitCode = 1; $this->state = 'failed'; $this->lastError ??= EventRecord::safeText($error->getMessage()); }
             try { $this->log('info', 'daemon_stopped', ['exit_code' => $exitCode], 'Client process stopped.'); $this->writeStatus(); }
             catch (Throwable $error) { $exitCode = 1; $this->state = 'failed'; $this->lastError ??= EventRecord::safeText($error->getMessage()); }
             $this->control?->close();
@@ -157,7 +163,7 @@ final class Daemon
 
     public function status(): array
     {
-        return ['milestone' => 'M3', 'mode' => $this->config->serverUrl === '' ? 'local_core' : 'server_intelligence', 'trading_enabled' => false, 'state' => $this->state,
+        return ['milestone' => 'M4', 'mode' => $this->config->paperTrading['enabled'] ? 'paper_trading' : ($this->config->serverUrl === '' ? 'local_core' : 'server_intelligence'), 'trading_enabled' => false, 'state' => $this->state,
             'pid' => getmypid(), 'run_id' => $this->runId, 'uptime_seconds' => $this->started > 0 ? round(hrtime(true) / 1e9 - $this->started, 3) : 0,
             'updated_at' => gmdate('Y-m-d\TH:i:s\Z'), 'data_dir' => $this->paths->dataDir,
             'ipc_transport' => PHP_OS_FAMILY === 'Windows' ? 'windows_named_pipe' : 'unix_socket',

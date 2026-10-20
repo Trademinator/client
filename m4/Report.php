@@ -37,6 +37,7 @@ final class Report
         foreach($c['balances'] as $currency=>$amount) { if($currency!==$c['reporting_currency'] && D::cmp($amount,$represented[$currency]??'0')!==0) { $basisComplete=false; } }
         $complete=$basisComplete && $coverage===$sells;
         return ['recovery'=>$c['recovery']??null,'engine'=>Engine::VERSION,'reporting_currency'=>$c['reporting_currency'],'source_exchange'=>$c['source_exchange'],'execution_exchange'=>$c['execution_exchange'],
+            'intelligence'=>array_map(static fn(array $m): ?array => $m['intelligence'] ?? null, ($run['resolved_config'] ?? $c)['markets']),
             'realized_net_profit'=>$coverage===$sells?$profit:null,'converted_realized_subtotal'=>$profit,'realized_profit_by_currency'=>$original,'fees_by_currency'=>$fees,
             'capital_at_cost'=>$basisComplete?$initial:null,'realized_capital'=>$complete?D::add($initial,$profit):null,
             'realized_return'=>$complete&&D::cmp($initial,'0')>0?D::div($profit,$initial):null,'realized_drawdown'=>$coverage===$sells?$drawdown:null,'realized_curve'=>$curve,

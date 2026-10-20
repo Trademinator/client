@@ -24,13 +24,14 @@ final class Config
     public readonly int $serverRiskIntervalMs;
     public readonly int $serverMinRequestIntervalMs;
     public readonly array $exchange;
+    public readonly array $paperTrading;
     private readonly ?string $dataDirOverride;
 
     public function __construct(array $values = [], ?string $baseDir = null, ?string $sourceFile = null, ?string $dataDirOverride = null)
     {
         $allowed = ['data_dir', 'tick_ms', 'log_max_bytes', 'log_keep', 'log_level',
             'server_url', 'server_api_key_env', 'server_api_key_file', 'checks_per_candle',
-            'server_timeout_ms', 'server_catalog_interval_ms', 'server_risk_interval_ms', 'server_min_request_interval_ms', 'exchange'];
+            'server_timeout_ms', 'server_catalog_interval_ms', 'server_risk_interval_ms', 'server_min_request_interval_ms', 'exchange', 'paper_trading'];
         $unknown = array_diff(array_keys($values), $allowed);
         if ($unknown !== []) { throw new InvalidArgumentException('Unknown configuration field(s): '.implode(', ', $unknown)); }
         $path = $dataDirOverride ?? (array_key_exists('data_dir', $values) ? $values['data_dir'] : Paths::defaultDataDir());
@@ -40,6 +41,10 @@ final class Config
         $this->dataDirOverride = $dataDirOverride;
         if (isset($values['exchange']) && !is_array($values['exchange'])) { throw new InvalidArgumentException('exchange must be an object.'); }
         $this->exchange = \Trademinator\Client\M3\Settings::validate($values['exchange'] ?? [], $baseDir);
+        if (array_key_exists('paper_trading', $values) && !is_array($values['paper_trading'])) {
+            throw new InvalidArgumentException('paper_trading must be an object.');
+        }
+        $this->paperTrading = \Trademinator\Client\M4\PaperConfig::validate($values['paper_trading'] ?? null);
         foreach ([
             'tick_ms' => ['tickMs', 250, 50, 10000],
             'log_max_bytes' => ['logMaxBytes', 5242880, 4096, 1073741824],
@@ -57,7 +62,7 @@ final class Config
         $level = array_key_exists('log_level', $values) ? $values['log_level'] : 'info';
         if (!is_string($level) || !in_array($level, ['debug', 'info', 'warning', 'error'], true)) { throw new InvalidArgumentException('Invalid log_level.'); }
         $this->logLevel = $level;
-        $url = $values['server_url'] ?? '';
+        $url = $values['server_url'] ?? ((isset($values['server_api_key_env']) || isset($values['server_api_key_file']) || $this->paperTrading['enabled']) ? 'https://server.trademinator.com' : '');
         if (!is_string($url) || strlen($url) > 2048) { throw new InvalidArgumentException('server_url must be an HTTPS origin.'); }
         $parts = parse_url($url);
         if ($url !== '' && ($parts === false || ($parts['scheme'] ?? '') !== 'https' || empty($parts['host'])
@@ -98,6 +103,14 @@ final class Config
         $currentPath = PHP_OS_FAMILY === 'Windows' ? strtolower($this->dataDir) : $this->dataDir;
         $candidatePath = PHP_OS_FAMILY === 'Windows' ? strtolower($candidate->dataDir) : $candidate->dataDir;
         if ($candidatePath !== $currentPath) { throw new InvalidArgumentException('data_dir cannot change during reload; stop and restart explicitly.'); }
+        if (\Trademinator\Client\M4\PaperConfig::fingerprint($candidate->paperTrading) !== \Trademinator\Client\M4\PaperConfig::fingerprint($this->paperTrading)) {
+            throw new InvalidArgumentException('Changing paper_trading requires stop and restart. Use a new run_id when changing simulation settings.');
+        }
+        if ($this->paperTrading['enabled']) {
+            foreach (['serverUrl', 'serverApiKeyEnv', 'serverApiKeyFile', 'serverTimeoutMs'] as $property) {
+                if ($candidate->$property !== $this->$property) { throw new InvalidArgumentException('Changing the paper Server connection requires stop and restart.'); }
+            }
+        }
         return $candidate;
     }
 
@@ -109,7 +122,8 @@ final class Config
             'server_api_key_file' => $this->serverApiKeyFile, 'checks_per_candle' => $this->checksPerCandle,
             'server_timeout_ms' => $this->serverTimeoutMs, 'server_catalog_interval_ms' => $this->serverCatalogIntervalMs,
             'server_risk_interval_ms' => $this->serverRiskIntervalMs,
-            'server_min_request_interval_ms' => $this->serverMinRequestIntervalMs, 'exchange' => $this->exchange];
+            'server_min_request_interval_ms' => $this->serverMinRequestIntervalMs, 'exchange' => $this->exchange,
+            'paper_trading' => $this->paperTrading];
     }
 
     /** This includes the secret: pass only to Runtime, never to logging or status. */

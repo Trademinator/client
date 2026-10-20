@@ -155,14 +155,15 @@ final class Engine
     }
     private function submit(string $s,string $side,string $price,string $role,?string $parent,array $e,int $t): ?string
     {
-        $m=$this->config['markets'][$s];[$base,$quote]=explode('/',$s);$fee=$m['taker_fee'];
+        $m=$this->config['markets'][$s];[$base,$quote]=explode('/',$s);$fee=$m['taker_fee'];$feeAsset=self::feeAsset($m['fee_asset'],$side);
+        if(isset($m['minimum_price']) && D::cmp($price,$m['minimum_price'])<0 || isset($m['maximum_price']) && D::cmp($price,$m['maximum_price'])>0) { return null; }
         $campaign=$this->state['campaigns'][$s]??null;
         if($parent!==null) { $campaign=['side'=>$side,'quantity'=>$this->state['orders'][$parent]['quantity'],'value'=>D::mul($this->state['orders'][$parent]['quantity'],$this->state['orders'][$parent]['price'])]; }
         if($campaign && $campaign['side']===$side && D::cmp($campaign['quantity'],'0')>0) {
             $average=D::div($campaign['value'],$campaign['quantity']);
             if(($side==='buy' && D::cmp($price,$average)>=0) || ($side==='sell' && D::cmp($price,$average)<=0)) { return null; }
         }
-        $reserveUnit=$side==='buy'?D::mul($price,$m['fee_asset']==='quote'?D::add('1',$fee):'1'):($m['fee_asset']==='base'?D::add('1',$fee):'1');
+        $reserveUnit=$side==='buy'?D::mul($price,$feeAsset==='quote'?D::add('1',$fee):'1'):($feeAsset==='base'?D::add('1',$fee):'1');
         $currency=$side==='buy'?$quote:$base;$capacity=D::div($this->free($currency),$reserveUnit);$alloc=[];
         if($side==='buy') {
             $markets=count(array_filter(array_keys($this->config['markets']),fn($symbol)=>explode('/',$symbol)[1]===$quote));
@@ -175,7 +176,7 @@ final class Engine
             } else { return null; }
             $quantity=D::min($q3,$risk,$capacity);
         } else {
-            $netUnit=D::mul($price,$m['fee_asset']==='quote'?D::sub('1',$fee):'1');$eligible='0';
+            $netUnit=D::mul($price,$feeAsset==='quote'?D::sub('1',$fee):'1');$eligible='0';
             foreach($this->state['lots'] as $i=>$lot) {
                 if($lot['symbol']!==$s || D::cmp($netUnit,D::mul(D::mul($lot['unit_cost'],$reserveUnit),D::add('1',$m['minimum_profit'])))<=0) { continue; }
                 $available=$lot['remaining'];
@@ -184,6 +185,8 @@ final class Engine
             }
             $quantity=D::min(D::div($eligible,$reserveUnit),$capacity);
         }
+        if(isset($m['maximum_amount'])) { $quantity=D::min($quantity,$m['maximum_amount']); }
+        if(isset($m['maximum_cost'])) { $quantity=D::min($quantity,D::div($m['maximum_cost'],$price)); }
         $minimum=D::step(D::max($m['minimum_amount'],D::div($m['minimum_cost'],$price)),$m['amount_step'],true);
         // Exchange minimum is allowed only while all capacity/risk/liquidity gates still hold.
         $quantity=D::step($quantity,$m['amount_step']);
@@ -241,18 +244,22 @@ final class Engine
             if(D::cmp($q,'0')>0) { $this->fill($id,$q,$o['price'],($e['approximate']??false)?'taker':'maker',$t);$remaining=D::sub($remaining,$q); }
         }
     }
+    private static function feeAsset(string $rule,string $side): string
+    {
+        return match($rule) { 'get'=>$side==='buy'?'base':'quote', 'give'=>$side==='buy'?'quote':'base', default=>$rule };
+    }
     private function balance(string $c,string $delta): void { $this->state['balances'][$c]=D::add($this->state['balances'][$c]??'0',$delta); }
     private function fill(string $id,string $q,string $price,string $liquidity,int $t): void
     {
-        $o=&$this->state['orders'][$id];$m=$this->config['markets'][$o['symbol']];[$base,$quote]=explode('/',$o['symbol']);
-        $cost=D::mul($q,$price);$rate=$m[$liquidity.'_fee'];$fee=D::mul($m['fee_asset']==='base'?$q:$cost,$rate);
-        $feeCurrency=$m['fee_asset']==='base'?$base:$quote;$matched=[];$profit=null;
+        $o=&$this->state['orders'][$id];$m=$this->config['markets'][$o['symbol']];[$base,$quote]=explode('/',$o['symbol']);$feeAsset=self::feeAsset($m['fee_asset'],$o['side']);
+        $cost=D::mul($q,$price);$rate=$m[$liquidity.'_fee'];$fee=D::mul($feeAsset==='base'?$q:$cost,$rate);
+        $feeCurrency=$feeAsset==='base'?$base:$quote;$matched=[];$profit=null;
         if($o['side']==='buy') {
-            $netQ=$m['fee_asset']==='base'?D::sub($q,$fee):$q;$paid=$m['fee_asset']==='quote'?D::add($cost,$fee):$cost;
+            $netQ=$feeAsset==='base'?D::sub($q,$fee):$q;$paid=$feeAsset==='quote'?D::add($cost,$fee):$cost;
             $this->balance($base,$netQ);$this->balance($quote,D::sub('0',$paid));
             $this->state['lots'][]=['id'=>'fill-'.(count($this->state['fills'])+1),'symbol'=>$o['symbol'],'remaining'=>$netQ,'unit_cost'=>D::div($paid,$netQ)];
         } else {
-            $spent=$m['fee_asset']==='base'?D::add($q,$fee):$q;$proceeds=$m['fee_asset']==='quote'?D::sub($cost,$fee):$cost;
+            $spent=$feeAsset==='base'?D::add($q,$fee):$q;$proceeds=$feeAsset==='quote'?D::sub($cost,$fee):$cost;
             $needed=$spent;$basis='0';
             foreach($o['allocations'] as $i=>$available) {
                 $take=D::min($available,$needed);if(D::cmp($take,'0')<=0) { continue; }

@@ -1,7 +1,7 @@
 {
     "$schema": "https://getcomposer.org/schema.json",
     "name": "trademinator/client",
-    "description": "Trademinator Client M3 read-only exchange connectivity and authoritative accounting.",
+    "description": "Trademinator Client exchange reconciliation, paper trading and replay.",
     "type": "project",
     "license": "MIT",
     "require": {
@@ -57,7 +57,9 @@
             "@php tests/m3-bitso-transfers.php",
             "@php tests/m3-bitso-account-history.php",
             "@php tests/m3-bitso-history-probe.php",
-            "@php tests/m4.php"
+            "@php tests/m4.php",
+            "@php tests/m4-config.php",
+            "@php tests/m4-discovery.php"
         ],
         "lint": "@php tools/lint.php",
         "doctor": "@php bin/client.php doctor",
@@ -85,7 +87,11 @@
             "@php tests/m3-bitso-account-history.php",
             "@php tests/m3-bitso-history-probe.php"
         ],
-        "test:m4": "@php tests/m4.php"
+        "test:m4": [
+            "@php tests/m4.php",
+            "@php tests/m4-config.php",
+            "@php tests/m4-discovery.php"
+        ]
     },
     "config": {
         "sort-packages": true,

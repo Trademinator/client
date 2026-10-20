@@ -31,7 +31,7 @@ final class Application
             $command=$argv[1];
             if($command==='paper-help') {
                 echo "M4 paper commands (all financial amounts in JSON are decimal strings):\n";
-                echo "paper-create --paper-config=FILE --run=ID\npaper-reset --run=OLD --new-run=NEW\npaper-import --run=ID --input=events.jsonl\npaper-replay --run=SOURCE --new-run=NEW\npaper-recover --run=SOURCE --new-run=NEW --input=complete-capture.json\npaper-report --run=ID [--output=FILE]\npaper-export --run=ID --output=events.jsonl\npaper-sweep --run=SOURCE --sets=FILE --prefix=ID\npaper-models --config=FILE --subscription=UUID --model-exchange=bitso --period=15m\npaper-history --config=FILE --subscription=UUID --source-exchange=binance --period=15m --from-ms=N --to-ms=N --output=FILE\npaper-backtest --run=ID --input=history.json --symbol=BTC/USD --intelligence=recorded|historical|current [--config=FILE --subscription=UUID --model-id=UUID --family=production|shadow --period=15m --model-exchange=bitso --warmup=50000 --path=low_first|high_first]\npaper-live --run=ID --config=FILE --seconds=86400 [--color=auto]\nAll local commands accept --data-dir=DIR. Restart paper-live with the same run to resume. Reset always creates a new ID.\n";
+                echo "paper-create --config=FILE [--run=ID] [--paper-config=LEGACY_FILE]\npaper-reset --run=OLD --new-run=NEW\npaper-import --run=ID --input=events.jsonl\npaper-replay --run=SOURCE --new-run=NEW\npaper-recover --run=SOURCE --new-run=NEW --input=complete-capture.json\npaper-report --run=ID [--output=FILE]\npaper-export --run=ID --output=events.jsonl\npaper-sweep --run=SOURCE --sets=FILE --prefix=ID\npaper-models --config=FILE --subscription=UUID --model-exchange=bitso --period=15m\npaper-history --config=FILE --subscription=UUID --source-exchange=binance --period=15m --from-ms=N --to-ms=N --output=FILE\npaper-backtest --run=ID --input=history.json --symbol=BTC/USD --intelligence=recorded|historical|current [--config=FILE --subscription=UUID --model-id=UUID --family=production|shadow --period=15m --model-exchange=bitso --warmup=50000 --path=low_first|high_first]\npaper-live --run=ID --config=FILE --seconds=86400 [--color=auto]\nAll paper commands accept --config=FILE; run defaults to paper_trading.run_id. All local commands accept --data-dir=DIR. Restart paper-live with the same run to resume. Reset always creates a new ID.\n";
                 return 0;
             }
             $config=Config::load($options['config']??null,$options['data-dir']??null);
@@ -47,9 +47,16 @@ final class Application
                 }while($cursor!==null);
                 self::output(['source_exchange'=>$source,'symbol'=>$symbol,'period'=>$period,'candles'=>$rows,'signals'=>array_values($signals),'gaps'=>$gaps],$options['output']??null);return 0;
             }
-            $store=new Store($config->dataDir.'/paper');$run=$options['run']??'';Store::id($run);
+            $store=new Store($config->dataDir.'/paper');
+            if ($command === 'paper-report' && !isset($config->paperTrading['run_id']) && !isset($options['run']) && !isset($config->paperTrading['markets'])) {
+                $reports=[];foreach($store->automaticIds() as $id) { $reports[$id]=Report::build($store->run($id)); }
+                self::output(['runs'=>$reports],$options['output']??null);return 0;
+            }
+            $run=$options['run']??$config->paperTrading['run_id']??'';Store::id($run);
             switch($command) {
-                case 'paper-create': $store->create($run,self::json($options['paper-config']??''));$result=['run'=>$run,'status'=>'created'];break;
+                case 'paper-create':
+                    $settings=isset($options['paper-config'])?self::json($options['paper-config']):PaperConfig::settings($config->paperTrading);
+                    $store->create($run,$settings);$result=['run'=>$run,'status'=>'created'];break;
                 case 'paper-reset': $store->create($options['new-run']??'', $store->run($run)['config']);$result=['run'=>$options['new-run'],'status'=>'new_run'];break;
                 case 'paper-import': $result=['events'=>Replay::import($store,$run,$options['input']??'')];break;
                 case 'paper-recover': $result=Recovery::replay($store,$run,$options['new-run']??'',self::json($options['input']??''));break;
