@@ -55,6 +55,7 @@
             "@php tests/m3-inventory-diagnostics.php",
             "@php tests/m3-inventory-preview.php",
             "@php tests/m3-pricing-progress.php",
+            "@php tests/m3-coingecko-mappings.php",
             "@php tests/m3-bitso-transfers.php",
             "@php tests/m3-bitso-account-history.php",
             "@php tests/m3-bitso-history-probe.php",
@@ -85,6 +86,7 @@
             "@php tests/m3-inventory-diagnostics.php",
             "@php tests/m3-inventory-preview.php",
             "@php tests/m3-pricing-progress.php",
+            "@php tests/m3-coingecko-mappings.php",
             "@php tests/m3-bitso-transfers.php",
             "@php tests/m3-bitso-account-history.php",
             "@php tests/m3-bitso-history-probe.php"

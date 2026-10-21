@@ -497,6 +497,31 @@ rebuilds the orders table transactionally without changing existing rows/IDs, an
 checks foreign keys. An interrupted/failed rebuild rolls back; permanent Hard H0
 archives are not rewritten. Older Client code cannot open schema 4.
 
+## Shared CoinGecko mappings
+
+Apply the Server mapping API patch before the Client patch, then restart the
+Client daemon. No extra credentials or UUIDs are required. The existing Server
+API key authenticates `GET /api/v1/client/coingecko-mappings`.
+
+The Client fetches all pages at startup and refreshes every five minutes. It uses
+only resolved mappings for the receiving exchange and exact base/quote pair.
+Owner corrections on the Server therefore reach the Client on its next refresh.
+A complete refresh replaces the in-memory catalogue, including removals. No
+CoinGecko lookup guesses an asset ID from its ticker.
+
+Delete `coingecko_ids` from existing account configurations. Older configurations
+containing it remain loadable, but the field is discarded and cannot override the
+Server. The unified `config.example.json` already needs only credential references
+and the optional paper-trading switch; the M3 template no longer contains a map.
+`coingecko_api_key_env` remains an optional credential for CoinGecko history access.
+
+`exchange-status` includes `coingecko_mappings` with its state, resolved-pair count,
+last refresh time and error. A missing endpoint, failed refresh, expired catalogue,
+unresolved mapping or pair mismatch disables CoinGecko fallback. Historical
+exchange pricing remains available; unavailable historical prices remain unknown.
+Refresh failures retry automatically after at least one minute and honor
+`Retry-After`. Existing recorded deposit bases are not rewritten by map changes.
+
 ## Accounting and transfers
 
 * Manual and Client-origin activity use the same inventory. Actual fills and
@@ -512,7 +537,8 @@ archives are not rewritten. Older Client code cannot open schema 4.
   on the receiving CCXT exchange, configured alternative CCXT exchanges (including
   direct/inverse/bridge quote conversion), CoinGecko history, or the user. Source,
   quote and timestamp are audited. Today's ticker is never substituted for a
-  historical acquisition price. CoinGecko IDs must be explicitly configured.
+  historical acquisition price. CoinGecko identities are fetched automatically
+  from the Server; do not configure `coingecko_ids`.
 * Withdrawals consume newest BUY lots first. Principal and confirmed fees are
   separate debits, including fees in another inventory currency. No withdrawal is
   initiated by the Client.

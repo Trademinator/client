@@ -34,7 +34,7 @@ final class Runtime
     private bool $closed = false;
     private array $transferCandidates = [];
     private array $transferBlocks = [];
-    public function __construct(private Database $db, private array $settings, ?callable $factory = null, ?callable $sink = null, private ?HardPoints $hard = null, private ?string $dataDir = null)
+    public function __construct(private Database $db, private array $settings, ?callable $factory = null, ?callable $sink = null, private ?HardPoints $hard = null, private ?string $dataDir = null, private ?CoinGeckoMappings $mappings = null)
     {
         $settings = AccountSetup::resolve($db, $settings, $dataDir);
         $this->settings = $settings;
@@ -66,6 +66,7 @@ final class Runtime
         if ($this->closed) {
             return;
         }$now ??= (int)floor(microtime(true) * 1000);
+        if ($this->settings['accounts'] !== []) { $this->mappings?->tick(); }
         // Run one bounded React turn; M1's IPC and M2 curl polling retain control.
         if (class_exists(Loop::class)) {
             Loop::futureTick(static function (): void {Loop::stop();});
@@ -211,7 +212,7 @@ final class Runtime
                     $this->reconciler->validateInventory($id, $batch, $account);
                     $this->syncs[$id]['stage'] = 'deposit_pricing';
                     $this->accounting->prepareMarkets($id, $batch);
-                    $prices = new Prices($this->clients[$id]->publicClient(), $account, $this->settings['timeout_ms']);
+                    $prices = new Prices($this->clients[$id]->publicClient(), $account, $this->settings['timeout_ms'], $this->mappings);
                     $this->priceTasks[$id] = $prices;
                     try {
                         $storedDeposits = array_column($this->accounting->rows("SELECT * FROM operations WHERE account_id=? AND kind='deposit'", [$id]), null, 'exchange_operation_id');
@@ -483,7 +484,7 @@ final class Runtime
                 $state['adjustment_token'] = $this->adjustmentToken($id, $state);
             }$state['transport'] = count(array_filter($state['ws'], static fn ($s) => $s['state'] === 'connected')) > 0 ? 'websocket_with_rest' : 'rest';
         }unset($state);
-        return ['enabled' => $accounts !== [],'live_execution_enabled' => false,'accounts' => $accounts,'transfer_candidates' => $this->transferCandidates, 'transfer_blocks' => $this->transferBlocks];
+        return ['coingecko_mappings' => $this->mappings?->status(), 'enabled' => $accounts !== [],'live_execution_enabled' => false,'accounts' => $accounts,'transfer_candidates' => $this->transferCandidates, 'transfer_blocks' => $this->transferBlocks];
     }
     public function configuredAccountIds(): array { return array_column($this->settings['accounts'], 'account_id'); }
     public function command(string $command, array $args): array
@@ -547,6 +548,7 @@ final class Runtime
         }$this->closed = true;
         foreach ($this->priceTasks as $prices) { $prices->close(); }
         $this->priceTasks = [];
+        $this->mappings?->close();
         foreach ($this->clients as $id => $client) {
             $this->generation[$id]++;
             $client->close();

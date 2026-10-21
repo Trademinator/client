@@ -54,6 +54,8 @@ final class Settings
             // Compatibility for the superseded workaround. It has no effect on
             // reconciliation and is not forwarded to an exchange adapter.
             unset($a['bitso_lightning_payment_hashes']);
+            // CoinGecko identities now come exclusively from the Server.
+            unset($a['coingecko_ids']);
             foreach (['api_key','secret','password','uid'] as $key) {
                 foreach (['env','file'] as $kind) {
                     $field = $key.'_'.$kind;
@@ -83,7 +85,7 @@ final class Settings
             if (!is_string($a['valuation_quote']) || !preg_match('/^[A-Z0-9]{2,12}$/D', $a['valuation_quote'])) {
                 throw new InvalidArgumentException('Invalid valuation_quote.');
             }
-            foreach (['currency_markets','coingecko_ids','history_params'] as $key) {
+            foreach (['currency_markets','history_params'] as $key) {
                 $a[$key] ??= [];
                 if (!is_array($a[$key])) {
                     throw new InvalidArgumentException('Invalid '.$key.'.');

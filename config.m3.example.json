@@ -18,7 +18,6 @@
                 "valuation_quote": "USD",
                 "currency_markets": { "ATOM": "ATOM/USD" },
                 "public_price_exchanges": ["kraken"],
-                "coingecko_ids": { "ATOM": "cosmos" },
                 "history_params": {
                     "fetch_my_trades": { "mode": "backward_id", "cursor_param": "marker", "params": { "sort": "desc" } },
                     "fetch_open_orders": { "mode": "all" },

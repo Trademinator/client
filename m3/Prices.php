@@ -28,14 +28,16 @@ final class Prices
     private bool $closed = false;
     private const CACHE_LIMIT = 4096;
 
-    public function __construct(private object $receiving, private array $account, private int $timeoutMs)
+    public function __construct(private object $receiving, private array $account, private int $timeoutMs, private ?CoinGeckoMappings $mappings = null, private ?object $browser = null)
     {
         $this->providers[] = $receiving;
     }
     public function estimate(string $currency, string $quote, int $timestamp): PromiseInterface
     {
         return async(function () use ($currency, $quote, $timestamp): ?array {
-            $key = $currency.'/'.$quote.':'.$timestamp;
+            if ($this->closed) { return null; }
+            $this->mappings?->tick();
+            $key = $currency.'/'.$quote.':'.$timestamp.':'.($this->mappings?->revision() ?? 0);
             if (array_key_exists($key, $this->estimates)) { return $this->estimates[$key]; }
             $result = $this->lookup($currency, $quote, $timestamp);
             $this->remember($this->estimates, $key, $result);
@@ -82,10 +84,12 @@ final class Prices
                 }
             } catch (Throwable) { /* Next source; never substitute today's price. */ }
         }
-        $id = $this->account['coingecko_ids'][$currency] ?? null;
-        if (!$this->closed && is_string($id) && preg_match('/^[a-z0-9-]{1,100}$/D', $id)) {
+        if ($this->mappings !== null) { await($this->mappings->ready()); }
+        $exchange = $this->receiving->id ?? '';
+        $id = $this->mappings?->coinId($exchange, $currency, $quote);
+        if (!$this->closed && $id !== null) {
             try {
-                $browser = (new \React\Http\Browser())->withTimeout($this->timeoutMs / 1000);
+                $browser = $this->browser ?? (new \React\Http\Browser())->withTimeout($this->timeoutMs / 1000);
                 $headers = ['Accept' => 'application/json'];
                 if (isset($this->account['coingecko_api_key_env'])) {
                     $key = \Trademinator\Client\M2\Credentials::read($this->account['coingecko_api_key_env'], null);
@@ -97,7 +101,7 @@ final class Prices
                     fn () => $browser->get('https://api.coingecko.com/api/v3/coins/'.$id.'/history?date='.$date.'&localization=false', $headers));
                 $data = json_decode((string)$response->getBody(), true, 64, JSON_THROW_ON_ERROR);
                 $price = Numbers::decimal($data['market_data']['current_price'][strtolower($quote)] ?? null);
-                if (bccomp($price, '0', 24) > 0) {
+                if (!$this->closed && $this->mappings?->coinId($exchange, $currency, $quote) === $id && bccomp($price, '0', 24) > 0) {
                     return ['price' => $price,'source' => 'coingecko:'.$id,'quote' => $quote,'at_ms' => $timestamp,'date' => $date,'estimated' => true];
                 }
             } catch (Throwable) { /* Operator basis is the final fallback. */ }

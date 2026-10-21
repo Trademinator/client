@@ -83,7 +83,9 @@ final class Application
                             fn(string $level, string $event, array $context, string $message) => $daemon->log($level, $event, $context, $message));
                         $exchange = new \Trademinator\Client\M3\Runtime($db, $config->exchange, null,
                             fn(string $level, string $event, array $context, string $message) => $daemon->log($level, $event, $context, $message),
-                            new \Trademinator\Client\M3\HardPoints($db, $config->dataDir), $config->dataDir);
+                            new \Trademinator\Client\M3\HardPoints($db, $config->dataDir), $config->dataDir,
+                            new \Trademinator\Client\M3\CoinGeckoMappings($settings, sink:
+                                fn(string $level, string $event, array $context, string $message) => $daemon->log($level, $event, $context, $message)));
                         $paper = new \Trademinator\Client\M4\Runtime($config,
                             fn(string $level, string $event, array $context, string $message) => $daemon->log($level, $event, $context, $message));
                         $daemon->log('info', 'storage_ready', ['schema_version'=>Database::SCHEMA_VERSION, 'live_order_execution'=>false], 'Local storage verified; live trading is disabled.');
@@ -118,7 +120,9 @@ final class Application
                     EventRecord::hideSecret($settings['token']);
                     $nextExchange = new \Trademinator\Client\M3\Runtime($db, $candidate->exchange, null,
                         fn(string $level, string $event, array $context, string $message) => $daemon->log($level, $event, $context, $message),
-                        new \Trademinator\Client\M3\HardPoints($db, $candidate->dataDir), $candidate->dataDir);
+                        new \Trademinator\Client\M3\HardPoints($db, $candidate->dataDir), $candidate->dataDir,
+                        new \Trademinator\Client\M3\CoinGeckoMappings($settings, sink:
+                            fn(string $level, string $event, array $context, string $message) => $daemon->log($level, $event, $context, $message)));
                     $runtime?->reconfigure($settings);
                     $exchange?->close(); $exchange = $nextExchange;
                 };

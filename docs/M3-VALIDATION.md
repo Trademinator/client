@@ -651,3 +651,12 @@ archived movements leaves immutable archive hashes unchanged.
 
 Confirmation and explanation screens remain part of the future UIs; no review
 action or additional exchange capability is enabled by this patch.
+
+
+### Shared CoinGecko mapping regression
+
+Run `php tests/m3-coingecko-mappings.php`. It exercises authenticated endpoint
+routing, complete-page publication, exchange/pair isolation, correction and
+removal refreshes, rejected malformed catalogues, retry and timeout behavior,
+legacy configuration removal, actual historical lookup URLs, in-flight revocation,
+and daemon lifecycle integration. Fixtures perform no external HTTP requests.

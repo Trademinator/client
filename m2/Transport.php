@@ -62,7 +62,7 @@ final class Transport
         foreach ($this->requests as $request) {
             if ($request['request_id'] === $requestId) { throw new RuntimeException('Duplicate Server request identifier.'); }
         }
-        if (!preg_match('~^/api/v1/client/(?:markets(?:/[A-Za-z0-9_-]{1,128})?|risk-factor)$~D', $path)) {
+        if (!preg_match('~^/api/v1/client/(?:markets(?:/[A-Za-z0-9_-]{1,128})?|risk-factor|coingecko-mappings(?:\?after=[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})?)$~D', $path)) {
             throw new InvalidArgumentException('Invalid Server request path.');
         }
         $handle = curl_init();

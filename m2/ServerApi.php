@@ -17,6 +17,13 @@ final class ServerApi
         if (!self::identifier($subscriptionId)) { throw new RuntimeException('Invalid subscription identifier.'); }
         $this->transport->start($requestId, '/api/v1/client/markets/'.$subscriptionId);
     }
+    public function coinGeckoMappings(string $requestId, ?string $after = null): void
+    {
+        if ($after !== null && !preg_match('/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/D', $after)) {
+            throw new RuntimeException('Invalid mapping cursor.');
+        }
+        $this->transport->start($requestId, '/api/v1/client/coingecko-mappings'.($after === null ? '' : '?after='.$after));
+    }
     public function pending(): int { return $this->transport->pending(); }
     public function cancelAll(): void { $this->transport->cancelAll(); }
 
