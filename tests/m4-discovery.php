@@ -149,7 +149,9 @@ try {
     $modeFile=$dir.'/discovery-mode';putenv('TM4_DISCOVERY_MODE_FILE='.$modeFile);file_put_contents($modeFile,'unavailable');
     $nextDiscovery=new ReflectionProperty(Runtime::class,'nextDiscovery');$nextDiscovery->setValue($runtime,0.0);
     $deadline=microtime(true)+6;
-    do {$runtime->tick();$status=$runtime->status();if(isset($status['error'])){break;}usleep(20000);}while(microtime(true)<$deadline);
+    // The worker publishes its error before exiting. Wait until the supervisor
+    // handles that exit; only then is the retry deadline scheduled.
+    do {$runtime->tick();$status=$runtime->status();if(isset($status['error']) && in_array('paper_worker_failed',$events,true)){break;}usleep(20000);}while(microtime(true)<$deadline);
     check(str_contains($status['error']??'','temporarily unavailable') && count(array_filter($status['runs'],fn($s)=>$s['state']==='running'))===2,'A discovery outage preserves existing paper workers and reports the failure');
     check($nextDiscovery->getValue($runtime)>microtime(true),'Failed discovery schedules an automatic retry');
     file_put_contents($modeFile,'');$nextDiscovery->setValue($runtime,0.0);$deadline=microtime(true)+6;
