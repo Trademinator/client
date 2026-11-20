@@ -64,7 +64,9 @@
             "@php tests/m4-discovery.php",
             "@php tests/m4-server.php",
             "@php tests/m4-store.php",
-            "@php tests/m4-live-resilience.php"
+            "@php tests/m4-live-resilience.php",
+            "@php tests/m4-store-contention.php",
+            "@php tests/m4-ndax-book.php"
         ],
         "lint": "@php tools/lint.php",
         "doctor": "@php bin/client.php doctor",
@@ -100,7 +102,9 @@
             "@php tests/m4-discovery.php",
             "@php tests/m4-server.php",
             "@php tests/m4-store.php",
-            "@php tests/m4-live-resilience.php"
+            "@php tests/m4-live-resilience.php",
+            "@php tests/m4-store-contention.php",
+            "@php tests/m4-ndax-book.php"
         ]
     },
     "config": {

@@ -37,6 +37,29 @@ function feed(bool $invalid=false,int $candles=3):object {
         public function close():void {}
     };
 }
+function tradeFeed(int $count):object {
+    return new class(feed(),$count) {
+        public array $requests=[];
+        private ?array $rows=null;
+        public function __construct(private object $base,private int $count) {}
+        public function market(string $symbol):array { return $this->base->market($symbol); }
+        public function book(string $symbol):array { return $this->base->book($symbol); }
+        public function candles(string $symbol,string $period,int $limit):array { return $this->base->candles($symbol,$period,$limit); }
+        public function close():void { $this->base->close(); }
+        public function trades(string $symbol,?int $since):array {
+            $this->requests[]=$since;
+            if($this->rows===null) {
+                $this->rows=[];
+                for($i=1;$i<=$this->count;$i++) {
+                    $this->rows[]=['id'=>'source-'.$i,'timestamp'=>$since,'price'=>1.005,'amount'=>0.01,'side'=>'sell'];
+                    if($i===20){$this->rows[]=$this->rows[0];}
+                }
+                $this->rows[]=$this->rows[0];
+            }
+            return $this->rows;
+        }
+    };
+}
 function eventTypes(Store $store,string $run):array { return array_count_values(array_column(iterator_to_array($store->events($run)),'type')); }
 
 $store->create('unavailable',$settings);$calls=0;$feed=feed();$logs=[];
@@ -99,5 +122,36 @@ $active=true;$server=new Server($config,static function()use(&$active):array { $
 $keepRunning=static function()use(&$active):bool { return $active; };
 $stopped=Live::run($store,'shutdown-recovery',$server,1,static function(array $e):void {},static fn()=>feed(),$keepRunning);
 check(($store->run('shutdown-recovery')['state']['paused']['XRP/USD']??false) && (eventTypes($store,'shutdown-recovery')['resume']??0)===0 && $stopped['orders']===0,'Lease loss before recovery commit leaves both resume and decision unapplied');
+
+$store->create('trade-burst',$settings);$active=true;$feed=tradeFeed(125);$stateWrites=0;
+$fixtureDb=(new ReflectionProperty(Store::class,'db'))->getValue($store);
+$fixtureDb->sqliteCreateFunction('fixture_state_write',static function()use(&$stateWrites):int { return ++$stateWrites; },0);
+$fixtureDb->exec("CREATE TRIGGER fixture_trade_writes AFTER UPDATE OF state ON runs WHEN NEW.id='trade-burst' BEGIN SELECT fixture_state_write(); END");
+$server=new Server($config,static fn():array=>['signal'=>['action'=>'hodl']]);
+$finish=static function(array $event)use(&$active):void { if($event['event']==='paper_market_event'){$active=false;} };
+$burst=Live::run($store,'trade-burst',$server,2,$finish,static fn()=>$feed,static function()use(&$active):bool{return $active;});
+$fixtureDb->exec('DROP TRIGGER fixture_trade_writes');
+$tradeEvents=array_values(array_filter(iterator_to_array($store->events('trade-burst')),static fn($event)=>$event['type']==='trade'));
+$sourceIds=array_map(static fn($i)=>'source-'.$i,range(1,125));
+check(array_column($tradeEvents,'source_id')===$sourceIds && count(array_unique(array_column($tradeEvents,'id')))===125,
+    'A trade burst preserves all 125 ordered source records and deduplicates within and between batches');
+check($stateWrites<=10 && $burst['gaps']===[],'A trade burst uses bounded grouped commits instead of one durable state write per trade');
+check($store->replay('trade-burst','trade-burst-replay')['matched'],'Batched live trades replay to the exact persisted state');
+
+$store->create('trade-retry',$settings);$active=true;$feed=tradeFeed(125);$rejectOnce=true;
+$fixtureDb->sqliteCreateFunction('fixture_reject_trade',static function()use(&$rejectOnce):int {
+    if($rejectOnce){$rejectOnce=false;throw new RuntimeException('Fixture trade commit failed.');}return 0;
+},0);
+$fixtureDb->exec("CREATE TRIGGER fixture_trade_failure BEFORE INSERT ON events WHEN NEW.run_id='trade-retry' AND instr(NEW.payload,'\"source_id\":\"source-30\"')>0 BEGIN SELECT fixture_reject_trade(); END");
+$retried=Live::run($store,'trade-retry',$server,7,$finish,static fn()=>$feed,static function()use(&$active):bool{return $active;});
+$fixtureDb->exec('DROP TRIGGER fixture_trade_failure');
+$retriedEvents=array_values(array_filter(iterator_to_array($store->events('trade-retry')),static fn($event)=>$event['type']==='trade'));
+check(!$rejectOnce && count($feed->requests)===2 && $feed->requests[0]===$feed->requests[1],
+    'A failed first trade batch retries from its original capture boundary');
+check(array_column($retriedEvents,'source_id')===$sourceIds && count(array_unique(array_column($retriedEvents,'id')))===125,
+    'Failed batch persistence cannot advance deduplication or lose rolled-back source trades');
+check(count($retried['gaps'])===1 && (eventTypes($store,'trade-retry')['resume']??0)===1,
+    'Trade persistence recovery retains its gap and resumes only after successful fresh inference');
+check($store->replay('trade-retry','trade-retry-replay')['matched'],'Failed and retried trade capture preserves deterministic replay');
 
 echo json_encode(['milestone'=>'M4 live resilience','checks'=>$checks,'status'=>'passed','network_requests'=>0,'exchange_orders_submitted'=>0],JSON_PRETTY_PRINT).PHP_EOL;

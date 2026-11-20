@@ -84,6 +84,27 @@ batchReject(static fn() => $store->applyBatch('batch', array_slice($events, 0, 5
 $store = new Store($dir);
 batchCheck($store->run('batch')['state'] === $before, 'Restart resumes the exact last committed batch');
 
+// An external writer does not honor the cooperative gate. Its bounded SQLite
+// failure must roll back cleanly and release our gate before an exact retry.
+$store->create('external-lock', $config);
+$blockedStore = new Store($dir);
+$blockedDb = (new ReflectionProperty(Store::class, 'db'))->getValue($blockedStore);
+$blockedDb->exec('PRAGMA busy_timeout=20');
+$external = new PDO('sqlite:'.$dir.'/paper.sqlite', null, null, [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]);
+$captured = [['id'=>'captured-before-lock','type'=>'clock','time_ms'=>1], ['id'=>'captured-after-lock','type'=>'clock','time_ms'=>2]];
+$external->exec('BEGIN IMMEDIATE'); $failure = null;
+try { $blockedStore->applyBatch('external-lock', $captured); }
+catch (PDOException $error) { $failure = $error; }
+finally { $external->exec('ROLLBACK'); $blockedDb->exec('PRAGMA busy_timeout=5000'); }
+batchCheck($failure !== null && str_contains($failure->getMessage(), 'database is locked'),
+    'An external lock preserves the original bounded BEGIN failure without a spurious rollback error');
+batchCheck($store->run('external-lock')['state']['sequence'] === 0 && iterator_to_array($store->events('external-lock')) === [],
+    'An unsuccessful transaction start persists none of its captured events');
+$recoveredStore = new Store($dir); $recoveredStore->applyBatch('external-lock', $captured);
+batchCheck(iterator_to_array($recoveredStore->events('external-lock')) === $captured
+    && $recoveredStore->run('external-lock')['state']['sequence'] === 2,
+    'The released writer gate permits another connection to retry the exact captured IDs once');
+
 $workers = [];
 for ($i = 0; $i < 4; $i++) { $store->create('writer-'.$i, $config); }
 try {

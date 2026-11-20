@@ -16,9 +16,13 @@ final class LiveFeed
     {
         if(!preg_match('/^[a-z][a-z0-9]{1,40}$/D',$exchange)) { throw new RuntimeException('Invalid exchange.'); }
         $class='\\ccxt\\'.$exchange;if(!class_exists($class)) { throw new RuntimeException('Exchange unavailable in installed CCXT.'); }
+        if($exchange==='ndax') { $class=NdaxRest::class; }
         $this->rest=new $class(['enableRateLimit'=>true,'timeout'=>10000]);$this->rest->load_markets();
         $pro='\\ccxt\\pro\\'.$exchange;
-        if(class_exists($pro)) { $this->ws=new $pro(['enableRateLimit'=>true,'timeout'=>5000,'newUpdates'=>true]); }
+        if(class_exists($pro)) {
+            if($exchange==='ndax') { $pro=NdaxPro::class; }
+            $this->ws=new $pro(['enableRateLimit'=>true,'timeout'=>5000,'newUpdates'=>true]);
+        }
     }
     public static function decimal(mixed $v): string { return bcconv($v); }
     public function market(string $symbol): array
@@ -34,10 +38,24 @@ final class LiveFeed
     public function book(string $symbol): array
     {
         if($this->ws!==null && ($this->ws->has['watchOrderBook']??false)) {
-            try { $book=await(timeout($this->ws->watch_order_book($symbol,50),5));$book['transport']='websocket';return $book; }
+            try { $book=self::bookArray(await(timeout($this->ws->watch_order_book($symbol,50),5)));$book['transport']='websocket';return $book; }
             catch(\Throwable) { $this->close(); }
         }
-        $book=$this->rest->fetch_order_book($symbol,50);$book['transport']='rest';return $book;
+        $book=self::bookArray($this->rest->fetch_order_book($symbol,50));$book['transport']='rest';return $book;
+    }
+    /** CCXT Pro returns ArrayObject books with OrderBookSide objects. */
+    private static function bookArray(mixed $book): array
+    {
+        if($book instanceof \ArrayObject) { $book=$book->getArrayCopy(); }
+        if(!is_array($book)) { throw new RuntimeException('Invalid public order book container.'); }
+        foreach(['bids','asks'] as $name) {
+            $side=$book[$name]??null;
+            if($side instanceof \JsonSerializable) { $side=$side->jsonSerialize(); }
+            elseif($side instanceof \ArrayObject) { $side=$side->getArrayCopy(); }
+            if(!is_array($side)) { throw new RuntimeException('Invalid public order book side container.'); }
+            $book[$name]=$side;
+        }
+        return $book;
     }
     public function trades(string $symbol,?int $since): array
     {
