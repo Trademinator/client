@@ -25,8 +25,9 @@ final class IntelligenceSetup
                 if ($spec['family'] !== 'production') { throw new RuntimeException('Automatic model selection uses the production model. Explicit shadow models remain available for custom research runs.'); }
                 $response = $server->request($spec['subscription'], 'replay/models', query: ['model_exchange' => $exchange, 'period' => $period]);
                 if (($response['api_version'] ?? null) !== 1 || ($response['symbol'] ?? null) !== $symbol || !is_array($response['models'] ?? null)) { throw new RuntimeException('Invalid Server model discovery response for '.$symbol.'.'); }
-                $matches = array_values(array_filter($response['models'], static fn($row): bool => is_array($row) && ($row['family'] ?? null) === 'production' && ($row['current'] ?? false) === true));
-                if (count($matches) !== 1) { throw new CurrentModelUnavailable('No unique current production model for '.$exchange.' '.$symbol.' '.$period.'. Wait for the Server to publish its intelligence model.'); }
+                $matches = array_values(array_filter($response['models'], static fn($row): bool => is_array($row)
+                    && ($row['family'] ?? null) === 'production' && ($row['current'] ?? false) === true && ($row['status'] ?? null) === 'ready'));
+                if (count($matches) !== 1) { throw new CurrentModelUnavailable('No unique ready current production model for '.$exchange.' '.$symbol.' '.$period.'. Wait for the Server to publish its intelligence model.'); }
                 $spec['model_id'] = $matches[0]['model_id'] ?? null;
             }
             foreach (['subscription', 'model_id'] as $field) {

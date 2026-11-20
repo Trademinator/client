@@ -61,7 +61,10 @@
             "@php tests/m3-bitso-history-probe.php",
             "@php tests/m4.php",
             "@php tests/m4-config.php",
-            "@php tests/m4-discovery.php"
+            "@php tests/m4-discovery.php",
+            "@php tests/m4-server.php",
+            "@php tests/m4-store.php",
+            "@php tests/m4-live-resilience.php"
         ],
         "lint": "@php tools/lint.php",
         "doctor": "@php bin/client.php doctor",
@@ -94,7 +97,10 @@
         "test:m4": [
             "@php tests/m4.php",
             "@php tests/m4-config.php",
-            "@php tests/m4-discovery.php"
+            "@php tests/m4-discovery.php",
+            "@php tests/m4-server.php",
+            "@php tests/m4-store.php",
+            "@php tests/m4-live-resilience.php"
         ]
     },
     "config": {

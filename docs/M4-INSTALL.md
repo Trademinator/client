@@ -6,7 +6,10 @@ on top of Client commit `965ae393c024de5d4708021743a560898caf1b0c` with those
 unified daemon/configuration changes installed locally.
 Use it instead of `trademinator-client-auto-setup.patch` on this baseline;
 there is no need to reverse the earlier unified-config patch.
-The already-applied M4 Server API is sufficient; no new Server patch is needed.
+This Client follow-up uses the existing M4 Server endpoints. Live acceptance also
+requires independent general/inference rate-limit counters and loadable compatible
+artifacts for the selected models; Client retry handling does not repair those
+Server conditions.
 
 ```bash
 git apply --check /path/to/trademinator-client-auto-setup-incremental.patch
@@ -15,6 +18,9 @@ composer dump-autoload
 php -d memory_limit=512M tests/m4.php
 php -d memory_limit=512M tests/m4-config.php
 php -d memory_limit=512M tests/m4-discovery.php
+php -d memory_limit=512M tests/m4-server.php
+php -d memory_limit=512M tests/m4-store.php
+php -d memory_limit=512M tests/m4-live-resilience.php
 ```
 
 ## Credentials are the required input
@@ -66,7 +72,7 @@ trading using public exchange data and only the Server key. Setting
 | Local exchange account UUID | Reuse saved credential binding or sole existing ledger; otherwise create a local account |
 | Subscriptions and exact pairs | Authenticated Server active-subscription catalog |
 | Candle period | Server-selected period for each subscription |
-| Current model UUID | Server's unique current production model for that exchange, exact pair and period |
+| Current model UUID | Server's unique ready current production model for that exchange, exact pair and period |
 | Risk factor | Server questionnaire/default risk endpoint |
 | Starting paper funds | Server's `paper_initial_quote`; one shared budget per quote currency per exchange |
 | Reporting currency | Most frequent quote in that paper account, with deterministic alphabetical ties |
@@ -94,10 +100,12 @@ account configuration; the client cannot safely guess which ledger owns a key.
 
 Automatic discovery runs in a separate process so local control remains responsive.
 The daemon refreshes subscription discovery every minute, including retries for
-unavailable intelligence. A market without a unique current production model waits
+unavailable intelligence. A market without a unique ready current production model waits
 independently; it does not block ready markets on the same exchange. When it later
 becomes ready, the enlarged market set starts as a distinct saved run. Per-exchange
-workers drive the paper engine. `status`
+workers drive the paper engine. An abstaining head is not an eligible model even
+when the Server marks it current; a missing readiness status also waits. Existing
+explicit model pins remain immutable and are not silently replaced. `status`
 shows their run IDs and each market's state under `ledger.paper_trading`.
 `paper-report` returns all current automatic runs without requiring their IDs.
 
@@ -107,6 +115,13 @@ not reset that run or silently change its experiment. Changing the active market
 set or selected periods creates a distinct run with an explicit creation event;
 old runs remain available using `paper-report --run=ID`. No real ledger balances
 are used as paper starting capital. Storage is `<data_dir>/paper/paper.sqlite`.
+
+A temporary Server failure during discovery keeps the previous active partial run
+only while every saved market still matches the fresh active catalog's exact
+subscription, pair and selected period. The run ID, model pins and saved settings
+remain unchanged. An unsubscribe or period/identity change still removes the old
+worker. Missing manifests never reactivate archived runs. Setup warnings identify
+retained runs while discovery retries.
 
 Stop closes all paper workers. Loss of the supervising daemon's heartbeat also
 stops paper writes. A live-session lock prevents concurrent workers advancing one
@@ -172,6 +187,21 @@ pauses that market; an unproven interval is recorded as unverified. Historical
 REST trades received late cannot fill an order accepted after their source time.
 REST does not prove complete event coverage; this is a visible-depth simulation,
 not exchange matching-engine reconstruction.
+
+M4 workers sharing a data directory coordinate Server request pacing. HTTP 429
+honors `Retry-After` through a shared cooldown; inference waits without blocking
+book capture. Failed feed/inference requests back off from 5 to 60 seconds, or
+longer when the Server requests it. A locally deferred request is not itself a
+data gap. After a real availability failure, books may continue to be captured,
+but simulated execution stays paused until fresh inference succeeds. Resume and
+the new decision commit together, and previous gap evidence remains in the report.
+This pacing covers M4 in that data directory; it does not coordinate M3 or other
+Client instances using different directories.
+
+Warmup candles commit in bounded batches of at most 50 events. Individual event
+payloads and sequence numbers remain available for exact replay, while each batch
+writes the resulting state once. Invalid books remain unavailable; backoff never
+turns them into accepted liquidity.
 
 The 24-hour acceptance run must be performed on your machine with the patched
 Server and selected models. `live_observations`, gaps and `live_24h_observed` are

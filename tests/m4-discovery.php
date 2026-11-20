@@ -13,6 +13,8 @@ use Trademinator\Client\M4\IntelligenceSetup;
 use Trademinator\Client\M4\MarketRules;
 use Trademinator\Client\M4\Runtime;
 use Trademinator\Client\M4\Server;
+use Trademinator\Client\M4\ServerRequestFailed;
+use Trademinator\Client\M4\RequestDeferred;
 use Trademinator\Client\M4\Store;
 use Trademinator\Client\M4\Worker;
 
@@ -29,14 +31,20 @@ function answer(string $sub,string $resource,?array $body=null,array $query=[]):
     $modeFile=getenv('TM4_DISCOVERY_MODE_FILE');
     $mode=$modeFile && is_file($modeFile)?trim(file_get_contents($modeFile)):'';
     if($mode==='unavailable' && $resource==='markets') { throw new RuntimeException('Fixture Server is temporarily unavailable.'); }
-    if($resource==='markets') { return catalog(); }
+    if($resource==='markets') {
+        $result=catalog();
+        if($mode==='partial-inactive') { $result['markets'][1]['active']=false; }
+        return $result;
+    }
+    if($mode==='partial-rate-limited' && $resource==='market' && $sub===uuid(1)) { throw new ServerRequestFailed(429,1000); }
+    if(str_starts_with($mode,'partial') && $resource==='replay/models' && $sub===uuid(1)) { return ['api_version'=>1,'symbol'=>'ATOM/USD','models'=>[]]; }
     if($resource==='risk-factor') { return ['api_version'=>1,'risk_factor'=>'0.37','source'=>'questionnaire','algorithm_version'=>'questionnaire-risk-v1']; }
     $row=array_values(array_filter(catalog()['markets'],fn($m)=>$m['subscription_id']===$sub))[0];
     if($resource==='market') { return ['api_version'=>1,'market'=>[...$row,'settings'=>['paper_initial_quote'=>$sub===uuid(2)?'20000':'10000']]]; }
     if($resource==='replay/models') { return ['api_version'=>1,'symbol'=>$row['symbol'],'models'=>[
-        ['model_id'=>uuid(80),'family'=>'production','current'=>false],
-        ['model_id'=>uuid(90),'family'=>'shadow','current'=>true],
-        ['model_id'=>uuid(100+(int)substr($sub,-2)),'family'=>'production','current'=>true],
+        ['model_id'=>uuid(80),'family'=>'production','current'=>false,'status'=>'ready'],
+        ['model_id'=>uuid(90),'family'=>'shadow','current'=>true,'status'=>'ready'],
+        ['model_id'=>uuid(100+(int)substr($sub,-2)),'family'=>'production','current'=>true,'status'=>'ready'],
     ]]; }
     if($resource==='replay/infer') { return ['signal'=>['action'=>'buy'],'provenance'=>['model_id'=>$body['model_id'],'fixture'=>true]]; }
     throw new RuntimeException('Unexpected request: '.$resource);
@@ -103,14 +111,16 @@ try {
     $partialServer=new Server($partialConfig,static function($sub,$resource,$body,$query){
         $response=answer($sub,$resource,$body,$query);
         if($resource==='replay/models' && $sub===uuid(1)) {
-            foreach($response['models'] as &$model) { if(($model['family']??null)==='production') { $model['current']=false; } } unset($model);
+            foreach($response['models'] as &$model) { if(($model['family']??null)==='production' && $model['current']===true) { $model['status']='abstaining'; } } unset($model);
         }
         return $response;
     });
     $partial=AutomaticSetup::discover($partialConfig,$partialServer,'feed');$partialByExchange=[];
     foreach($partial['plans'] as $plan) { $partialByExchange[$plan['source_exchange']]=$plan; }
-    check(count($partial['plans'])===2 && array_keys($partialByExchange['bitso']['markets'])===['XRP/USD'],
-        'Unavailable intelligence waits per market without blocking ready peers');
+    check(count($partial['plans'])===2 && array_keys($partialByExchange['bitso']['markets'])===['XRP/USD']
+        && $partialByExchange['bitso']['markets']['XRP/USD']['intelligence']['period']==='15m'
+        && $partialByExchange['bitso']['markets']['XRP/USD']['intelligence']['model_id']===uuid(102),
+        'An abstaining current head waits without blocking the ready Bitso XRP/USD 15m model');
     check(count($partial['warnings'])===1 && ($partial['warnings'][0]['symbol']??null)==='ATOM/USD'
         && ($partial['warnings'][0]['period']??null)==='15m' && str_contains($partial['warnings'][0]['reason']??'','production model'),
         'Skipped market warning identifies its exchange pair and period');
@@ -119,6 +129,72 @@ try {
     foreach($partialAgain['plans'] as $plan) { $partialAgainByExchange[$plan['source_exchange']]=$plan; }
     check($partialAgainByExchange['bitso']['run_id']===$partialRun && $partialAgain['created']===[],
         'Partial automatic run resumes without resetting while its peer remains unavailable');
+    $partialStore=new Store($partialConfig->dataDir.'/paper');
+    $partialStore->apply($partialRun,['id'=>'before-refresh','type'=>'book','symbol'=>'XRP/USD','time_ms'=>1000,'bids'=>[['9','10']],'asks'=>[['10','10']]]);
+    $savedPartial=$partialStore->run($partialRun);
+    $retryServer=static fn(int $status,string $sub,string $resource):Server=>new Server($partialConfig,
+        static function($id,$name,$body,$query)use($partialServer,$status,$sub,$resource){
+            if($id===$sub && $name===$resource) { throw new ServerRequestFailed($status,1000); }
+            return $partialServer->request($id,$name,$body,$query);
+        });
+    foreach([[429,uuid(1),'market'],[503,uuid(2),'replay/models'],[0,uuid(1),'market']] as [$statusCode,$sub,$resource]) {
+        $retained=AutomaticSetup::discover($partialConfig,$retryServer($statusCode,$sub,$resource),'feed');
+        $retainedBitso=array_values(array_filter($retained['plans'],fn($p)=>$p['source_exchange']==='bitso'));
+        check($retainedBitso===[$partialByExchange['bitso']] && $retained['created']===[]
+            && in_array($partialRun,$partialStore->automaticIds(),true) && $partialStore->run($partialRun)===$savedPartial
+            && count(array_filter($retained['warnings'],fn($w)=>($w['retained_run_id']??null)===$partialRun))===1,
+            'Transient HTTP '.$statusCode.' during '.$resource.' retains the active partial run, pins and ledger state');
+    }
+    $deferred=AutomaticSetup::discover($partialConfig,new Server($partialConfig,static function($sub,$resource,$body,$query)use($partialServer){
+        if($resource==='market' && $sub===uuid(1)) { throw new RequestDeferred(1000); }
+        return $partialServer->request($sub,$resource,$body,$query);
+    }),'feed');
+    check(count(array_filter($deferred['plans'],fn($p)=>$p['run_id']===$partialRun))===1,
+        'A shared request cooldown retains the authorized active partial run');
+    foreach(['removed','inactive','period','subscription'] as $change) {
+        $changed=new Server($partialConfig,static function($sub,$resource,$body,$query)use($change){
+            if($resource==='markets') {
+                $response=catalog();
+                if($change==='removed') { array_splice($response['markets'],1,1); }
+                if($change==='inactive') { $response['markets'][1]['active']=false; }
+                if($change==='period') { $response['markets'][1]['period']='30m'; }
+                if($change==='subscription') { $response['markets'][1]['subscription_id']=uuid(22); }
+                return $response;
+            }
+            if($resource==='market') { throw new ServerRequestFailed(429,1000); }
+            return answer($sub,$resource,$body,$query);
+        });
+        $changedResult=AutomaticSetup::discover($partialConfig,$changed,'feed');
+        check(count(array_filter($changedResult['plans'],fn($p)=>$p['source_exchange']==='bitso'))===0
+            && !in_array($partialRun,$partialStore->automaticIds(),true) && $partialStore->run($partialRun)===$savedPartial,
+            'Authoritative '.$change.' change prevents retention during a transient discovery failure');
+        AutomaticSetup::discover($partialConfig,$partialServer,'feed');
+    }
+    $invalid=new Server($partialConfig,static function($sub,$resource,$body,$query)use($partialServer){
+        $response=$partialServer->request($sub,$resource,$body,$query);
+        if($resource==='market' && $sub===uuid(1)) { $response['market']['symbol']='ATOM/USDT'; }
+        return $response;
+    });
+    $invalidResult=AutomaticSetup::discover($partialConfig,$invalid,'feed');
+    check(count(array_filter($invalidResult['plans'],fn($p)=>$p['source_exchange']==='bitso'))===0,
+        'A permanent market identity mismatch is not hidden by retaining a saved run');
+    AutomaticSetup::discover($partialConfig,$partialServer,'feed');
+    $unauthorized=AutomaticSetup::discover($partialConfig,$retryServer(403,uuid(1),'market'),'feed');
+    check(count(array_filter($unauthorized['plans'],fn($p)=>$p['source_exchange']==='bitso'))===0,
+        'A nontransient API refusal does not retain a prior active run');
+    $archived=AutomaticSetup::discover($partialConfig,$retryServer(429,uuid(1),'market'),'feed');
+    check(count(array_filter($archived['plans'],fn($p)=>$p['source_exchange']==='bitso'))===0
+        && $partialStore->exists($partialRun) && $partialStore->run($partialRun)===$savedPartial,
+        'Transient failure does not reactivate an archived run omitted from the active manifest');
+    unlink($partialConfig->dataDir.'/paper/automatic-runs.json');
+    $withoutManifest=AutomaticSetup::discover($partialConfig,$retryServer(429,uuid(1),'market'),'feed');
+    check(count(array_filter($withoutManifest['plans'],fn($p)=>$p['source_exchange']==='bitso'))===0,
+        'A missing active manifest does not authorize fallback to historical automatic ledgers');
+    AutomaticSetup::discover($partialConfig,$partialServer,'feed');
+    $newConfig=new Config(['server_api_key_env'=>'TM4_DISCOVERY_KEY','paper_trading'=>['enabled'=>true],'data_dir'=>$dir.'/first-failure']);
+    $firstFailure=AutomaticSetup::discover($newConfig,$retryServer(429,uuid(1),'market'),'feed');
+    check(count(array_filter($firstFailure['plans'],fn($p)=>$p['source_exchange']==='bitso'))===0,
+        'A first discovery failure does not invent a fallback paper run');
     $recovered=AutomaticSetup::discover($partialConfig,new Server($partialConfig,Closure::fromCallable('answer')),'feed');$recoveredByExchange=[];
     foreach($recovered['plans'] as $plan) { $recoveredByExchange[$plan['source_exchange']]=$plan; }
     check(count($recoveredByExchange['bitso']['markets'])===2 && $recoveredByExchange['bitso']['run_id']!==$partialRun
@@ -130,6 +206,30 @@ try {
     check($resolved['markets']['ATOM/USD']['intelligence']['subscription']===uuid(1),'Custom configurations can also omit UUIDs');
     $bad=new Server($minimal,static function($sub,$resource,$body,$query){$a=answer($sub,$resource,$body,$query);if($resource==='replay/models'){$a['models']=[];}return $a;});
     check(rejects(fn()=>IntelligenceSetup::resolve($custom,$bad),'production model'),'Missing current models cause a clear wait condition rather than selection of an unrelated model');
+    $missingStatus=new Server($minimal,static function($sub,$resource,$body,$query){
+        $response=answer($sub,$resource,$body,$query);
+        if($resource==='replay/models') { foreach($response['models'] as &$model) { unset($model['status']); } unset($model); }
+        return $response;
+    });
+    check(rejects(fn()=>IntelligenceSetup::resolve($custom,$missingStatus),'ready current production model'),
+        'A current model with missing readiness status is not selected automatically');
+    $ambiguousModels=new Server($minimal,static function($sub,$resource,$body,$query){
+        $response=answer($sub,$resource,$body,$query);
+        if($resource==='replay/models') { $response['models'][]=['model_id'=>uuid(199),'family'=>'production','current'=>true,'status'=>'ready']; }
+        return $response;
+    });
+    check(rejects(fn()=>IntelligenceSetup::resolve($custom,$ambiguousModels),'No unique ready current production model'),
+        'Multiple ready current production models remain an ambiguous wait condition');
+    $oneReady=new Server($minimal,static function($sub,$resource,$body,$query){
+        $response=answer($sub,$resource,$body,$query);
+        if($resource==='replay/models') { $response['models'][]=['model_id'=>uuid(199),'family'=>'production','current'=>true,'status'=>'abstaining']; }
+        return $response;
+    });
+    check(IntelligenceSetup::resolve($custom,$oneReady)['markets']['ATOM/USD']['intelligence']['model_id']===uuid(101),
+        'Only a ready current production candidate participates in automatic selection');
+    $explicitPins=$store->run($bitso['run_id'])['config'];
+    check(IntelligenceSetup::resolve($explicitPins,new Server($minimal,static fn()=>throw new RuntimeException('Pinned models must not be rediscovered'))) === $explicitPins,
+        'Explicit model pins remain immutable and do not trigger automatic readiness selection');
     $duplicate=new Server($minimal,static function($sub,$resource,$body,$query){$a=answer($sub,$resource,$body,$query);if($resource==='markets'){$copy=$a['markets'][0];$copy['subscription_id']=uuid(9);$a['markets'][]=$copy;}return $a;});
     check(rejects(fn()=>IntelligenceSetup::resolve($custom,$duplicate),'found 2'),'Ambiguous subscriptions are not guessed');
     $wrong=new Server($minimal,static function($sub,$resource,$body,$query){$a=answer($sub,$resource,$body,$query);if($resource==='replay/models'){$a['symbol']='ATOM/USDT';}return $a;});
@@ -186,6 +286,44 @@ try {
     check(count($store->run($bitso['run_id'])['state']['fills'])===2,'Discovery refresh retains the same paper account without duplicate fills or a balance reset');
     $runtime->close();$saved=$store->run($bitso['run_id']);usleep(100000);
     check($store->run($bitso['run_id'])===$saved,'Daemon shutdown stops all discovered writers');
+
+    $partialRuntimeConfig=new Config(['server_api_key_env'=>'TM4_DISCOVERY_KEY','paper_trading'=>['enabled'=>true],'data_dir'=>$dir.'/partial-runtime']);
+    $runtimeEvents=[];file_put_contents($modeFile,'partial');
+    $runtime=new Runtime($partialRuntimeConfig,static function($level,$name,$context,$message)use(&$runtimeEvents){$runtimeEvents[]=['name'=>$name,'context'=>$context];},[PHP_BINARY,__FILE__,'--worker']);
+    $deadline=microtime(true)+6;
+    do {
+        $runtime->tick();$status=$runtime->status();
+        $ready=count($status['runs']??[])===2 && count(array_filter($status['runs'],fn($s)=>$s['state']==='running'))===2;
+        if($ready){break;}usleep(20000);
+    }while(microtime(true)<$deadline);
+    check($ready,'Supervisor starts the available partial exchange plan while its peer waits');
+    $activeBitso=array_values(array_filter(array_keys($status['runs']),fn($id)=>str_starts_with($id,'auto-bitso-')))[0];
+    $runtimeStore=new Store($partialRuntimeConfig->dataDir.'/paper');$beforeRefresh=$runtimeStore->run($activeBitso);
+    $startsBefore=count(array_filter($runtimeEvents,fn($e)=>$e['name']==='paper_resumed' && ($e['context']['paper_run_id']??null)===$activeBitso));
+    file_put_contents($modeFile,'partial-rate-limited');$nextDiscovery->setValue($runtime,0.0);$deadline=microtime(true)+6;
+    do {
+        $runtime->tick();$status=$runtime->status();
+        $retentionLogged=count(array_filter($runtimeEvents,fn($e)=>$e['name']==='paper_setup_waiting' && ($e['context']['retained_run_id']??null)===$activeBitso))>0;
+        if($retentionLogged && $nextDiscovery->getValue($runtime)>microtime(true)
+            && $runtimeStore->run($activeBitso)['state']['sequence']>$beforeRefresh['state']['sequence']){break;}usleep(20000);
+    }while(microtime(true)<$deadline);
+    check($retentionLogged && ($status['runs'][$activeBitso]['state']??null)==='running'
+        && in_array($activeBitso,$runtimeStore->automaticIds(),true)
+        && count(array_filter($runtimeEvents,fn($e)=>$e['name']==='paper_resumed' && ($e['context']['paper_run_id']??null)===$activeBitso))===$startsBefore,
+        'An exchange discovery rate limit keeps the existing worker running without a restart');
+    $afterRefresh=$runtimeStore->run($activeBitso);
+    check($afterRefresh['config']===$beforeRefresh['config'] && $afterRefresh['state']['sequence']>$beforeRefresh['state']['sequence'],
+        'The retained partial worker keeps processing its original immutable ledger');
+    file_put_contents($modeFile,'partial-inactive');$nextDiscovery->setValue($runtime,0.0);$deadline=microtime(true)+6;
+    do {
+        $runtime->tick();$status=$runtime->status();
+        if($nextDiscovery->getValue($runtime)>microtime(true) && !isset($status['runs'][$activeBitso])){break;}usleep(20000);
+    }while(microtime(true)<$deadline);
+    check(!isset($status['runs'][$activeBitso]) && !in_array($activeBitso,$runtimeStore->automaticIds(),true),
+        'An authoritative unsubscribe still removes and stops the previously retained worker');
+    $removedState=$runtimeStore->run($activeBitso);usleep(100000);
+    check($runtimeStore->run($activeBitso)===$removedState,'An unsubscribed partial run has no continuing writer');
+    $runtime->close();file_put_contents($modeFile,'');
     $file=$dir.'/config.json';file_put_contents($file,json_encode($minimal->toArray()));
     $process=proc_open([PHP_BINARY,dirname(__DIR__).'/bin/client.php','paper-report','--config='.$file],[1=>['pipe','w'],2=>['pipe','w']],$pipes);
     $out=stream_get_contents($pipes[1]);$error=stream_get_contents($pipes[2]);fclose($pipes[1]);fclose($pipes[2]);

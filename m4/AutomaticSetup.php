@@ -24,6 +24,9 @@ final class AutomaticSetup
         }
         ksort($groups);
         $store = new Store($config->dataDir.'/paper');
+        // Only the last published active set can be retained; archived ledgers
+        // must not restart merely because a later discovery request failed.
+        $previousIds = is_file($config->dataDir.'/paper/automatic-runs.json') ? $store->automaticIds() : [];
         try {
             foreach ($groups as $exchange => $subscriptions) {
                 if ($keepRunning !== null && !$keepRunning()) { throw new RuntimeException('Automatic paper setup stopped.'); }
@@ -87,7 +90,16 @@ final class AutomaticSetup
                     }
                     $plans[] = ['enabled' => true, 'run_id' => $run, ...$settings];
                 } catch (\Throwable $error) {
-                    $warnings[] = ['exchange' => $exchange, 'reason' => $error->getMessage()];
+                    $warning = ['exchange' => $exchange, 'reason' => $error->getMessage()];
+                    if ($error instanceof RequestDeferred || ($error instanceof ServerRequestFailed && $error->isTransient())) {
+                        $previous = self::previousPlan($store, $previousIds, $exchange, $subscriptions);
+                        if ($previous !== null) {
+                            $plans[] = $previous;
+                            $warning['retained_run_id'] = $previous['run_id'];
+                            $warning['reason'] .= ' Existing paper run continues while discovery waits to retry.';
+                        }
+                    }
+                    $warnings[] = $warning;
                 }
             }
         } finally { foreach ($feeds as $feed) { $feed->close(); } }
@@ -95,6 +107,27 @@ final class AutomaticSetup
         if ($groups === [] && $warnings === []) { $warnings[] = ['reason' => 'No active Server subscriptions. Activate your markets on the Server; UUIDs are discovered automatically.']; }
         Paths::atomicJson($config->dataDir.'/paper/automatic-runs.json', ['runs' => array_column($plans, 'run_id')]);
         return ['plans' => $plans, 'warnings' => $warnings, 'created' => $created];
+    }
+
+    private static function previousPlan(Store $store, array $previousIds, string $exchange, array $subscriptions): ?array
+    {
+        $authorized = array_fill_keys(array_map(self::identity(...), $subscriptions), true);
+        $matches = [];
+        foreach (array_unique($previousIds) as $run) {
+            if (!$store->exists($run)) { continue; }
+            $settings = $store->run($run)['config'];
+            if ($settings['source_exchange'] !== $exchange || $settings['execution_exchange'] !== $exchange) { continue; }
+            foreach ($settings['markets'] as $symbol => $market) {
+                $spec = $market['intelligence'] ?? [];
+                if (!isset($spec['subscription'], $spec['period'])
+                    || !isset($authorized[$spec['subscription'].'|'.$symbol.'|'.$spec['period']])) {
+                    continue 2;
+                }
+            }
+            $matches[] = ['enabled' => true, 'run_id' => $run, ...$settings];
+        }
+        // An ambiguous manifest is not permission to choose a different ledger.
+        return count($matches) === 1 ? $matches[0] : null;
     }
 
     private static function identity(array $subscription): string

@@ -9,13 +9,15 @@ use Throwable;
 /** An event and its resulting state commit together; real client.sqlite is never opened. */
 final class Store
 {
+    public const MAX_BATCH_EVENTS = 50;
     private PDO $db;
     public function __construct(private readonly string $directory)
     {
         if(!is_dir($directory) && !mkdir($directory,0700,true)) { throw new RuntimeException('Cannot create paper directory.'); }
         $this->db=new PDO('sqlite:'.$directory.'/paper.sqlite',null,null,[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC]);
         chmod($directory.'/paper.sqlite',0600);
-        $this->db->exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
+        $this->db->exec('PRAGMA busy_timeout=5000');
+        $this->db->exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, config TEXT NOT NULL, state TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events(run_id TEXT NOT NULL, sequence INTEGER NOT NULL, id TEXT NOT NULL, digest TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(run_id,id), UNIQUE(run_id,sequence));');
         if (!in_array('resolved_config', array_column($this->db->query('PRAGMA table_info(runs)')->fetchAll(), 'name'), true)) {
@@ -93,20 +95,48 @@ final class Store
     }
     public function apply(string $id, array $event): array
     {
-        self::id($id);$payload=json_encode($event,JSON_THROW_ON_ERROR);$hash=hash('sha256',$payload);
-        if(!is_string($event['id']??null) || strlen($event['id'])>200 || $event['id']==='') { throw new RuntimeException('Event needs a stable ID.'); }
+        return $this->applyBatch($id, [$event]);
+    }
+    /** Commit a bounded group of captured events and its final state atomically. */
+    public function applyBatch(string $id, array $events): array
+    {
+        self::id($id);
+        if (!array_is_list($events) || !$events || count($events) > self::MAX_BATCH_EVENTS) {
+            throw new RuntimeException('Supply 1–'.self::MAX_BATCH_EVENTS.' events per paper batch.');
+        }
+        $captured = [];
+        foreach ($events as $event) {
+            if (!is_array($event) || !is_string($event['id'] ?? null) || $event['id'] === '' || strlen($event['id']) > 200) {
+                throw new RuntimeException('Event needs a stable ID.');
+            }
+            $payload = json_encode($event, JSON_THROW_ON_ERROR);
+            $captured[] = [$event, $payload, hash('sha256', $payload)];
+        }
         $this->db->exec('BEGIN IMMEDIATE');
         try {
-            $q=$this->db->prepare('SELECT digest FROM events WHERE run_id=? AND id=?');$q->execute([$id,$event['id']]);$old=$q->fetchColumn();
-            if($old!==false) {
-                if(!hash_equals($old,$hash)) { throw new RuntimeException('Event ID reused with different content.'); }
-                $this->db->exec('COMMIT');return ['duplicate'=>true];
+            $lookup = $this->db->prepare('SELECT digest FROM events WHERE run_id=? AND id=?');
+            $insert = $this->db->prepare('INSERT INTO events VALUES(?,?,?,?,?)');
+            $engine = null;
+            foreach ($captured as [$event, $payload, $hash]) {
+                $lookup->execute([$id, $event['id']]); $old = $lookup->fetchColumn(); $lookup->closeCursor();
+                if ($old !== false) {
+                    if (!hash_equals($old, $hash)) { throw new RuntimeException('Event ID reused with different content.'); }
+                    continue;
+                }
+                if ($engine === null) {
+                    $run = $this->run($id); $engine = new Engine($run['config'], $run['state']);
+                }
+                $engine->apply($event);
+                $insert->execute([$id, $engine->state['sequence'], $event['id'], $hash, $payload]);
             }
-            $run=$this->run($id);$engine=new Engine($run['config'],$run['state']);$engine->apply($event);
-            $q=$this->db->prepare('INSERT INTO events VALUES(?,?,?,?,?)');$q->execute([$id,$engine->state['sequence'],$event['id'],$hash,$payload]);
-            $q=$this->db->prepare('UPDATE runs SET state=? WHERE id=?');$q->execute([json_encode($engine->state,JSON_THROW_ON_ERROR),$id]);
-            $this->db->exec('COMMIT');return ['sequence'=>$engine->state['sequence'],'orders'=>count($engine->state['orders']),'fills'=>count($engine->state['fills'])];
-        } catch(Throwable $e) { $this->db->exec('ROLLBACK');throw $e; }
+            if ($engine === null) {
+                $this->db->exec('COMMIT'); return ['duplicate' => true];
+            }
+            $q = $this->db->prepare('UPDATE runs SET state=? WHERE id=?');
+            $q->execute([json_encode($engine->state, JSON_THROW_ON_ERROR), $id]);
+            $this->db->exec('COMMIT');
+            return ['sequence' => $engine->state['sequence'], 'orders' => count($engine->state['orders']), 'fills' => count($engine->state['fills'])];
+        } catch (Throwable $error) { $this->db->exec('ROLLBACK'); throw $error; }
     }
     public function events(string $id): iterable
     {
