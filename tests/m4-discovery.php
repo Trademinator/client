@@ -99,6 +99,32 @@ try {
     $store=new Store($minimal->dataDir.'/paper');
     check($store->automaticIds()===array_column($result['plans'],'run_id'),'Reports can find automatic run IDs without user configuration');
 
+    $partialConfig=new Config(['server_api_key_env'=>'TM4_DISCOVERY_KEY','paper_trading'=>['enabled'=>true],'data_dir'=>$dir.'/partial-state']);
+    $partialServer=new Server($partialConfig,static function($sub,$resource,$body,$query){
+        $response=answer($sub,$resource,$body,$query);
+        if($resource==='replay/models' && $sub===uuid(1)) {
+            foreach($response['models'] as &$model) { if(($model['family']??null)==='production') { $model['current']=false; } } unset($model);
+        }
+        return $response;
+    });
+    $partial=AutomaticSetup::discover($partialConfig,$partialServer,'feed');$partialByExchange=[];
+    foreach($partial['plans'] as $plan) { $partialByExchange[$plan['source_exchange']]=$plan; }
+    check(count($partial['plans'])===2 && array_keys($partialByExchange['bitso']['markets'])===['XRP/USD'],
+        'Unavailable intelligence waits per market without blocking ready peers');
+    check(count($partial['warnings'])===1 && ($partial['warnings'][0]['symbol']??null)==='ATOM/USD'
+        && ($partial['warnings'][0]['period']??null)==='15m' && str_contains($partial['warnings'][0]['reason']??'','production model'),
+        'Skipped market warning identifies its exchange pair and period');
+    $partialRun=$partialByExchange['bitso']['run_id'];
+    $partialAgain=AutomaticSetup::discover($partialConfig,$partialServer,'feed');$partialAgainByExchange=[];
+    foreach($partialAgain['plans'] as $plan) { $partialAgainByExchange[$plan['source_exchange']]=$plan; }
+    check($partialAgainByExchange['bitso']['run_id']===$partialRun && $partialAgain['created']===[],
+        'Partial automatic run resumes without resetting while its peer remains unavailable');
+    $recovered=AutomaticSetup::discover($partialConfig,new Server($partialConfig,Closure::fromCallable('answer')),'feed');$recoveredByExchange=[];
+    foreach($recovered['plans'] as $plan) { $recoveredByExchange[$plan['source_exchange']]=$plan; }
+    check(count($recoveredByExchange['bitso']['markets'])===2 && $recoveredByExchange['bitso']['run_id']!==$partialRun
+        && (new Store($partialConfig->dataDir.'/paper'))->exists($partialRun),
+        'A newly ready peer creates a new exchange run without overwriting prior state');
+
     $custom=$store->run($bitso['run_id'])['config'];unset($custom['markets']['ATOM/USD']['intelligence']['subscription'],$custom['markets']['ATOM/USD']['intelligence']['model_id']);
     $resolved=IntelligenceSetup::resolve($custom,$server);
     check($resolved['markets']['ATOM/USD']['intelligence']['subscription']===uuid(1),'Custom configurations can also omit UUIDs');

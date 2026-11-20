@@ -28,44 +28,62 @@ final class AutomaticSetup
             foreach ($groups as $exchange => $subscriptions) {
                 if ($keepRunning !== null && !$keepRunning()) { throw new RuntimeException('Automatic paper setup stopped.'); }
                 try {
-                    $identities = array_map(static fn(array $row): string => $row['subscription_id'].'|'.$row['symbol'].'|'.$row['period'], $subscriptions);
-                    sort($identities, SORT_STRING);
-                    $run = 'auto-'.$exchange.'-'.substr(hash('sha256', implode("\n", $identities)), 0, 16);
+                    $completeRun = self::runId($exchange, array_map(self::identity(...), $subscriptions));
+                    if ($store->exists($completeRun)) {
+                        $plans[] = ['enabled' => true, 'run_id' => $completeRun, ...$store->run($completeRun)['config']];
+                        continue;
+                    }
+
+                    $risk ??= ServerApi::validateRisk($server->request('', 'risk-factor'));
+                    $feeds[$exchange] ??= $feedFactory($exchange);
+                    $markets = []; $balances = []; $quotes = []; $readyIdentities = [];
+                    foreach ($subscriptions as $subscription) {
+                        if ($keepRunning !== null && !$keepRunning()) { throw new RuntimeException('Automatic paper setup stopped.'); }
+                        $symbol = $subscription['symbol']; $period = $subscription['period'];
+                        if (isset($markets[$symbol])) { throw new RuntimeException('Duplicate active subscriptions for '.$exchange.' '.$symbol.'. Review subscriptions on the Server.'); }
+                        $periodMs = Application::periodMs($period);
+                        $response = $server->request($subscription['subscription_id'], 'market'); $detail = $response['market'] ?? [];
+                        if (($response['api_version'] ?? null) !== 1 || ($detail['subscription_id'] ?? null) !== $subscription['subscription_id']
+                            || ($detail['exchange']['class'] ?? null) !== $exchange || ($detail['symbol'] ?? null) !== $symbol
+                            || ($detail['period'] ?? null) !== $period || ($detail['active'] ?? false) !== true) {
+                            throw new RuntimeException('Server market changed during setup; restart to refresh subscriptions.');
+                        }
+                        $initial = Decimal::value($detail['settings']['paper_initial_quote'] ?? null, true);
+                        [$base, $quote] = explode('/', $symbol);
+                        $market = [...$feeds[$exchange]->rules($symbol), 'period_ms' => $periodMs,
+                            'evaluation_ms' => max(1000, intdiv($periodMs, $config->checksPerCandle)), 'risk_factor' => $risk['risk_factor'],
+                            'minimum_profit' => '0', 'volume_participation' => '0.01',
+                            'intelligence' => ['subscription' => $subscription['subscription_id'], 'period' => $period,
+                                'family' => 'production', 'source' => 'current', 'model_exchange' => $exchange, 'warmup' => 500]];
+                        try {
+                            $resolved = IntelligenceSetup::resolve([
+                                'account' => 'paper-'.$exchange, 'source_exchange' => $exchange, 'execution_exchange' => $exchange,
+                                'reporting_currency' => $quote, 'balances' => [$quote => $initial, $base => '0'],
+                                'opening_lots' => [], 'policy' => 'two_order', 'markets' => [$symbol => $market],
+                            ], $server);
+                        } catch (CurrentModelUnavailable $error) {
+                            $warnings[] = ['exchange' => $exchange, 'symbol' => $symbol, 'period' => $period, 'reason' => $error->getMessage()];
+                            continue;
+                        }
+                        $markets[$symbol] = $resolved['markets'][$symbol];
+                        // One shared budget per quote currency, never one budget per pair.
+                        $balances[$quote] = Decimal::max($balances[$quote] ?? '0', $initial);
+                        $balances[$base] ??= '0'; $quotes[$quote] = ($quotes[$quote] ?? 0) + 1;
+                        $readyIdentities[] = self::identity($subscription);
+                    }
+                    if ($markets === []) { continue; }
+                    $run = self::runId($exchange, $readyIdentities);
                     if ($store->exists($run)) {
-                        // Fee, funding and model changes cannot reset an existing paper account.
                         $settings = $store->run($run)['config'];
                     } else {
-                        $risk ??= ServerApi::validateRisk($server->request('', 'risk-factor'));
-                        $feeds[$exchange] ??= $feedFactory($exchange);
-                        $markets = []; $balances = []; $quotes = [];
-                        foreach ($subscriptions as $subscription) {
-                            $symbol = $subscription['symbol']; $period = $subscription['period'];
-                            if (isset($markets[$symbol])) { throw new RuntimeException('Duplicate active subscriptions for '.$exchange.' '.$symbol.'. Review subscriptions on the Server.'); }
-                            $periodMs = Application::periodMs($period);
-                            $response = $server->request($subscription['subscription_id'], 'market'); $detail = $response['market'] ?? [];
-                            if (($response['api_version'] ?? null) !== 1 || ($detail['subscription_id'] ?? null) !== $subscription['subscription_id']
-                                || ($detail['exchange']['class'] ?? null) !== $exchange || ($detail['symbol'] ?? null) !== $symbol
-                                || ($detail['period'] ?? null) !== $period || ($detail['active'] ?? false) !== true) {
-                                throw new RuntimeException('Server market changed during setup; restart to refresh subscriptions.');
-                            }
-                            $initial = Decimal::value($detail['settings']['paper_initial_quote'] ?? null, true);
-                            [$base, $quote] = explode('/', $symbol);
-                            // One shared budget per quote currency, never one budget per pair.
-                            $balances[$quote] = Decimal::max($balances[$quote] ?? '0', $initial);
-                            $balances[$base] ??= '0'; $quotes[$quote] = ($quotes[$quote] ?? 0) + 1;
-                            $markets[$symbol] = [...$feeds[$exchange]->rules($symbol), 'period_ms' => $periodMs,
-                                'evaluation_ms' => max(1000, intdiv($periodMs, $config->checksPerCandle)), 'risk_factor' => $risk['risk_factor'],
-                                'minimum_profit' => '0', 'volume_participation' => '0.01',
-                                'intelligence' => ['subscription' => $subscription['subscription_id'], 'period' => $period,
-                                    'family' => 'production', 'source' => 'current', 'model_exchange' => $exchange, 'warmup' => 500]];
-                        }
                         ksort($quotes); arsort($quotes, SORT_NUMERIC); ksort($markets); ksort($balances);
-                        $settings = IntelligenceSetup::resolve(['account' => 'paper-'.$exchange, 'source_exchange' => $exchange,
-                            'execution_exchange' => $exchange, 'reporting_currency' => array_key_first($quotes), 'balances' => $balances,
-                            'opening_lots' => [], 'policy' => 'two_order', 'markets' => $markets], $server);
+                        $settings = Settings::validate([
+                            'account' => 'paper-'.$exchange, 'source_exchange' => $exchange, 'execution_exchange' => $exchange,
+                            'reporting_currency' => array_key_first($quotes), 'balances' => $balances,
+                            'opening_lots' => [], 'policy' => 'two_order', 'markets' => $markets,
+                        ]);
                         if ($keepRunning !== null && !$keepRunning()) { throw new RuntimeException('Automatic paper setup stopped.'); }
-                        $store->ensure($run, $settings);
-                        $created[] = $run;
+                        $store->ensure($run, $settings); $created[] = $run;
                     }
                     $plans[] = ['enabled' => true, 'run_id' => $run, ...$settings];
                 } catch (\Throwable $error) {
@@ -77,5 +95,16 @@ final class AutomaticSetup
         if ($groups === [] && $warnings === []) { $warnings[] = ['reason' => 'No active Server subscriptions. Activate your markets on the Server; UUIDs are discovered automatically.']; }
         Paths::atomicJson($config->dataDir.'/paper/automatic-runs.json', ['runs' => array_column($plans, 'run_id')]);
         return ['plans' => $plans, 'warnings' => $warnings, 'created' => $created];
+    }
+
+    private static function identity(array $subscription): string
+    {
+        return $subscription['subscription_id'].'|'.$subscription['symbol'].'|'.$subscription['period'];
+    }
+
+    private static function runId(string $exchange, array $identities): string
+    {
+        sort($identities, SORT_STRING);
+        return 'auto-'.$exchange.'-'.substr(hash('sha256', implode("\n", $identities)), 0, 16);
     }
 }

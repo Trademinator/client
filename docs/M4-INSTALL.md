@@ -94,7 +94,10 @@ account configuration; the client cannot safely guess which ledger owns a key.
 
 Automatic discovery runs in a separate process so local control remains responsive.
 The daemon refreshes subscription discovery every minute, including retries for
-unavailable intelligence. Per-exchange workers drive the paper engine. `status`
+unavailable intelligence. A market without a unique current production model waits
+independently; it does not block ready markets on the same exchange. When it later
+becomes ready, the enlarged market set starts as a distinct saved run. Per-exchange
+workers drive the paper engine. `status`
 shows their run IDs and each market's state under `ledger.paper_trading`.
 `paper-report` returns all current automatic runs without requiring their IDs.
 
