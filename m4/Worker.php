@@ -14,24 +14,31 @@ final class Worker
         $directory = dirname($snapshot);
         $lease = $directory.'/lease';
         $statusFile = $directory.'/status.json';
-        $keepRunning = static function () use ($lease): bool {
-            clearstatcache(true, $lease);
-            return is_file($lease) && time() - (int) filemtime($lease) < 15;
-        };
+        $leaseGuard = new WorkerLease($lease);
+        $keepRunning = static fn(): bool => $leaseGuard->active();
         $status = ['state' => 'starting', 'updated_at_ms' => (int) floor(microtime(true) * 1000), 'events' => []];
         $publish = static function () use (&$status, $statusFile): void {
             $status['updated_at_ms'] = (int) floor(microtime(true) * 1000);
             Paths::atomicJson($statusFile, $status);
         };
+        $stop = static function () use (&$status, $publish, $leaseGuard): int {
+            $state = $leaseGuard->state();
+            $status['state'] = 'stopped';
+            $status['stop_reason'] = $state['valid'] ? 'work_completed' : $state['reason'];
+            if (isset($state['age_seconds'])) { $status['lease_age_seconds'] = $state['age_seconds']; }
+            $publish();
+            return 0;
+        };
         try {
             $config = Config::load($snapshot);
             $status['run_id'] = $config->paperTrading['run_id'] ?? 'automatic';
             $publish();
-            if (!$keepRunning()) { $status['state'] = 'stopped'; $publish(); return 0; }
+            if (!$keepRunning()) { return $stop(); }
             $server = new Server($config, $transport);
             if (!isset($config->paperTrading['markets'])) {
                 $status['state'] = 'discovering'; $publish();
                 $result = AutomaticSetup::discover($config, $server, $feedFactory, $keepRunning);
+                if (!$keepRunning()) { return $stop(); }
                 $status = [...$status, ...$result, 'state' => 'prepared']; $publish(); return 0;
             }
             $store = new Store($config->dataDir.'/paper');
@@ -48,7 +55,7 @@ final class Worker
                 $publish();
             };
             Live::run($store, $status['run_id'], $server, 0, $emit, $feedFactory, $keepRunning);
-            $status['state'] = 'stopped'; $publish(); return 0;
+            return $stop();
         } catch (\Throwable $error) {
             $status['state'] = 'failed'; $status['error'] = EventRecord::safeText($error->getMessage());
             $publish(); return 1;

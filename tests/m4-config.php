@@ -9,6 +9,7 @@ use Trademinator\Client\M4\PaperConfig;
 use Trademinator\Client\M4\Runtime;
 use Trademinator\Client\M4\Store;
 use Trademinator\Client\M4\Worker;
+use Trademinator\Client\M4\WorkerLease;
 
 if (in_array($argv[1] ?? '', ['--worker', '--slow-worker'], true)) {
     $slow = $argv[1] === '--slow-worker';
@@ -112,10 +113,14 @@ try {
     check(count($store->run('trial-01')['state']['fills']) >= count($saved['state']['fills']), 'Restart preserves previously executed paper fills');
     $workerDir = (new ReflectionProperty($runtime, 'directory'))->getValue($runtime);
     $workerProcess = (new ReflectionProperty($runtime, 'process'))->getValue($runtime);
-    touch($workerDir.'/lease', time() - 30);
+    // Simulate an expired lease without sleeping for the full 60-second timeout.
+    touch($workerDir.'/lease', time() - WorkerLease::TIMEOUT_SECONDS - 1);
     $deadline = microtime(true) + 3;
     while (proc_get_status($workerProcess)['running'] && microtime(true) < $deadline) { usleep(20000); }
     check(!proc_get_status($workerProcess)['running'], 'Worker exits when its parent heartbeat expires');
+    $workerStatus = json_decode((string) file_get_contents($workerDir.'/status.json'), true, 32, JSON_THROW_ON_ERROR);
+    check(($workerStatus['stop_reason'] ?? null) === 'supervisor_heartbeat_expired',
+        'Worker reports lease expiry rather than an unexplained exit');
     $afterLease = $store->run('trial-01'); usleep(100000);
     check($store->run('trial-01') === $afterLease, 'Expired parent lease leaves no orphan paper writer');
     $runtime->close();

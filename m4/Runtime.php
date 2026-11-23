@@ -32,11 +32,21 @@ final class Runtime
     {
         if ($this->sessions !== null) {
             foreach ($this->sessions as $id => $session) { $session->tick(); $this->status['runs'][$id] = $session->status(); }
-            if ($this->process === null && microtime(true) < $this->nextDiscovery) { return; }
         }
+        if ($this->process === null && microtime(true) < $this->nextDiscovery) { return; }
         if (!$this->status['enabled'] || ($this->process === null && in_array($this->status['state'], ['failed', 'stopped'], true))) { return; }
         if ($this->process === null) { $this->start(); }
-        if (time() !== $this->heartbeat) { touch($this->directory.'/lease'); $this->heartbeat = time(); }
+        $now = time();
+        if ($now !== $this->heartbeat) {
+            if ($this->heartbeat > 0 && $now - $this->heartbeat >= 10) {
+                ($this->log)('warning', 'paper_supervisor_delayed', ['paper_run_id' => $this->status['run_id'],
+                    'heartbeat_delay_seconds' => $now - $this->heartbeat], 'Paper supervisor heartbeat was delayed.');
+            }
+            if (!is_file($this->directory.'/lease') || !touch($this->directory.'/lease')) {
+                throw new RuntimeException('Cannot renew paper worker lease.');
+            }
+            $this->heartbeat = $now;
+        }
         $file = $this->directory.'/status.json';
         if (is_file($file)) {
             $snapshot = json_decode((string) file_get_contents($file), true, 64, JSON_THROW_ON_ERROR);
@@ -72,6 +82,26 @@ final class Runtime
                 $this->nextDiscovery = microtime(true) + 60;
                 $this->tick(); return;
             }
+            if (($snapshot['state'] ?? null) === 'stopped'
+                && ($snapshot['stop_reason'] ?? null) === 'supervisor_heartbeat_expired'
+                && $process['exitcode'] === 0) {
+                // This is a safety stop, not a worker crash. Restart the same immutable
+                // paper run after a short pause; its unproven book history remains gapped.
+                ($this->log)('warning', 'paper_worker_lease_expired', [
+                    'paper_run_id' => $this->status['run_id'],
+                    'lease_age_seconds' => $snapshot['lease_age_seconds'] ?? null,
+                    'exit_code' => 0,
+                ], 'Paper worker stopped after missing supervisor heartbeats; recovery is scheduled.');
+                $this->cleanup();
+                $this->nextDiscovery = microtime(true) + 5;
+                if ($this->sessions !== null || !isset($this->config->paperTrading['markets'])) {
+                    $this->sessions ??= [];
+                    $this->status['state'] = $this->sessions === [] ? 'waiting_for_markets' : 'running';
+                } else {
+                    $this->status['state'] = 'pending';
+                }
+                return;
+            }
             $this->status['state'] = 'failed';
             $this->status['error'] ??= 'Paper worker exited (code '.$process['exitcode'].'). Restart the daemon after correcting its configuration.';
             ($this->log)('error', 'paper_worker_failed', $this->status, 'Paper trading stopped; local control remains available.');
@@ -104,7 +134,8 @@ final class Runtime
             $this->process = proc_open($command, [0 => ['file', $null, 'r'], 1 => ['file', $null, 'w'], 2 => ['file', $null, 'w']], $pipes, null, null, ['bypass_shell' => true]);
             if (!is_resource($this->process)) { $this->process = null; throw new RuntimeException('Cannot start paper worker.'); }
             $this->lastEvent = 0;
-            unset($this->status['error']);
+            $this->heartbeat = 0; // A fresh worker must not inherit the previous worker's idle time.
+            unset($this->status['error'], $this->status['stop_reason'], $this->status['lease_age_seconds']);
             $this->status['state'] = 'starting';
             ($this->log)('info', 'paper_'.$outcome, ['paper_run_id' => $this->status['run_id']], 'Paper run '.$outcome.'.');
         } catch (\Throwable $error) { $this->close(); throw $error; }
