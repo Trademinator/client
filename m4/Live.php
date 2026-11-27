@@ -42,7 +42,7 @@ final class Live
             }
             while(microtime(true)<$end && ($keepRunning===null || $keepRunning())) {
                 foreach($c['markets'] as $symbol=>$m) {
-                    $stage='feed';
+                    $stage='feed';$bookTimestampDiagnostic=[];
                     try {
                         if($keepRunning!==null && !$keepRunning()) { break 2; }
                         $started=(int)floor(microtime(true)*1000);
@@ -63,9 +63,48 @@ final class Live
                             $gapped[$symbol]=true;$next[$symbol]=$now;
                             $emit('warning','paper_paused',['symbol'=>$symbol,'message'=>'Book history is not proven complete; awaiting fresh inference.']);
                         }
-                        $levels=static fn(array $rows):array=>array_map(static fn(array $row):array=>[LiveFeed::decimal($row[0]),LiveFeed::decimal($row[1])],$rows);
-                        $result=$apply(['type'=>'book','time_ms'=>$now,'observed_at_ms'=>$book['timestamp']??$now,'symbol'=>$symbol,
-                            'bids'=>$levels(array_slice($book['bids'],0,50)),'asks'=>$levels(array_slice($book['asks'],0,50)),'transport'=>$book['transport']]);
+                        $levels=static function(array $rows,string $side)use($c,$symbol,$book):array {
+                            $result=[];
+                            foreach($rows as $index=>$row) {
+                                $base='exchange='.$c['source_exchange'].' symbol='.$symbol.' source=book field='.$side.'['.$index.']';
+                                $transport=' transport='.($book['transport']??'unknown');
+                                $result[]=[
+                                    LiveFeed::decimal(is_array($row)?($row[0]??null):null,$base.'.price'.$transport),
+                                    LiveFeed::decimal(is_array($row)?($row[1]??null):null,$base.'.amount'.$transport),
+                                ];
+                            }
+                            return $result;
+                        };
+                        $observedAt=$book['timestamp']??$now;
+                        $timestampFields=BookTimestamp::normalize($c['source_exchange'],$book,$now);
+                        try {
+                            $result=$apply(['type'=>'book','time_ms'=>$now,...$timestampFields,'symbol'=>$symbol,
+                                'bids'=>$levels(array_slice($book['bids'],0,50),'bids'),'asks'=>$levels(array_slice($book['asks'],0,50),'asks'),'transport'=>$book['transport']]);
+                        } catch(RuntimeException $error) {
+                            if($error->getMessage()==='Invalid book observation time.') {
+                                // Keep the Engine's fail-closed validation. Only enrich the existing pause event.
+                                $bookTimestampDiagnostic=[
+                                    'source_timestamp_ms'=>is_scalar($observedAt)?$observedAt:null,
+                                    'source_timestamp_type'=>get_debug_type($observedAt),
+                                    'local_event_time_ms'=>$now,
+                                    'source_minus_local_ms'=>is_int($observedAt)?$observedAt-$now:null,
+                                    'transport'=>$book['transport']??'unknown',
+                                ];
+                            }
+                            throw $error;
+                        }
+                        if(isset($timestampFields['timestamp_adjustment_ms'])) {
+                            // The unmodified source time is also retained in the durable book event.
+                            $emit('warning','paper_book_timestamp_adjusted',[
+                                'symbol'=>$symbol,
+                                'source_timestamp_ms'=>$observedAt,
+                                'source_timestamp_type'=>get_debug_type($observedAt),
+                                'local_event_time_ms'=>$now,
+                                'accepted_observed_at_ms'=>$timestampFields['observed_at_ms'],
+                                'source_minus_local_ms'=>$timestampFields['timestamp_adjustment_ms'],
+                                'transport'=>$book['transport']??'unknown',
+                            ]);
+                        }
                         // Keep the first capture boundary if persistence fails before any trade commits.
                         $cursors[$symbol]??=$now;
                         $trades=$source->trades($symbol,$cursors[$symbol]);
@@ -78,14 +117,16 @@ final class Live
                             foreach($tradeIds as $id=>$_) { $seen[$symbol][$id]=true; }
                             $cursors[$symbol]=$tradeCursor;$tradeBatch=[];$tradeIds=[];
                         };
-                        foreach($trades as $trade) {
+                        foreach($trades as $tradeIndex=>$trade) {
                             if(!is_int($trade['timestamp']??null) || $trade['timestamp']<$tradeCursor || !in_array($trade['side']??null,['buy','sell'],true)) { continue; }
                             $id=(string)($trade['id']??hash('sha256',json_encode($trade)));
                             if(isset($seen[$symbol][$id]) || isset($tradeIds[$id])) { continue; }
                             // Capture stable IDs and timestamps before waiting for the shared writer gate.
                             $tradeBatch[]=['id'=>'live-'.bin2hex(random_bytes(12)),'type'=>'trade','time_ms'=>(int)floor(microtime(true)*1000),
-                                'source_time_ms'=>$trade['timestamp'],'symbol'=>$symbol,'price'=>LiveFeed::decimal($trade['price']),
-                                'quantity'=>LiveFeed::decimal($trade['amount']),'side'=>$trade['side'],'source_id'=>$id];
+                                'source_time_ms'=>$trade['timestamp'],'symbol'=>$symbol,
+                                'price'=>LiveFeed::decimal($trade['price']??null,'exchange='.$c['source_exchange'].' symbol='.$symbol.' source=trade field=price transport=rest index='.$tradeIndex),
+                                'quantity'=>LiveFeed::decimal($trade['amount']??null,'exchange='.$c['source_exchange'].' symbol='.$symbol.' source=trade field=amount transport=rest index='.$tradeIndex),
+                                'side'=>$trade['side'],'source_id'=>$id];
                             $tradeIds[$id]=true;$tradeCursor=$trade['timestamp'];
                             if(count($tradeBatch)===Store::MAX_BATCH_EVENTS) { $flushTrades(); }
                         }
@@ -96,9 +137,14 @@ final class Live
                             $spec=$m['intelligence']??throw new RuntimeException('Market needs intelligence subscription, period, family, model_id and source.');
                             $rows=$source->candles($symbol,$spec['period'],(int)($spec['warmup']??500));$closed=[];$batch=[];
                             $lastCandle=$store->run($run)['state']['candles'][$symbol]??[];$lastTime=$lastCandle?end($lastCandle)[0]:-1;
-                            foreach($rows as $row) {
+                            foreach($rows as $rowIndex=>$row) {
                                 if($row[0]+$m['period_ms']>$now) { continue; }
-                                $row=[(int)$row[0],...array_map([LiveFeed::class,'decimal'],array_slice($row,1,5))];$closed[]=$row;
+                                $values=[];
+                                foreach([1=>'open',2=>'high',3=>'low',4=>'close',5=>'volume'] as $offset=>$field) {
+                                    $values[]=LiveFeed::decimal($row[$offset]??null,
+                                        'exchange='.$c['source_exchange'].' symbol='.$symbol.' source=candle field='.$field.' transport=rest index='.$rowIndex);
+                                }
+                                $row=[(int)$row[0],...$values];$closed[]=$row;
                                 if($row[0]>$lastTime) {
                                     $batch[]=['id'=>'live-'.bin2hex(random_bytes(12)),'type'=>'candle','time_ms'=>(int)floor(microtime(true)*1000),'symbol'=>$symbol,'ohlcv'=>$row];
                                     if(count($batch)===Store::MAX_BATCH_EVENTS) { $applyBatch($batch);$batch=[]; }
@@ -135,7 +181,7 @@ final class Live
                         $next[$symbol]=$now+$retryMs;
                         if($stage==='feed') { $feedNext[$symbol]=$next[$symbol]; }
                         if(!($gapped[$symbol]??false)) { $apply(['type'=>'gap','time_ms'=>$now,'symbol'=>$symbol,'from_ms'=>$store->run($run)['state']['books'][$symbol]['time_ms']??$now,'reason'=>'live_data_or_inference_unavailable']);$gapped[$symbol]=true; }
-                        $emit('warning','paper_paused',['symbol'=>$symbol,'message'=>$error->getMessage(),'retry_after_ms'=>$retryMs]);
+                        $emit('warning','paper_paused',['symbol'=>$symbol,'message'=>$error->getMessage(),'retry_after_ms'=>$retryMs,...$bookTimestampDiagnostic]);
                     }
                 }
                 usleep(500000);

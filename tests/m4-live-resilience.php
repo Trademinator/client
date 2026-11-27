@@ -99,6 +99,162 @@ $invalid=Live::run($store,'invalid-book',$server,1,static function(array $e):voi
 check($calls===0 && $feed->books===1,'Invalid books back off before inference instead of spinning');
 check(count($invalid['gaps'])===1 && (eventTypes($store,'invalid-book')['resume']??0)===0 && $invalid['live_observations']===[],'An invalid book cannot falsely recover a gap or count as observed liquidity');
 
+// Rejected observation timestamps must preserve forensic context without changing ledger safety.
+foreach([
+    'future'=>(int)floor(microtime(true)*1000)+60000,
+    'string'=>(string)((int)floor(microtime(true)*1000)),
+    'negative'=>-1,
+    'array'=>['unexpected'],
+] as $case=>$timestamp) {
+    $run='timestamp-'.$case;$store->create($run,$settings);
+    $timedFeed=new class(feed(),$timestamp) {
+        public function __construct(private object $base,private mixed $timestamp) {}
+        public function market(string $symbol):array { return $this->base->market($symbol); }
+        public function book(string $symbol):array { return [...$this->base->book($symbol),'timestamp'=>$this->timestamp,'transport'=>'websocket']; }
+        public function trades(string $symbol,?int $since):array { return $this->base->trades($symbol,$since); }
+        public function candles(string $symbol,string $period,int $limit):array { return $this->base->candles($symbol,$period,$limit); }
+        public function close():void { $this->base->close(); }
+    };
+    $logs=[];$server=new Server($config,static fn():array=>throw new RuntimeException('Invalid books cannot reach inference.'));
+    $report=Live::run($store,$run,$server,1,static function(array $e)use(&$logs):void { $logs[]=$e; },static fn()=>$timedFeed);
+    $pauses=array_values(array_filter($logs,static fn($e)=>$e['event']==='paper_paused'));
+    $diagnostic=$pauses[0]['context']??[];
+    check(count($pauses)===1 && ($diagnostic['message']??null)==='Invalid book observation time.'
+        && ($diagnostic['retry_after_ms']??null)===5000,'Invalid timestamp '.$case.' retains the original pause and backoff');
+    check(($diagnostic['source_timestamp_type']??null)===get_debug_type($timestamp)
+        && ($diagnostic['source_timestamp_ms']??null)===(is_scalar($timestamp)?$timestamp:null)
+        && ($diagnostic['transport']??null)==='websocket'
+        && is_int($diagnostic['local_event_time_ms']??null)
+        && ($diagnostic['source_minus_local_ms']??null)===(is_int($timestamp)?$timestamp-$diagnostic['local_event_time_ms']:null),
+        'Invalid timestamp '.$case.' records source value, type, local time and signed skew');
+    check(count($report['gaps'])===1 && !$report['verified'] && $report['live_observations']===[]
+        && $report['orders']===0 && $report['fills']===0,'Invalid timestamp '.$case.' cannot authorize paper activity');
+    check($store->replay($run,$run.'-replay')['matched'],'Invalid timestamp '.$case.' retains deterministic ledger replay');
+}
+
+$store->create('timestamp-valid',$settings);$logs=[];
+$server=new Server($config,static fn():array=>['signal'=>['action'=>'hodl']]);
+$valid=Live::run($store,'timestamp-valid',$server,1,static function(array $e)use(&$logs):void { $logs[]=$e; },static fn()=>feed());
+check($valid['verified'] && $valid['gaps']===[] && ($valid['live_observations']['XRP/USD']['books']??0)>0
+    && count(array_filter($logs,static fn($e)=>$e['event']==='paper_paused'))===0,
+    'Valid book timestamps are accepted without diagnostic fields or pauses');
+
+// Captured NDAX jitter includes +1 through +34 ms on REST and +50 ms on WebSocket.
+// Accept at most 100 ms into the future, retaining the unmodified source time.
+// Values above the bound still fail closed, with exact replay and ledger rollback.
+$capturedAt=1795519556090;
+$limit=\Trademinator\Client\M4\BookTimestamp::MAX_FUTURE_JITTER_MS;
+$ndaxSettings=Settings::validate([...$settings,'source_exchange'=>'ndax','execution_exchange'=>'ndax']);
+foreach(['websocket'=>[4,25,34,50,100],'rest'=>[1,13,25,26,34,50,100]] as $transport=>$deltas) {
+    foreach($deltas as $delta) {
+        $normalized=\Trademinator\Client\M4\BookTimestamp::normalize(
+            'ndax',['timestamp'=>$capturedAt+$delta,'transport'=>$transport],$capturedAt);
+        check($normalized===['observed_at_ms'=>$capturedAt,'source_observed_at_ms'=>$capturedAt+$delta,'timestamp_adjustment_ms'=>$delta],
+            'NDAX '.$transport.' +'.$delta.' ms jitter retains the unmodified source timestamp within the existing bound');
+        $run='ndax-'.$transport.'-jitter-'.$delta;$store->create($run,$ndaxSettings);
+        $bookEvent=['id'=>'ndax-accepted-book','type'=>'book','time_ms'=>$capturedAt,'symbol'=>'XRP/USD',
+            'bids'=>[['1','100']],'asks'=>[['1.01','100']],'transport'=>$transport,...$normalized];
+        $store->apply($run,$bookEvent);
+        $savedBook=iterator_to_array($store->events($run));
+        check(count($savedBook)===1 && $savedBook[0]['source_observed_at_ms']===$capturedAt+$delta
+            && $savedBook[0]['observed_at_ms']===$capturedAt
+            && $savedBook[0]['timestamp_adjustment_ms']===$delta && $savedBook[0]['transport']===$transport,
+            'NDAX '.$transport.' +'.$delta.' ms correction preserves both timestamps, adjustment and transport in the ledger');
+        $state=$store->run($run)['state'];
+        check($state['gaps']===[] && ($state['live_observations']['XRP/USD']['books']??null)===1,
+            'NDAX '.$transport.' +'.$delta.' ms correction passes Engine validation without fabricating a gap');
+        check($store->replay($run,$run.'-replay')['matched'],
+            'NDAX '.$transport.' +'.$delta.' ms correction replays to the exact persisted state');
+    }
+}
+foreach([
+    'beyond_tolerance'=>['ndax','websocket',$capturedAt+$limit+1],
+    'rest_beyond_tolerance'=>['ndax','rest',$capturedAt+$limit+1],
+    'unknown_transport'=>['ndax','unknown',$capturedAt+4],
+    'null_transport'=>['ndax',null,$capturedAt+4],
+    'other_exchange'=>['bitso','websocket',$capturedAt+4],
+    'other_exchange_rest'=>['bitso','rest',$capturedAt+4],
+    'malformed_string'=>['ndax','websocket',(string)($capturedAt+4)],
+    'rest_malformed_string'=>['ndax','rest',(string)($capturedAt+4)],
+    'rest_malformed_array'=>['ndax','rest',[$capturedAt+4]],
+    'rest_malformed_float'=>['ndax','rest',(float)($capturedAt+4)],
+    'negative'=>['ndax','websocket',-1],
+    'historical'=>['ndax','websocket',$capturedAt-4],
+] as $case=>[$exchange,$transport,$timestamp]) {
+    check(\Trademinator\Client\M4\BookTimestamp::normalize($exchange,['timestamp'=>$timestamp,'transport'=>$transport],$capturedAt)
+        ===['observed_at_ms'=>$timestamp],'NDAX correction leaves '.$case.' untouched for strict Engine validation');
+}
+check(\Trademinator\Client\M4\BookTimestamp::normalize('ndax',['timestamp'=>$capturedAt+4],$capturedAt)
+    ===['observed_at_ms'=>$capturedAt+4],'NDAX correction leaves an absent transport untouched for strict Engine validation');
+
+foreach(['websocket','rest'] as $transport) {
+    $run='ndax-'.$transport.'-jitter-'.$limit;
+    $before=$store->run($run)['state'];$beforeEvents=iterator_to_array($store->events($run));
+    $rejectedAt=$capturedAt+1;
+    $badBook=['id'=>'ndax-rejected-book','type'=>'book','time_ms'=>$rejectedAt,'symbol'=>'XRP/USD',
+        'bids'=>[['1','100']],'asks'=>[['1.01','100']],'transport'=>$transport,
+        ...\Trademinator\Client\M4\BookTimestamp::normalize(
+            'ndax',['timestamp'=>$rejectedAt+$limit+1,'transport'=>$transport],$rejectedAt)];
+    $rejected=false;
+    try { $store->apply($run,$badBook); }
+    catch(RuntimeException $error) { $rejected=$error->getMessage()==='Invalid book observation time.'; }
+    check($rejected && $store->run($run)['state']===$before
+        && iterator_to_array($store->events($run))===$beforeEvents,
+        'NDAX '.$transport.' +'.($limit+1).' ms timestamp fails closed and rolls back state and ledger');
+}
+
+// A malformed numeric field must name its source and field, while retaining
+// the existing fail-closed gap, pause, and backoff behavior (no real networks).
+$numericSettings=Settings::validate([...$settings,'source_exchange'=>'binance','execution_exchange'=>'binance']);
+foreach([
+    'book-price'=>['book','bids[0].price'],
+    'book-amount'=>['book','asks[0].amount'],
+    'trade-price'=>['trade','price'],
+    'trade-amount'=>['trade','amount'],
+    'candle-volume'=>['candle','volume'],
+] as $case=>[$source,$field]) {
+    $run='numeric-'.$case;$store->create($run,$numericSettings);
+    $badFeed=new class(feed(),$case) {
+        public function __construct(private object $base,private string $case) {}
+        public function market(string $symbol):array { return $this->base->market($symbol); }
+        public function book(string $symbol):array {
+            $book=$this->base->book($symbol);
+            if($this->case==='book-price') { $book['bids'][0][0]=null; }
+            if($this->case==='book-amount') { $book['asks'][0][1]=null; }
+            return $book;
+        }
+        public function trades(string $symbol,?int $since):array {
+            if($this->case==='trade-price' || $this->case==='trade-amount') {
+                return [['id'=>'null-value','timestamp'=>$since,'side'=>'buy',
+                    'price'=>$this->case==='trade-price'?null:'1','amount'=>$this->case==='trade-amount'?null:'1']];
+            }
+            return [];
+        }
+        public function candles(string $symbol,string $period,int $limit):array {
+            $rows=$this->base->candles($symbol,$period,$limit);
+            if($this->case==='candle-volume') { $rows[0][5]=null; }
+            return $rows;
+        }
+        public function close():void { $this->base->close(); }
+    };
+    $logs=[];$server=new Server($config,static fn():array=>throw new RuntimeException('Bad numeric data reached inference.'));
+    $report=Live::run($store,$run,$server,1,static function(array $e)use(&$logs):void { $logs[]=$e; },static fn()=>$badFeed);
+    $pauses=array_values(array_filter($logs,static fn($e)=>$e['event']==='paper_paused'));
+    $message=$pauses[0]['context']['message']??'';
+    check(count($pauses)===1 && str_contains($message,'Invalid public numeric field')
+        && str_contains($message,'exchange=binance') && str_contains($message,'symbol=XRP/USD')
+        && str_contains($message,'source='.$source) && str_contains($message,'field='.$field)
+        && str_contains($message,'type=null') && str_contains($message,'transport=rest')
+        && ($pauses[0]['context']['retry_after_ms']??null)===5000,
+        'Null '.$case.' reports its exact source and field with existing backoff');
+    check(count($report['gaps'])===1 && !$report['verified'] && $report['orders']===0 && $report['fills']===0,
+        'Null '.$case.' does not authorize a paper order or erase its gap');
+    check($store->replay($run,$run.'-replay')['matched'],
+        'Null '.$case.' retains deterministic paper ledger replay');
+}
+check(\Trademinator\Client\M4\Decimal::cmp(\Trademinator\Client\M4\LiveFeed::decimal('1.25','fixture valid value'),'1.25')===0,
+    'Valid decimal data retains its numeric conversion');
+
 $store->create('warmup',$settings);$calls=0;
 $server=new Server($config,static function($sub,$resource,$body)use(&$calls):array { $calls++;check(count($body['candles'])===500,'All 500 warmup candles reach inference');return ['signal'=>['action'=>'hodl']]; });
 $warmup=Live::run($store,'warmup',$server,1,static function(array $e):void {},static fn()=>feed(false,500));

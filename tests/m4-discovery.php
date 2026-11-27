@@ -50,6 +50,9 @@ function answer(string $sub,string $resource,?array $body=null,array $query=[]):
     throw new RuntimeException('Unexpected request: '.$resource);
 }
 function feed(string $exchange): object {
+    $modeFile=getenv('TM4_DISCOVERY_MODE_FILE');
+    $mode=$modeFile && is_file($modeFile)?trim(file_get_contents($modeFile)):'';
+    if($exchange==='bitso' && $mode==='partial-feed-timeout') { throw new \ccxt\RequestTimeout('Fixture public exchange metadata timed out.'); }
     return new class {
         public function market(string $symbol): array { return ['spot'=>true,'active'=>true,'precision'=>['price'=>0.01,'amount'=>0.001],
             'limits'=>['amount'=>['min'=>0.01,'max'=>10],'cost'=>['min'=>1]],'maker'=>0.001,'taker'=>0.002,'feeSide'=>'get']; }
@@ -151,6 +154,50 @@ try {
     }),'feed');
     check(count(array_filter($deferred['plans'],fn($p)=>$p['run_id']===$partialRun))===1,
         'A shared request cooldown retains the authorized active partial run');
+    $networkFeed=static function(string $phase):Closure {
+        return static function(string $exchange)use($phase):object {
+            if($exchange!=='bitso') { return feed($exchange); }
+            if($phase==='constructor') { throw new \ccxt\RequestTimeout('Fixture load_markets timed out.'); }
+            return new class(feed($exchange)) {
+                public function __construct(private object $base) {}
+                public function rules(string $symbol):array { throw new \ccxt\RequestTimeout('Fixture public market rules timed out.'); }
+                public function close():void { $this->base->close(); }
+            };
+        };
+    };
+    foreach(['constructor','rules'] as $phase) {
+        $networkRetained=AutomaticSetup::discover($partialConfig,$partialServer,$networkFeed($phase));
+        $retainedBitso=array_values(array_filter($networkRetained['plans'],fn($p)=>$p['source_exchange']==='bitso'));
+        check($retainedBitso===[$partialByExchange['bitso']] && $networkRetained['created']===[]
+            && in_array($partialRun,$partialStore->automaticIds(),true) && $partialStore->run($partialRun)===$savedPartial
+            && count(array_filter($networkRetained['warnings'],fn($w)=>($w['retained_run_id']??null)===$partialRun))===1,
+            'Public exchange '.$phase.' timeout retains the active partial run, pinned configuration and unchanged ledger');
+    }
+    $invalidFeed=static function(string $exchange):object {
+        if($exchange==='bitso') { throw new RuntimeException('Fixture exchange metadata is invalid.'); }
+        return feed($exchange);
+    };
+    $invalidFeedResult=AutomaticSetup::discover($partialConfig,$partialServer,$invalidFeed);
+    check(count(array_filter($invalidFeedResult['plans'],fn($p)=>$p['source_exchange']==='bitso'))===0
+        && !in_array($partialRun,$partialStore->automaticIds(),true) && $partialStore->run($partialRun)===$savedPartial,
+        'A non-network exchange failure is not hidden by retaining a prior active run');
+    AutomaticSetup::discover($partialConfig,$partialServer,'feed');
+    unlink($partialConfig->dataDir.'/paper/automatic-runs.json');
+    $networkWithoutManifest=AutomaticSetup::discover($partialConfig,$partialServer,$networkFeed('constructor'));
+    check(count(array_filter($networkWithoutManifest['plans'],fn($p)=>$p['source_exchange']==='bitso'))===0
+        && !in_array($partialRun,$partialStore->automaticIds(),true) && $partialStore->run($partialRun)===$savedPartial,
+        'A public exchange timeout cannot revive a historical run without an active manifest');
+    AutomaticSetup::discover($partialConfig,$partialServer,'feed');
+    $unsubscribedServer=new Server($partialConfig,static function($sub,$resource,$body,$query)use($partialServer){
+        $response=$partialServer->request($sub,$resource,$body,$query);
+        if($resource==='markets') { $response['markets'][1]['active']=false; }
+        return $response;
+    });
+    $networkUnsubscribed=AutomaticSetup::discover($partialConfig,$unsubscribedServer,$networkFeed('constructor'));
+    check(count(array_filter($networkUnsubscribed['plans'],fn($p)=>$p['source_exchange']==='bitso'))===0
+        && !in_array($partialRun,$partialStore->automaticIds(),true) && $partialStore->run($partialRun)===$savedPartial,
+        'An authoritative unsubscribe prevents retention even when public exchange discovery times out');
+    AutomaticSetup::discover($partialConfig,$partialServer,'feed');
     foreach(['removed','inactive','period','subscription'] as $change) {
         $changed=new Server($partialConfig,static function($sub,$resource,$body,$query)use($change){
             if($resource==='markets') {
@@ -314,6 +361,22 @@ try {
     $afterRefresh=$runtimeStore->run($activeBitso);
     check($afterRefresh['config']===$beforeRefresh['config'] && $afterRefresh['state']['sequence']>$beforeRefresh['state']['sequence'],
         'The retained partial worker keeps processing its original immutable ledger');
+    $beforeNetworkRefresh=$runtimeStore->run($activeBitso);
+    $retentionsBefore=count(array_filter($runtimeEvents,fn($e)=>$e['name']==='paper_setup_waiting' && ($e['context']['retained_run_id']??null)===$activeBitso));
+    file_put_contents($modeFile,'partial-feed-timeout');$nextDiscovery->setValue($runtime,0.0);$deadline=microtime(true)+6;
+    do {
+        $runtime->tick();$status=$runtime->status();
+        $networkRetentionLogged=count(array_filter($runtimeEvents,fn($e)=>$e['name']==='paper_setup_waiting' && ($e['context']['retained_run_id']??null)===$activeBitso))>$retentionsBefore;
+        if($networkRetentionLogged && $nextDiscovery->getValue($runtime)>microtime(true)
+            && $runtimeStore->run($activeBitso)['state']['sequence']>$beforeNetworkRefresh['state']['sequence']){break;}usleep(20000);
+    }while(microtime(true)<$deadline);
+    $afterNetworkRefresh=$runtimeStore->run($activeBitso);
+    check($networkRetentionLogged && ($status['runs'][$activeBitso]['state']??null)==='running'
+        && in_array($activeBitso,$runtimeStore->automaticIds(),true)
+        && count(array_filter($runtimeEvents,fn($e)=>$e['name']==='paper_resumed' && ($e['context']['paper_run_id']??null)===$activeBitso))===$startsBefore
+        && $afterNetworkRefresh['config']===$beforeNetworkRefresh['config']
+        && $afterNetworkRefresh['state']['sequence']>$beforeNetworkRefresh['state']['sequence'],
+        'A public exchange discovery timeout preserves the running worker and original ledger without a restart');
     file_put_contents($modeFile,'partial-inactive');$nextDiscovery->setValue($runtime,0.0);$deadline=microtime(true)+6;
     do {
         $runtime->tick();$status=$runtime->status();

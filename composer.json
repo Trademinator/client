@@ -67,6 +67,7 @@
             "@php tests/m4-live-resilience.php",
             "@php tests/m4-store-contention.php",
             "@php tests/m4-ndax-book.php",
+            "@php tests/m4-binance-book.php",
             "@php tests/m4-worker-supervision.php"
         ],
         "lint": "@php tools/lint.php",
@@ -106,6 +107,7 @@
             "@php tests/m4-live-resilience.php",
             "@php tests/m4-store-contention.php",
             "@php tests/m4-ndax-book.php",
+            "@php tests/m4-binance-book.php",
             "@php tests/m4-worker-supervision.php"
         ]
     },

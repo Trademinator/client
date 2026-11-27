@@ -91,7 +91,8 @@ final class AutomaticSetup
                     $plans[] = ['enabled' => true, 'run_id' => $run, ...$settings];
                 } catch (\Throwable $error) {
                     $warning = ['exchange' => $exchange, 'reason' => $error->getMessage()];
-                    if ($error instanceof RequestDeferred || ($error instanceof ServerRequestFailed && $error->isTransient())) {
+                    if ($error instanceof RequestDeferred || $error instanceof \ccxt\NetworkError
+                        || ($error instanceof ServerRequestFailed && $error->isTransient())) {
                         $previous = self::previousPlan($store, $previousIds, $exchange, $subscriptions);
                         if ($previous !== null) {
                             $plans[] = $previous;

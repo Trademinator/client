@@ -20,11 +20,22 @@ final class LiveFeed
         $this->rest=new $class(['enableRateLimit'=>true,'timeout'=>10000]);$this->rest->load_markets();
         $pro='\\ccxt\\pro\\'.$exchange;
         if(class_exists($pro)) {
+            if($exchange==='binance') { $pro=BinancePro::class; }
             if($exchange==='ndax') { $pro=NdaxPro::class; }
             $this->ws=new $pro(['enableRateLimit'=>true,'timeout'=>5000,'newUpdates'=>true]);
         }
     }
-    public static function decimal(mixed $v): string { return bcconv($v); }
+    /** Field-qualified conversion: reject missing data, never invent a price or quantity. */
+    public static function decimal(mixed $v, string $field='unspecified'): string
+    {
+        if(!is_string($v) && !is_int($v) && !is_float($v)) {
+            throw new RuntimeException('Invalid public numeric field '.$field.'; type='.get_debug_type($v));
+        }
+        try { return bcconv($v); }
+        catch(\Throwable $error) {
+            throw new RuntimeException('Invalid public numeric field '.$field.'; type='.get_debug_type($v),0,$error);
+        }
+    }
     public function market(string $symbol): array
     {
         $m=$this->rest->market($symbol);
